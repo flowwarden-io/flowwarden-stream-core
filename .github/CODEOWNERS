@@ -1,0 +1,10 @@
+# FlowWarden Stream Core - Code Owners
+#
+# This file defines who is automatically requested for review when a pull
+# request modifies matching paths. Combined with branch protection rules,
+# it ensures changes go through the right reviewers.
+#
+# Documentation: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything in the repo
+* @cedricclausPro

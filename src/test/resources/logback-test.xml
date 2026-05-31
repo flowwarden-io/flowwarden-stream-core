@@ -1,0 +1,11 @@
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    <include resource="org/springframework/boot/logging/logback/console-appender.xml"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+    <!-- Suppress noisy MongoDB monitor thread errors during Testcontainers shutdown -->
+    <logger name="org.mongodb.driver.cluster" level="WARN"/>
+</configuration>
