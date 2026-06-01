@@ -28,31 +28,88 @@ import java.lang.annotation.Target;
  * Enables automatic persistence of Change Stream resume tokens.
  *
  * <p>Place this annotation on a class that is also annotated with
- * {@link ChangeStream}. The framework will save the resume token after
- * every {@link #saveEveryN()} successfully processed event(s) and
- * resume from the last checkpoint on restart. A periodic timer
- * ({@link #saveIntervalSeconds()}) also saves the latest token as a
- * heartbeat, even when no events are arriving.</p>
+ * {@link ChangeStream}. FlowWarden tracks two independent resume tokens
+ * for each stream and uses them in a layered resume strategy on restart.</p>
+ *
+ * <h2>Dual-token model</h2>
+ *
+ * <ul>
+ *   <li><strong>{@code lastSeenToken}</strong> — advances on <em>every</em> event
+ *       received from MongoDB, including events rejected by {@code @Filter}, events
+ *       with no matching handler, and events being retried. The
+ *       {@link #saveIntervalSeconds() periodic timer} persists this token even when
+ *       the handler never runs, keeping the stream recoverable on idle or
+ *       massively-filtered workloads.</li>
+ *   <li><strong>{@code lastProcessedToken}</strong> — advances only when a handler
+ *       method returns successfully (or the event is acknowledged by the DLQ
+ *       pipeline). The {@link #saveEveryN() counter} persists this token at the
+ *       configured cadence to preserve at-least-once delivery on crash.</li>
+ * </ul>
+ *
+ * <h2>3-level resume cascade</h2>
+ *
+ * <p>On restart with {@link StartPosition#RESUME}, the stream resumes in order:</p>
+ * <ol>
+ *   <li>From {@code lastProcessedToken} (preserves strict at-least-once).</li>
+ *   <li>If that token has aged out of the oplog, fall back to {@code lastSeenToken}
+ *       — events still in flight at crash time (handler not yet acknowledged) are
+ *       not redelivered, but the stream avoids a {@code ChangeStreamHistoryLost}.</li>
+ *   <li>If both tokens are aged out, apply the {@link #onHistoryLost()} strategy.</li>
+ * </ol>
+ *
+ * <h2>Attribute roles</h2>
+ *
+ * <ul>
+ *   <li>{@link #saveEveryN()} = how often to persist {@code lastProcessedToken}.
+ *       {@code 1} (default) writes after every handler success — recommended for
+ *       at-least-once critical streams.</li>
+ *   <li>{@link #saveIntervalSeconds()} = how often the heartbeat timer persists
+ *       {@code lastSeenToken}. {@code 5} (default) is a safe trade-off; {@code 0}
+ *       disables the timer and removes the cascade level-2 safety net.</li>
+ *   <li>{@link #startPosition()} = whether to apply the cascade ({@code RESUME})
+ *       or ignore both tokens ({@code LATEST}, bootstrap).</li>
+ *   <li>{@link #onHistoryLost()} = strategy at cascade level 3 only.</li>
+ * </ul>
  */
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 public @interface Checkpoint {
 
-    /** Save a checkpoint every N successfully processed events. */
+    /**
+     * Persist {@code lastProcessedToken} after every N successful handler invocations.
+     * Must be {@code >= 1}; {@code 1} (default) gives strict at-least-once on crash.
+     * Larger values reduce write pressure at the cost of replaying up to {@code N-1}
+     * events on crash recovery.
+     */
     int saveEveryN() default 1;
 
     /**
-     * Periodic checkpoint interval in seconds.
-     * The framework saves the latest resume token at this interval,
-     * even if no events have been processed (heartbeat).
-     * Set to {@code 0} to disable periodic saving.
+     * Periodic timer interval in seconds for persisting {@code lastSeenToken}.
+     *
+     * <p>The timer advances {@code lastSeenToken} based on the most recent event
+     * received (including filtered or no-handler events), which keeps the stream
+     * recoverable even when the handler doesn't run. This is the level-2 safety
+     * net of the resume cascade.</p>
+     *
+     * <p>{@code 5} (default) is a balanced value; set to {@code 0} to disable
+     * the timer (disables cascade level 2 — the stream is then nude against
+     * oplog rollover on idle / massively-filtered workloads).</p>
      */
     int saveIntervalSeconds() default 5;
 
-    /** Where to start consuming when the stream is (re)started. */
+    /**
+     * Where to start consuming on (re)start.
+     * {@link StartPosition#RESUME} applies the 3-level cascade.
+     * {@link StartPosition#LATEST} ignores both persisted tokens and starts from now.
+     */
     StartPosition startPosition() default StartPosition.RESUME;
 
-    /** Strategy to apply when the saved resume token has expired from the oplog. */
+    /**
+     * Strategy when <strong>both</strong> persisted tokens have aged out of the
+     * MongoDB oplog (cascade level 3). With the dual-token cascade in place,
+     * reaching this level signals a genuine anomaly (downtime longer than the
+     * oplog window combined with timer not running).
+     */
     OnHistoryLost onHistoryLost() default OnHistoryLost.FAIL;
 }

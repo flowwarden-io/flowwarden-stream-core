@@ -74,7 +74,10 @@ class ReactiveSaveIntervalIntegrationTest {
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning("interval-reactive-test"));
 
-        // Insert 1 doc — not enough for saveEveryN=100
+        // Insert 1 doc — not enough for saveEveryN=100, so lastProcessedToken
+        // will NOT be persisted. The periodic timer (saveIntervalSeconds=2)
+        // is responsible for advancing lastSeenToken so the stream can recover
+        // even on streams where the saveEveryN counter rarely triggers.
         reactiveMongoTemplate.insert(new Document("item", "A"), "interval_orders").block();
 
         await().atMost(Duration.ofSeconds(5))
@@ -86,7 +89,9 @@ class ReactiveSaveIntervalIntegrationTest {
                 .untilAsserted(() -> {
                     var checkpoint = checkpointStore.findByStreamName("interval-reactive-test");
                     assertThat(checkpoint).isPresent();
-                    assertThat(checkpoint.get().lastProcessedToken()).isNotNull();
+                    // Timer advances lastSeenToken only — lastProcessedToken stays null
+                    // because saveEveryN=100 hasn't triggered yet
+                    assertThat(checkpoint.get().lastSeenToken()).isNotNull();
                 });
     }
 
@@ -102,22 +107,29 @@ class ReactiveSaveIntervalIntegrationTest {
                 .untilAsserted(() ->
                         assertThat(handler.getEvents()).hasSizeGreaterThanOrEqualTo(1));
 
-        // Wait for periodic checkpoint
+        // Wait for periodic checkpoint (timer writes lastSeenToken)
         await().atMost(Duration.ofSeconds(5))
-                .untilAsserted(() ->
-                        assertThat(checkpointStore.findByStreamName("interval-reactive-test")).isPresent());
+                .untilAsserted(() -> {
+                    var cp = checkpointStore.findByStreamName("interval-reactive-test");
+                    assertThat(cp).isPresent();
+                    assertThat(cp.get().lastSeenToken()).isNotNull();
+                });
 
-        Instant firstTimestamp = checkpointStore.findByStreamName("interval-reactive-test")
-                .get().lastProcessedTimestamp();
+        Instant firstSeenTimestamp = checkpointStore.findByStreamName("interval-reactive-test")
+                .get().lastSeenTimestamp();
+        assertThat(firstSeenTimestamp).isNotNull();
 
-        // Wait for a second periodic save — timestamp should advance
+        // Insert another doc so the timer has fresher input to persist
+        reactiveMongoTemplate.insert(new Document("item", "C"), "interval_orders").block();
+
+        // Wait for a second periodic save — lastSeenTimestamp should advance
         await().atMost(Duration.ofSeconds(5))
                 .pollInterval(Duration.ofMillis(500))
                 .untilAsserted(() -> {
                     var cp = checkpointStore.findByStreamName("interval-reactive-test");
                     assertThat(cp).isPresent();
-                    assertThat(cp.get().lastProcessedTimestamp())
-                            .isAfterOrEqualTo(firstTimestamp);
+                    assertThat(cp.get().lastSeenTimestamp())
+                            .isAfterOrEqualTo(firstSeenTimestamp);
                 });
     }
 

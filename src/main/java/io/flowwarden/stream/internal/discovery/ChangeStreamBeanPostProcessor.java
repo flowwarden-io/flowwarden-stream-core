@@ -115,10 +115,25 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         }
 
         Checkpoint cpAnnotation = AnnotationUtils.findAnnotation(targetClass, Checkpoint.class);
-        if (cpAnnotation != null && cpAnnotation.saveIntervalSeconds() < 0) {
-            throw new BeanCreationException(beanName,
-                    "@Checkpoint on " + targetClass.getName()
-                            + " has negative saveIntervalSeconds: " + cpAnnotation.saveIntervalSeconds());
+        if (cpAnnotation != null) {
+            if (cpAnnotation.saveIntervalSeconds() < 0) {
+                throw new BeanCreationException(beanName,
+                        "@Checkpoint on " + targetClass.getName()
+                                + " has negative saveIntervalSeconds: " + cpAnnotation.saveIntervalSeconds());
+            }
+            if (cpAnnotation.saveEveryN() < 1) {
+                throw new BeanCreationException(beanName,
+                        "@Checkpoint on " + targetClass.getName()
+                                + " has saveEveryN=" + cpAnnotation.saveEveryN()
+                                + " (must be >= 1; saveEveryN controls how often lastProcessedToken is persisted)");
+            }
+            if (cpAnnotation.saveIntervalSeconds() == 0 && cpAnnotation.saveEveryN() > 1) {
+                log.warn("@Checkpoint on {} has saveIntervalSeconds=0 and saveEveryN={} — "
+                                + "the heartbeat timer is disabled, so the resume cascade level-2 safety net "
+                                + "(fallback to lastSeenToken when lastProcessedToken ages out) will not work. "
+                                + "Consider setting saveIntervalSeconds > 0 or saveEveryN = 1.",
+                        targetClass.getName(), cpAnnotation.saveEveryN());
+            }
         }
 
         RetryPolicy retryAnnotation = AnnotationUtils.findAnnotation(targetClass, RetryPolicy.class);

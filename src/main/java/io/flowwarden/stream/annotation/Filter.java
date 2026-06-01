@@ -40,8 +40,17 @@ import java.lang.annotation.Target;
  * <p>Can be combined with {@link Pipeline} for a double-filtering funnel:
  * MongoDB pre-filters server-side, then Java refines application-side.</p>
  *
+ * <h2>Interaction with {@link Checkpoint}</h2>
+ *
+ * <p>Events rejected by this filter still advance {@code lastSeenToken} (FlowWarden
+ * tracks the receipt of every event, regardless of filter outcome). They do not
+ * advance {@code lastProcessedToken}, which only moves when a handler returns
+ * successfully. This keeps the resume cascade meaningful for streams where the
+ * vast majority of events are filtered out.</p>
+ *
  * @see ChangeStream
  * @see Pipeline
+ * @see Checkpoint
  */
 @Target(ElementType.METHOD)
 @Retention(RetentionPolicy.RUNTIME)
