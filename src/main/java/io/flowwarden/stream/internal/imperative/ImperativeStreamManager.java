@@ -164,19 +164,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
 
         if (def.checkpointAnnotation() != null
                 && def.checkpointAnnotation().startPosition() == StartPosition.RESUME) {
-            checkpointStore.findByStreamName(streamName)
-                    .ifPresent(cp -> {
-                        BsonDocument token = cp.lastProcessedToken();
-                        if (token == null) {
-                            return;
-                        }
-                        if (isTokenValid(def.collection(), token, streamTemplate)) {
-                            builder.resumeAfter(token);
-                            log.info("Resuming stream '{}' from checkpoint", streamName);
-                        } else {
-                            handleHistoryLost(streamName, def, builder, cp.lastProcessedTimestamp());
-                        }
-                    });
+            applyResumeCascade(streamName, def, builder, streamTemplate);
         }
 
         if (def.config().fullDocument() != FullDocumentMode.DEFAULT) {
@@ -503,11 +491,11 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                 if (snapshot == null) {
                     return;
                 }
-                checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
-                        streamName, null, snapshot.token(), snapshot.timestamp(),
-                        snapshot.token(), snapshot.timestamp(), Collections.emptyMap()));
+                // The timer advances ONLY lastSeenToken. lastProcessedToken is
+                // managed by saveCheckpointIfNeeded after confirmed handler success.
+                checkpointStore.saveSeen(streamName, snapshot.token(), snapshot.timestamp());
                 FlowWardenMetrics.get().onCheckpoint(streamName, snapshot.token().toJson());
-                log.debug("Periodic checkpoint saved for stream '{}'", streamName);
+                log.debug("Periodic lastSeenToken update for stream '{}'", streamName);
             } catch (Exception e) {
                 log.warn("Failed to save periodic checkpoint for stream '{}': {}",
                         streamName, e.getMessage(), e);
@@ -549,6 +537,50 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                     collection, e.getErrorCode(), e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Resume cascade: try lastProcessedToken (level 1), fall back to
+     * lastSeenToken if processed has aged out (level 2), apply onHistoryLost
+     * strategy if both have aged out (level 3).
+     */
+    private void applyResumeCascade(String streamName,
+                                    ChangeStreamDefinition def,
+                                    ChangeStreamRequest.ChangeStreamRequestBuilder<Document> builder,
+                                    MongoTemplate streamTemplate) {
+        java.util.Optional<io.flowwarden.stream.spi.Checkpoint> cpOpt =
+                checkpointStore.findByStreamName(streamName);
+        if (cpOpt.isEmpty()) {
+            return; // no prior checkpoint → stream starts from now
+        }
+        io.flowwarden.stream.spi.Checkpoint cp = cpOpt.get();
+        BsonDocument processedToken = cp.lastProcessedToken();
+        BsonDocument seenToken = cp.lastSeenToken();
+
+        // Level 1: try lastProcessedToken (preserves at-least-once)
+        if (processedToken != null && isTokenValid(def.collection(), processedToken, streamTemplate)) {
+            builder.resumeAfter(processedToken);
+            log.info("Resuming stream '{}' from lastProcessedToken", streamName);
+            return;
+        }
+
+        // Level 2: fallback to lastSeenToken if it's distinct and still valid
+        if (seenToken != null
+                && !seenToken.equals(processedToken)
+                && isTokenValid(def.collection(), seenToken, streamTemplate)) {
+            builder.resumeAfter(seenToken);
+            log.warn("Resuming stream '{}' from lastSeenToken: lastProcessedToken aged out of oplog "
+                    + "(in-flight events at crash time are not redelivered)", streamName);
+            FlowWardenMetrics.get().onResumeFallbackToSeen(streamName);
+            return;
+        }
+
+        // Level 3: both tokens unusable → apply onHistoryLost strategy
+        if (processedToken != null || seenToken != null) {
+            FlowWardenMetrics.get().onResumeHistoryLost(streamName);
+            handleHistoryLost(streamName, def, builder, cp.lastProcessedTimestamp());
+        }
+        // else: checkpoint document exists but both tokens are null → start from now
     }
 
     private void handleHistoryLost(String streamName,

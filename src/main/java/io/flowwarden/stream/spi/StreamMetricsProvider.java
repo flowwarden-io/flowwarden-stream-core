@@ -81,6 +81,38 @@ public interface StreamMetricsProvider {
     void onCheckpoint(String streamName, String resumeToken);
 
     /**
+     * Called when a stream resumes from {@code lastSeenToken} because
+     * {@code lastProcessedToken} has aged out of the oplog (resume cascade level 2).
+     *
+     * <p>This is a graceful degradation signal: the stream did not require
+     * the operator to intervene, but events that were in flight at crash
+     * time (handler not yet acknowledged) are not redelivered.</p>
+     *
+     * @param streamName stream identifier
+     */
+    default void onResumeFallbackToSeen(String streamName) {}
+
+    /**
+     * Called when neither {@code lastProcessedToken} nor {@code lastSeenToken}
+     * are valid in the oplog and the configured {@code @Checkpoint.onHistoryLost}
+     * strategy is applied (resume cascade level 3).
+     *
+     * @param streamName stream identifier
+     */
+    default void onResumeHistoryLost(String streamName) {}
+
+    /**
+     * Called periodically with the current lag between {@code lastSeenToken}
+     * and {@code lastProcessedToken}. Useful for monitoring streams whose
+     * handlers fall behind or get stuck.
+     *
+     * @param streamName  stream identifier
+     * @param lagSeconds  time difference between seen and processed timestamps in seconds (0 if unknown)
+     * @param lagEvents   approximate count of events between seen and processed (0 if unknown)
+     */
+    default void onCheckpointLag(String streamName, long lagSeconds, long lagEvents) {}
+
+    /**
      * Called when the internal event buffer status changes.
      *
      * @param streamName  stream identifier
