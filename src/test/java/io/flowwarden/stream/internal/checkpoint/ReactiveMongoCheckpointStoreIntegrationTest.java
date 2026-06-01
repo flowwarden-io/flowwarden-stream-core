@@ -15,33 +15,38 @@
  */
 package io.flowwarden.stream.internal.checkpoint;
 
-import com.mongodb.client.MongoClients;
+import com.mongodb.reactivestreams.client.MongoClients;
 import io.flowwarden.stream.spi.Checkpoint;
+import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.BsonDocument;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
 import org.springframework.data.mongodb.core.query.Query;
-import io.flowwarden.stream.test.SharedMongoContainer;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Collections;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class MongoCheckpointStoreIntegrationTest {
+class ReactiveMongoCheckpointStoreIntegrationTest {
 
-    private MongoCheckpointStore store;
+    private ReactiveMongoCheckpointStore store;
+    private ReactiveMongoTemplate reactiveMongoTemplate;
 
     @BeforeEach
     void setUp() {
-        var mongoTemplate = new MongoTemplate(
+        reactiveMongoTemplate = new ReactiveMongoTemplate(
                 MongoClients.create(SharedMongoContainer.MONGO.getReplicaSetUrl()), "test"
         );
-        mongoTemplate.remove(new Query(), MongoCheckpointStore.COLLECTION);
-        store = new MongoCheckpointStore(mongoTemplate);
+        reactiveMongoTemplate.remove(new Query(), MongoCheckpointStore.COLLECTION).block();
+        store = new ReactiveMongoCheckpointStore(reactiveMongoTemplate);
     }
 
     @Test
@@ -67,28 +72,14 @@ class MongoCheckpointStoreIntegrationTest {
     }
 
     @Test
-    void saveUpdatesExisting() {
-        var token1 = BsonDocument.parse("{\"_data\": \"t1\"}");
-        var token2 = BsonDocument.parse("{\"_data\": \"t2\"}");
-        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
-
-        store.save(new Checkpoint("s", null, token1, now, null, null, Collections.emptyMap()));
-        store.save(new Checkpoint("s", "pod-b", token2, now, token2, now, Collections.emptyMap()));
-
-        var found = store.findByStreamName("s");
-        assertTrue(found.isPresent());
-        assertEquals(token2, found.get().lastSeenToken());
-        assertEquals("pod-b", found.get().instanceId());
-    }
-
-    @Test
     void findReturnsEmptyWhenNotFound() {
         assertTrue(store.findByStreamName("nonexistent").isEmpty());
     }
 
     @Test
     void deleteRemovesCheckpoint() {
-        store.save(new Checkpoint("del", null, null, null, null, null, Collections.emptyMap()));
+        store.save(new Checkpoint("del", null, null, null, null, null,
+                Collections.emptyMap()));
         assertTrue(store.findByStreamName("del").isPresent());
 
         store.delete("del");

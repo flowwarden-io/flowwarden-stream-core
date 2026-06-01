@@ -22,6 +22,7 @@ import org.bson.Document;
 import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
 import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
 
 import java.time.Instant;
 import java.util.Collections;
@@ -58,6 +59,30 @@ public class ReactiveMongoCheckpointStore implements CheckpointStore {
         Document doc = reactiveMongoTemplate.findById(streamName, Document.class,
                 MongoCheckpointStore.COLLECTION).block();
         return Optional.ofNullable(doc).map(ReactiveMongoCheckpointStore::fromDocument);
+    }
+
+    @Override
+    public void saveSeen(String streamName, BsonDocument token, Instant timestamp) {
+        Update update = new Update()
+                .set("lastSeenToken", bsonToDocument(token))
+                .set("lastSeenTimestamp", timestamp);
+        reactiveMongoTemplate.upsert(
+                Query.query(Criteria.where("_id").is(streamName)),
+                update,
+                MongoCheckpointStore.COLLECTION
+        ).block();
+    }
+
+    @Override
+    public void saveProcessed(String streamName, BsonDocument token, Instant timestamp) {
+        Update update = new Update()
+                .set("lastProcessedToken", bsonToDocument(token))
+                .set("lastProcessedTimestamp", timestamp);
+        reactiveMongoTemplate.upsert(
+                Query.query(Criteria.where("_id").is(streamName)),
+                update,
+                MongoCheckpointStore.COLLECTION
+        ).block();
     }
 
     @Override

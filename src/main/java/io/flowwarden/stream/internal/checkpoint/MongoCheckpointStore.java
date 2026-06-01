@@ -22,6 +22,7 @@ import org.bson.Document;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
 
 import java.time.Instant;
 import java.util.Collections;
@@ -53,6 +54,30 @@ public class MongoCheckpointStore implements CheckpointStore {
     public Optional<Checkpoint> findByStreamName(String streamName) {
         Document doc = mongoTemplate.findById(streamName, Document.class, COLLECTION);
         return Optional.ofNullable(doc).map(MongoCheckpointStore::fromDocument);
+    }
+
+    @Override
+    public void saveSeen(String streamName, BsonDocument token, Instant timestamp) {
+        Update update = new Update()
+                .set("lastSeenToken", bsonToDocument(token))
+                .set("lastSeenTimestamp", timestamp);
+        mongoTemplate.upsert(
+                Query.query(Criteria.where("_id").is(streamName)),
+                update,
+                COLLECTION
+        );
+    }
+
+    @Override
+    public void saveProcessed(String streamName, BsonDocument token, Instant timestamp) {
+        Update update = new Update()
+                .set("lastProcessedToken", bsonToDocument(token))
+                .set("lastProcessedTimestamp", timestamp);
+        mongoTemplate.upsert(
+                Query.query(Criteria.where("_id").is(streamName)),
+                update,
+                COLLECTION
+        );
     }
 
     @Override
