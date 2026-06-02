@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Startup warning: `@Checkpoint(saveIntervalSeconds = 0, saveEveryN > 1)` logs a warning (the combination disables the resume cascade level-2 safety net).
 - `StreamMetricsProvider` SPI: new default methods `onResumeFallbackToSeen(streamName)`, `onResumeHistoryLost(streamName)`, and `onCheckpointLag(streamName, lagSeconds, lagEvents)` for monitoring the dual-token model.
 - `@Checkpoint` and `@Filter` Javadoc updated to describe the dual-token model explicitly.
+- `LockService` SPI in `io.flowwarden.stream.spi` for distributed lock backends supporting `DeploymentMode.SINGLE_LEADER`. Five methods — `tryAcquire`, `renew`, `release`, `getLockState`, `getCurrentLeader` — passing `instanceId` and `ttl` per call so the SPI is fully stateless and impl-agnostic. New `LockState` record exposed for Reporter / Console introspection. Default `MongoLockService` (backed by the `_fw_locks` collection) is now registered via `@ConditionalOnMissingBean LockService`, allowing user replacement with a Redis / Consul / JDBC implementation.
 
 ### Removed
 - **Breaking:** `@OnChange.operationTypes` attribute. `@OnChange` is now attribute-less and acts as a pure catch-all — it fires on every operation not covered by a typed handler (`@OnInsert`, `@OnUpdate`, `@OnDelete`, `@OnReplace`) in the same class, including `DROP` and `INVALIDATE`. To handle a specific subset of operation types, use two typed handlers delegating to a shared private method.

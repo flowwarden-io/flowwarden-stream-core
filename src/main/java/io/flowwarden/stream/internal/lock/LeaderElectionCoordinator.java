@@ -16,10 +16,14 @@
 package io.flowwarden.stream.internal.lock;
 
 import io.flowwarden.stream.FlowWardenMetrics;
+import io.flowwarden.stream.spi.LockService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -27,31 +31,46 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Coordinates leader election for SINGLE_LEADER streams (ARCH-025).
+ * Coordinates leader election for {@code SINGLE_LEADER} streams on top of a {@link LockService}.
  *
- * <p>Shared by both {@code ImperativeStreamManager} and {@code ReactiveStreamManager}.
- * Manages heartbeat renewal and standby polling for each stream.</p>
+ * <p>Shared by both {@code ImperativeStreamManager} and {@code ReactiveStreamManager}. Manages
+ * heartbeat renewal for the leader and standby polling for non-leaders, and owns the calling
+ * instance's identity ({@code instanceId}) and lock TTL — the lock service itself is stateless.</p>
  */
 public class LeaderElectionCoordinator {
 
     private static final Logger log = LoggerFactory.getLogger(LeaderElectionCoordinator.class);
 
+    public static final Duration DEFAULT_LOCK_TTL = Duration.ofSeconds(60);
+
     static final long HEARTBEAT_INTERVAL_SECONDS = 15;
     static final long STANDBY_POLL_INTERVAL_SECONDS = 20;
 
-    private final MongoLockService lockService;
+    private final LockService lockService;
+    private final String instanceId;
+    private final Duration lockTtl;
     private final ScheduledExecutorService scheduler;
     private final Map<String, ScheduledFuture<?>> heartbeatTasks = new ConcurrentHashMap<>();
     private final Map<String, ScheduledFuture<?>> pollingTasks = new ConcurrentHashMap<>();
     private final Map<String, LeaderRole> roles = new ConcurrentHashMap<>();
 
-    public LeaderElectionCoordinator(MongoLockService lockService) {
+    public LeaderElectionCoordinator(LockService lockService, String instanceId) {
+        this(lockService, instanceId, DEFAULT_LOCK_TTL);
+    }
+
+    public LeaderElectionCoordinator(LockService lockService, String instanceId, Duration lockTtl) {
         this.lockService = lockService;
+        this.instanceId = instanceId;
+        this.lockTtl = lockTtl;
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r, "fw-leader-election");
             t.setDaemon(true);
             return t;
         });
+    }
+
+    public String getInstanceId() {
+        return instanceId;
     }
 
     /**
@@ -65,7 +84,7 @@ public class LeaderElectionCoordinator {
      * @param onLostLeadership callback when this instance loses leadership
      */
     public void startElection(String streamName, Runnable onBecameLeader, Runnable onLostLeadership) {
-        if (lockService.tryAcquire(streamName)) {
+        if (lockService.tryAcquire(streamName, instanceId, lockTtl)) {
             becomeLeader(streamName, onBecameLeader, onLostLeadership);
         } else {
             becomeStandby(streamName, onBecameLeader, onLostLeadership);
@@ -78,14 +97,17 @@ public class LeaderElectionCoordinator {
     public void stop(String streamName) {
         cancelTask(heartbeatTasks, streamName);
         cancelTask(pollingTasks, streamName);
-        lockService.release(streamName);
+        lockService.release(streamName, instanceId);
         roles.remove(streamName);
     }
 
     /**
-     * Graceful shutdown: release all locks and stop the scheduler.
+     * Graceful shutdown: release all locks held by this instance and stop the scheduler.
      */
     public void shutdown() {
+        // Snapshot tracked streams before cancelling tasks
+        Set<String> trackedStreams = new HashSet<>(roles.keySet());
+
         // Cancel all tasks
         heartbeatTasks.forEach((name, task) -> task.cancel(false));
         heartbeatTasks.clear();
@@ -93,7 +115,21 @@ public class LeaderElectionCoordinator {
         pollingTasks.clear();
         roles.clear();
 
-        lockService.releaseAll();
+        // Release each lock — release is a no-op if this instance is not the owner
+        int released = 0;
+        for (String streamName : trackedStreams) {
+            try {
+                lockService.release(streamName, instanceId);
+                released++;
+            } catch (Exception e) {
+                log.warn("Failed to release lock for stream '{}' during shutdown: {}",
+                        streamName, e.getMessage());
+            }
+        }
+        if (released > 0) {
+            log.info("Attempted release of {} lock(s) during shutdown (instanceId={})",
+                    released, instanceId);
+        }
 
         scheduler.shutdown();
         try {
@@ -115,16 +151,15 @@ public class LeaderElectionCoordinator {
 
     private void becomeLeader(String streamName, Runnable onBecameLeader, Runnable onLostLeadership) {
         roles.put(streamName, LeaderRole.LEADER);
-        log.info("Instance became LEADER for stream '{}' (instanceId={})",
-                streamName, lockService.getInstanceId());
-        FlowWardenMetrics.get().onLeadershipChange(streamName, "LEADER", lockService.getInstanceId());
+        log.info("Instance became LEADER for stream '{}' (instanceId={})", streamName, instanceId);
+        FlowWardenMetrics.get().onLeadershipChange(streamName, "LEADER", instanceId);
 
         onBecameLeader.run();
 
         // Schedule heartbeat renewal
         ScheduledFuture<?> heartbeat = scheduler.scheduleAtFixedRate(() -> {
             try {
-                if (!lockService.renew(streamName)) {
+                if (!lockService.renew(streamName, instanceId, lockTtl)) {
                     log.warn("Lost leadership for stream '{}' — lock renewal failed", streamName);
                     cancelTask(heartbeatTasks, streamName);
                     roles.put(streamName, LeaderRole.STANDBY);
@@ -149,13 +184,13 @@ public class LeaderElectionCoordinator {
     private void becomeStandby(String streamName, Runnable onBecameLeader, Runnable onLostLeadership) {
         roles.put(streamName, LeaderRole.STANDBY);
         log.info("Instance is STANDBY for stream '{}' — polling for leadership (instanceId={})",
-                streamName, lockService.getInstanceId());
-        FlowWardenMetrics.get().onLeadershipChange(streamName, "STANDBY", lockService.getInstanceId());
+                streamName, instanceId);
+        FlowWardenMetrics.get().onLeadershipChange(streamName, "STANDBY", instanceId);
 
         // Schedule standby polling
         ScheduledFuture<?> polling = scheduler.scheduleAtFixedRate(() -> {
             try {
-                if (lockService.tryAcquire(streamName)) {
+                if (lockService.tryAcquire(streamName, instanceId, lockTtl)) {
                     log.info("Standby acquired leadership for stream '{}'", streamName);
                     cancelTask(pollingTasks, streamName);
                     becomeLeader(streamName, onBecameLeader, onLostLeadership);
