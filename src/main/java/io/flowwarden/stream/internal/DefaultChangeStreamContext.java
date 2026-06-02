@@ -18,9 +18,11 @@ package io.flowwarden.stream.internal;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import io.flowwarden.stream.ChangeStreamContext;
 import io.flowwarden.stream.OperationType;
+import io.flowwarden.stream.TransactionInfo;
 import io.flowwarden.stream.UpdateDescription;
 import org.bson.BsonDocument;
 import org.bson.BsonDateTime;
+import org.bson.BsonInt64;
 import org.bson.BsonTimestamp;
 import org.bson.BsonValue;
 import org.bson.Document;
@@ -126,6 +128,16 @@ public class DefaultChangeStreamContext<T> implements ChangeStreamContext<T> {
     @Override
     public BsonDocument getResumeToken() {
         return raw.getResumeToken();
+    }
+
+    @Override
+    public Optional<TransactionInfo> getTransactionInfo() {
+        BsonDocument lsid = raw.getLsid();
+        BsonInt64 txnNumber = raw.getTxnNumber();
+        if (lsid == null || txnNumber == null) {
+            return Optional.empty();
+        }
+        return Optional.of(new TransactionInfo(lsid, txnNumber.getValue()));
     }
 
     @Override

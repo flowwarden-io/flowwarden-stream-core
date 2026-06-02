@@ -59,6 +59,15 @@ public interface ChangeStreamContext<T> {
     /** MongoDB resume token for this event. */
     BsonDocument getResumeToken();
 
+    /**
+     * MongoDB transaction information if this event was emitted as part of a
+     * transaction (both {@code lsid} and {@code txnNumber} present), empty
+     * otherwise. Useful for handlers that need to group events of the same
+     * transaction — audit logs, aggregation, atomicity-preserving downstream
+     * propagation.
+     */
+    Optional<TransactionInfo> getTransactionInfo();
+
     /** Current retry attempt number (1-based, always 1 until retry is implemented). */
     int getAttemptNumber();
 

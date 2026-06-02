@@ -18,8 +18,10 @@ package io.flowwarden.stream.internal;
 import com.mongodb.MongoNamespace;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import io.flowwarden.stream.OperationType;
+import io.flowwarden.stream.TransactionInfo;
 import org.bson.BsonDocument;
 import org.bson.BsonInt32;
+import org.bson.BsonInt64;
 import org.bson.BsonString;
 import org.bson.BsonTimestamp;
 import org.bson.Document;
@@ -28,6 +30,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -135,6 +138,45 @@ class DefaultChangeStreamContextTest {
     @Test
     void returnsDocumentKey() {
         assertNotNull(ctx.getDocumentKey());
+    }
+
+    // ---- Transaction info ----
+
+    @Test
+    void transactionInfoPresentWhenBothLsidAndTxnNumberAvailable() {
+        BsonDocument lsid = new BsonDocument("id", new BsonString("session-1"));
+        when(raw.getLsid()).thenReturn(lsid);
+        when(raw.getTxnNumber()).thenReturn(new BsonInt64(42L));
+
+        Optional<TransactionInfo> info = ctx.getTransactionInfo();
+
+        assertTrue(info.isPresent());
+        assertEquals(lsid, info.get().lsid());
+        assertEquals(42L, info.get().txnNumber());
+    }
+
+    @Test
+    void transactionInfoEmptyWhenBothNull() {
+        when(raw.getLsid()).thenReturn(null);
+        when(raw.getTxnNumber()).thenReturn(null);
+
+        assertTrue(ctx.getTransactionInfo().isEmpty());
+    }
+
+    @Test
+    void transactionInfoEmptyWhenLsidNullOnly() {
+        when(raw.getLsid()).thenReturn(null);
+        when(raw.getTxnNumber()).thenReturn(new BsonInt64(42L));
+
+        assertTrue(ctx.getTransactionInfo().isEmpty());
+    }
+
+    @Test
+    void transactionInfoEmptyWhenTxnNumberNullOnly() {
+        when(raw.getLsid()).thenReturn(new BsonDocument("id", new BsonString("session-1")));
+        when(raw.getTxnNumber()).thenReturn(null);
+
+        assertTrue(ctx.getTransactionInfo().isEmpty());
     }
 
     // ---- Full document ----
