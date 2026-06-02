@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - The `saveIntervalSeconds` heartbeat timer was writing both `lastSeenToken` AND `lastProcessedToken` with the same value, breaking the documented at-least-once delivery guarantee: a crash mid-handler could lose the event being processed because `lastProcessedToken` had already advanced past it on the previous timer tick. The timer now advances only `lastSeenToken`; `lastProcessedToken` advances only after confirmed handler success.
 - MongoDB TTL index on `expiresAt` is now created at startup for every collection bound to a `@DeadLetterQueue`-annotated stream. Previously the DLQ collection had no TTL index, so `retentionDays` had no effect — entries accumulated indefinitely until manual cleanup.
+- `saveCheckpointIfNeeded` in both the imperative and reactive stream managers was still using the legacy `CheckpointStore.save(Checkpoint)` SPI method with the same token in `lastSeenToken` and `lastProcessedToken`, overwriting the heartbeat timer's `saveSeen(...)` work on every successful handler invocation. This masked the dual-token divergence that the resume cascade relies on — both tokens collapsed to the same value after any handler success, so the cascade level-2 fallback to `lastSeenToken` never reflected the actual heartbeat advance. The managers now call `CheckpointStore.saveProcessed(streamName, token, timestamp)` — the targeted method introduced for exactly this case.
 
 ## [1.0.0-rc.1] — 2026-05-31
 
