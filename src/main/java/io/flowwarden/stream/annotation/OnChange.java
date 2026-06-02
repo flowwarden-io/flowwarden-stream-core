@@ -15,8 +15,6 @@
  */
 package io.flowwarden.stream.annotation;
 
-import io.flowwarden.stream.OperationType;
-
 import java.lang.annotation.Documented;
 import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
@@ -24,10 +22,12 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * Generic handler for all Change Stream event types.
+ * Catch-all handler for Change Stream events.
  *
- * <p>Used as a catch-all when no specific handler ({@code @OnInsert},
- * {@code @OnUpdate}, {@code @OnDelete}) matches the event's operation type.</p>
+ * <p>Fires on every operation that is not covered by a typed handler
+ * ({@code @OnInsert}, {@code @OnUpdate}, {@code @OnDelete}, {@code @OnReplace})
+ * in the same class. This includes {@code DROP} and {@code INVALIDATE}, which
+ * have no dedicated typed handler.</p>
  *
  * <p>Only one {@code @OnChange} method is allowed per {@link ChangeStream} class.</p>
  */
@@ -35,7 +35,4 @@ import java.lang.annotation.Target;
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 public @interface OnChange {
-
-    /** Filter: only handle these operation types. Empty = all types. */
-    OperationType[] operationTypes() default {};
 }
