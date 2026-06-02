@@ -24,6 +24,7 @@ import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
 import io.flowwarden.stream.internal.lock.MongoLockService;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqStore;
+import io.flowwarden.stream.spi.LockService;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -57,15 +58,14 @@ public class ImperativeFlowWardenAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public MongoLockService mongoLockService(MongoTemplate mongoTemplate, Environment env) {
-        String instanceId = resolveInstanceId(env);
-        return new MongoLockService(mongoTemplate, instanceId);
+    public LockService lockService(MongoTemplate mongoTemplate) {
+        return new MongoLockService(mongoTemplate);
     }
 
     @Bean
     @ConditionalOnMissingBean
-    public LeaderElectionCoordinator leaderElectionCoordinator(MongoLockService lockService) {
-        return new LeaderElectionCoordinator(lockService);
+    public LeaderElectionCoordinator leaderElectionCoordinator(LockService lockService, Environment env) {
+        return new LeaderElectionCoordinator(lockService, resolveInstanceId(env));
     }
 
     @Bean
@@ -87,7 +87,8 @@ public class ImperativeFlowWardenAutoConfiguration {
     }
 
     /**
-     * Resolves the instance ID following the ARCH-037 pattern: hostname:appName:port.
+     * Resolves the instance ID as {@code hostname:appName:port}, used as the lock owner identity
+     * in {@link LeaderElectionCoordinator}.
      */
     static String resolveInstanceId(Environment env) {
         String hostname;
