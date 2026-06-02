@@ -24,6 +24,7 @@ import io.flowwarden.stream.internal.lock.MongoLockService;
 import io.flowwarden.stream.internal.reactive.ReactiveStreamManager;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqStore;
+import io.flowwarden.stream.spi.LockService;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -57,16 +58,17 @@ public class ReactiveFlowWardenAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public MongoLockService mongoLockService(MongoDatabaseFactory factory, Environment env) {
-        // Lock service needs blocking MongoTemplate — create one from the shared factory
-        String instanceId = ImperativeFlowWardenAutoConfiguration.resolveInstanceId(env);
-        return new MongoLockService(new MongoTemplate(factory), instanceId);
+    public LockService lockService(MongoDatabaseFactory factory) {
+        // The default Mongo-backed lock service uses a blocking MongoTemplate
+        // (constructed from the shared factory) to keep lock operations atomic.
+        return new MongoLockService(new MongoTemplate(factory));
     }
 
     @Bean
     @ConditionalOnMissingBean
-    public LeaderElectionCoordinator leaderElectionCoordinator(MongoLockService lockService) {
-        return new LeaderElectionCoordinator(lockService);
+    public LeaderElectionCoordinator leaderElectionCoordinator(LockService lockService, Environment env) {
+        return new LeaderElectionCoordinator(lockService,
+                ImperativeFlowWardenAutoConfiguration.resolveInstanceId(env));
     }
 
     @Bean
