@@ -23,6 +23,7 @@ import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.ChangeStream;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
+import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.annotation.OnChange;
 import io.flowwarden.stream.annotation.RetryPolicy;
 import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
@@ -145,6 +146,12 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         if (dlqAnnotation != null) {
             validateDeadLetterQueue(dlqAnnotation, targetClass, beanName);
         }
+        MongoDlqOptions mongoDlqOptionsAnnotation = AnnotationUtils.findAnnotation(
+                targetClass, MongoDlqOptions.class);
+        if (mongoDlqOptionsAnnotation != null && dlqAnnotation == null) {
+            log.warn("@MongoDlqOptions on {} has no effect without @DeadLetterQueue on the same class.",
+                    targetClass.getName());
+        }
 
         HandlerMethod onChangeHandler = findOnChangeHandler(targetClass, beanName, annotation);
         Map<OperationType, HandlerMethod> typedHandlers = findTypedHandlers(targetClass, beanName, annotation);
@@ -221,6 +228,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                 cpAnnotation,
                 retryAnnotation,
                 dlqAnnotation,
+                mongoDlqOptionsAnnotation,
                 errorHandlerResolver,
                 Collections.emptyMap());
 
@@ -802,10 +810,10 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
     }
 
     private void validateDeadLetterQueue(DeadLetterQueue dlqAnnotation, Class<?> targetClass, String beanName) {
-        if (dlqAnnotation.ttlDays() < 0) {
+        if (dlqAnnotation.retentionDays() < 0) {
             throw new BeanCreationException(beanName,
                     "@DeadLetterQueue on " + targetClass.getName()
-                            + " has negative ttlDays: " + dlqAnnotation.ttlDays()
+                            + " has negative retentionDays: " + dlqAnnotation.retentionDays()
                             + ". Must be >= 0.");
         }
     }

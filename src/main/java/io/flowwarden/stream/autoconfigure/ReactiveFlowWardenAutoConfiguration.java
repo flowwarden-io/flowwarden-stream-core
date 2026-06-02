@@ -17,6 +17,7 @@ package io.flowwarden.stream.autoconfigure;
 
 import io.flowwarden.stream.internal.checkpoint.ReactiveMongoCheckpointStore;
 import io.flowwarden.stream.internal.discovery.StreamRegistry;
+import io.flowwarden.stream.internal.dlq.MongoDlqProperties;
 import io.flowwarden.stream.internal.dlq.ReactiveMongoDlqStore;
 import io.flowwarden.stream.internal.MongoTemplateRegistry;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
@@ -28,6 +29,7 @@ import io.flowwarden.stream.spi.LockService;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.env.Environment;
@@ -42,6 +44,7 @@ import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
  */
 @AutoConfiguration(after = FlowWardenAutoConfiguration.class)
 @ConditionalOnProperty(name = "flowwarden.default-mode", havingValue = "REACTIVE")
+@EnableConfigurationProperties(MongoDlqProperties.class)
 public class ReactiveFlowWardenAutoConfiguration {
 
     @Bean
@@ -52,8 +55,9 @@ public class ReactiveFlowWardenAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public DlqStore dlqStore(ReactiveMongoTemplate reactiveMongoTemplate) {
-        return new ReactiveMongoDlqStore(reactiveMongoTemplate);
+    public DlqStore dlqStore(ReactiveMongoTemplate reactiveMongoTemplate,
+                             MongoDlqProperties dlqProperties) {
+        return new ReactiveMongoDlqStore(reactiveMongoTemplate, dlqProperties);
     }
 
     @Bean

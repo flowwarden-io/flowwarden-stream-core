@@ -33,8 +33,7 @@ class DeadLetterQueueAnnotationTest {
 
     @DeadLetterQueue(
             enabled = false,
-            collection = "custom_dlq",
-            ttlDays = 90,
+            retentionDays = 90,
             includeOriginalDocument = false,
             includeStackTrace = false
     )
@@ -46,8 +45,7 @@ class DeadLetterQueueAnnotationTest {
         DeadLetterQueue ann = DefaultDlqHandler.class.getAnnotation(DeadLetterQueue.class);
         assertThat(ann).isNotNull();
         assertThat(ann.enabled()).isTrue();
-        assertThat(ann.collection()).isEqualTo("_fw_dlq");
-        assertThat(ann.ttlDays()).isEqualTo(30);
+        assertThat(ann.retentionDays()).isEqualTo(30);
         assertThat(ann.includeOriginalDocument()).isTrue();
         assertThat(ann.includeStackTrace()).isTrue();
     }
@@ -57,8 +55,7 @@ class DeadLetterQueueAnnotationTest {
         DeadLetterQueue ann = CustomDlqHandler.class.getAnnotation(DeadLetterQueue.class);
         assertThat(ann).isNotNull();
         assertThat(ann.enabled()).isFalse();
-        assertThat(ann.collection()).isEqualTo("custom_dlq");
-        assertThat(ann.ttlDays()).isEqualTo(90);
+        assertThat(ann.retentionDays()).isEqualTo(90);
         assertThat(ann.includeOriginalDocument()).isFalse();
         assertThat(ann.includeStackTrace()).isFalse();
     }
