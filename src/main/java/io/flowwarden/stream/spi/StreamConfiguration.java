@@ -70,11 +70,13 @@ public record StreamConfiguration(
 
     /**
      * Dead letter queue configuration snapshot.
+     *
+     * <p>Backend-agnostic. Backend-specific tuning (e.g. the MongoDB collection)
+     * is not exposed in this snapshot.</p>
      */
     public record DlqConfig(
             boolean enabled,
-            String collection,
-            int ttlDays,
+            int retentionDays,
             boolean includeOriginalDocument,
             boolean includeStackTrace) {
     }

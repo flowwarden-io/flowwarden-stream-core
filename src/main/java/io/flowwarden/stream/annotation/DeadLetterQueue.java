@@ -29,6 +29,10 @@ import java.lang.annotation.Target;
  * (if {@link RetryPolicy} is present) are exhausted, the event is
  * automatically sent to the DLQ instead of being lost.</p>
  *
+ * <p>This annotation carries only <em>cross-cutting</em> policy that every DLQ
+ * backend can honour. Backend-specific tuning (e.g. the MongoDB collection
+ * name) lives on a companion annotation such as {@code @MongoDlqOptions}.</p>
+ *
  * <p>Works with or without {@link RetryPolicy}:
  * <ul>
  *   <li>With {@code @RetryPolicy}: event is sent to DLQ after all retries are exhausted</li>
@@ -44,11 +48,14 @@ public @interface DeadLetterQueue {
     /** Whether DLQ is enabled. */
     boolean enabled() default true;
 
-    /** MongoDB collection name for the DLQ. */
-    String collection() default "_fw_dlq";
-
-    /** Time-to-live in days. 0 means permanent (no expiry). */
-    int ttlDays() default 30;
+    /**
+     * Retention in days. {@code 0} means permanent (no expiry).
+     *
+     * <p>Each backend translates this to its native mechanism: Mongo
+     * sets a TTL index on {@code expiresAt}; Kafka uses {@code retention.ms};
+     * Rabbit uses the {@code x-message-ttl} header; JDBC schedules cleanup.</p>
+     */
+    int retentionDays() default 30;
 
     /** Whether to include the original document in the DLQ entry. */
     boolean includeOriginalDocument() default true;

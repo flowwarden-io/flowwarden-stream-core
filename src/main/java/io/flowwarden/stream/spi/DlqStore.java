@@ -30,9 +30,16 @@ public interface DlqStore {
     /**
      * Persists a failed event into the DLQ.
      *
-     * @param event the failed event to save
+     * <p>The {@link DlqPolicy} carries cross-cutting policy ({@code retentionDays},
+     * {@code includeOriginalDocument}, {@code includeStackTrace}). The caller has
+     * already applied the include-flags to the {@link FailedEvent} payload, so
+     * implementations typically only use {@code policy.retentionDays()} to set
+     * up backend-native expiry (TTL index, message-TTL, etc.).</p>
+     *
+     * @param event  the failed event to save
+     * @param policy cross-cutting DLQ policy for this entry
      */
-    void save(FailedEvent event);
+    void save(FailedEvent event, DlqPolicy policy);
 
     /**
      * Retrieves a failed event by its unique identifier.

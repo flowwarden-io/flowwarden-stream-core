@@ -17,6 +17,7 @@ package io.flowwarden.stream.autoconfigure;
 
 import io.flowwarden.stream.internal.checkpoint.MongoCheckpointStore;
 import io.flowwarden.stream.internal.discovery.StreamRegistry;
+import io.flowwarden.stream.internal.dlq.MongoDlqProperties;
 import io.flowwarden.stream.internal.dlq.MongoDlqStore;
 import io.flowwarden.stream.internal.MongoTemplateRegistry;
 import io.flowwarden.stream.internal.imperative.ImperativeStreamManager;
@@ -28,6 +29,7 @@ import io.flowwarden.stream.spi.LockService;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.env.Environment;
@@ -42,6 +44,7 @@ import java.net.InetAddress;
  */
 @AutoConfiguration(after = FlowWardenAutoConfiguration.class)
 @ConditionalOnProperty(name = "flowwarden.default-mode", havingValue = "IMPERATIVE", matchIfMissing = true)
+@EnableConfigurationProperties(MongoDlqProperties.class)
 public class ImperativeFlowWardenAutoConfiguration {
 
     @Bean
@@ -52,8 +55,8 @@ public class ImperativeFlowWardenAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public DlqStore dlqStore(MongoTemplate mongoTemplate) {
-        return new MongoDlqStore(mongoTemplate);
+    public DlqStore dlqStore(MongoTemplate mongoTemplate, MongoDlqProperties dlqProperties) {
+        return new MongoDlqStore(mongoTemplate, dlqProperties);
     }
 
     @Bean

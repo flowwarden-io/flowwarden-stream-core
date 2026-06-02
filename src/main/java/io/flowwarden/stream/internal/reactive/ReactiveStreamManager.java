@@ -29,10 +29,11 @@ import io.flowwarden.stream.OnHistoryLost;
 import io.flowwarden.stream.StartPosition;
 import io.flowwarden.stream.core.FlowWardenStreamManager;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
+import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.internal.DefaultChangeStreamContext;
 import io.flowwarden.stream.internal.MongoTemplateRegistry;
 import io.flowwarden.stream.internal.discovery.ChangeStreamDefinition;
-import io.flowwarden.stream.internal.dlq.DeadLetterQueueConfig;
+import io.flowwarden.stream.internal.dlq.ReactiveMongoDlqStore;
 import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
 import reactor.core.publisher.Mono;
 import reactor.util.retry.Retry;
@@ -43,6 +44,7 @@ import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
 import io.flowwarden.stream.spi.ChangeEventMetadata;
 import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
+import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
 import io.flowwarden.stream.spi.FailedEvent;
 import io.flowwarden.stream.spi.StreamConfiguration;
@@ -127,6 +129,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
     @EventListener(ApplicationReadyEvent.class)
     public void onApplicationReady() {
+        registerDlqCollections();
         for (ChangeStreamDefinition def : registry.getDefinitions()) {
             if (!def.config().autoStart() || !def.config().enabled()) {
                 continue;
@@ -269,25 +272,21 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     @Override
                     public void sendToDlq(String reason) {
                         DeadLetterQueue dlqAnn = def.deadLetterQueueAnnotation();
-                        Document fullDocument = raw.getFullDocument();
-                        String stackTrace = null;
-                        Instant expiresAt = null;
-                        if (dlqAnn != null) {
-                            DeadLetterQueueConfig dlqConfig = DeadLetterQueueConfig.fromAnnotation(dlqAnn);
-                            if (!dlqConfig.includeOriginalDocument()) {
-                                fullDocument = null;
-                            }
-                            expiresAt = dlqConfig.computeExpiresAt(Instant.now());
-                        }
+                        DlqPolicy policy = dlqAnn != null
+                                ? DlqPolicy.fromAnnotation(dlqAnn)
+                                : new DlqPolicy(0, true, true);
+                        Document fullDocument = policy.includeOriginalDocument()
+                                ? raw.getFullDocument() : null;
+                        Instant expiresAt = policy.computeExpiresAt(Instant.now());
                         dlqStore.save(new FailedEvent(
                                 ctx.getEventId(), def.streamName(),
                                 ctx.getOperationType() != null ? ctx.getOperationType().name() : null,
                                 raw.getDocumentKey(), fullDocument,
                                 raw.getResumeToken(),
-                                new FailedEvent.ErrorInfo("ManualDlq", reason, stackTrace),
+                                new FailedEvent.ErrorInfo("ManualDlq", reason, null),
                                 ctx.getAttemptNumber(), FailedEvent.STATUS_PENDING,
                                 Instant.now(), Instant.now(), Instant.now(),
-                                expiresAt, ctx.getAllMetadata()));
+                                expiresAt, ctx.getAllMetadata()), policy);
                         FlowWardenMetrics.get().onEventSentToDlq(def.streamName());
                     }
 
@@ -466,10 +465,10 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             return;
         }
         try {
-            DeadLetterQueueConfig config = DeadLetterQueueConfig.fromAnnotation(dlqAnn);
+            DlqPolicy policy = DlqPolicy.fromAnnotation(dlqAnn);
             Instant now = Instant.now();
-            Document fullDocument = config.includeOriginalDocument() ? raw.getFullDocument() : null;
-            String stackTrace = config.includeStackTrace() ? getStackTrace(cause) : null;
+            Document fullDocument = policy.includeOriginalDocument() ? raw.getFullDocument() : null;
+            String stackTrace = policy.includeStackTrace() ? getStackTrace(cause) : null;
 
             FailedEvent failedEvent = new FailedEvent(
                     ctx.getEventId(), def.streamName(),
@@ -479,10 +478,10 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     new FailedEvent.ErrorInfo(cause.getClass().getName(), cause.getMessage(), stackTrace),
                     attempt, FailedEvent.STATUS_PENDING,
                     now, now, now,
-                    config.computeExpiresAt(now), ctx.getAllMetadata());
+                    policy.computeExpiresAt(now), ctx.getAllMetadata());
 
             // DlqStore.save() uses blocking I/O, so schedule it off the reactive thread
-            Mono.fromRunnable(() -> dlqStore.save(failedEvent))
+            Mono.fromRunnable(() -> dlqStore.save(failedEvent, policy))
                     .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
                     .doOnSuccess(v -> {
                         FlowWardenMetrics.get().onEventSentToDlq(def.streamName());
@@ -493,6 +492,20 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     .subscribe();
         } catch (Exception e) {
             log.error("Failed to send event to DLQ for stream '{}': {}", def.streamName(), e.getMessage(), e);
+        }
+    }
+
+    private void registerDlqCollections() {
+        if (!(dlqStore instanceof ReactiveMongoDlqStore reactiveStore)) {
+            return;
+        }
+        for (ChangeStreamDefinition def : registry.getDefinitions()) {
+            if (def.deadLetterQueueAnnotation() == null) {
+                continue;
+            }
+            MongoDlqOptions opts = def.mongoDlqOptionsAnnotation();
+            String collection = opts != null ? opts.collection() : "";
+            reactiveStore.registerStream(def.streamName(), collection);
         }
     }
 
@@ -692,7 +705,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         if (def.deadLetterQueueAnnotation() != null) {
             var dlq = def.deadLetterQueueAnnotation();
             dlqConfig = new StreamConfiguration.DlqConfig(
-                    dlq.enabled(), dlq.collection(), dlq.ttlDays(),
+                    dlq.enabled(), dlq.retentionDays(),
                     dlq.includeOriginalDocument(), dlq.includeStackTrace());
         }
 

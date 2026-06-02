@@ -905,8 +905,7 @@ class ChangeStreamBeanPostProcessorTest {
         ChangeStreamDefinition def = processor.getDefinitions().get(0);
         assertNotNull(def.deadLetterQueueAnnotation());
         assertTrue(def.deadLetterQueueAnnotation().enabled());
-        assertEquals("_fw_dlq", def.deadLetterQueueAnnotation().collection());
-        assertEquals(30, def.deadLetterQueueAnnotation().ttlDays());
+        assertEquals(30, def.deadLetterQueueAnnotation().retentionDays());
     }
 
     @Test
@@ -919,8 +918,8 @@ class ChangeStreamBeanPostProcessorTest {
     }
 
     @Test
-    void throwsWhenDeadLetterQueueHasNegativeTtlDays() {
-        InvalidDlqNegativeTtlHandler bean = new InvalidDlqNegativeTtlHandler();
+    void throwsWhenDeadLetterQueueHasNegativeRetentionDays() {
+        InvalidDlqNegativeRetentionHandler bean = new InvalidDlqNegativeRetentionHandler();
         assertThrows(BeanCreationException.class,
                 () -> processor.postProcessAfterInitialization(bean, "invalidDlq"));
     }
@@ -933,8 +932,8 @@ class ChangeStreamBeanPostProcessorTest {
     }
 
     @ChangeStream(collection = "orders")
-    @DeadLetterQueue(ttlDays = -1)
-    static class InvalidDlqNegativeTtlHandler {
+    @DeadLetterQueue(retentionDays = -1)
+    static class InvalidDlqNegativeRetentionHandler {
         @OnChange
         void handle(ChangeStreamContext<?> ctx) {}
     }

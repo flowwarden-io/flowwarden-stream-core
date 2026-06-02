@@ -15,13 +15,16 @@
  */
 package io.flowwarden.stream.internal.dlq;
 
+import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
 import io.flowwarden.stream.spi.FailedEvent;
 import org.bson.BsonDocument;
 import org.bson.BsonValue;
 import org.bson.Document;
-import org.bson.json.JsonWriterSettings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.index.Index;
 import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Query;
 
@@ -31,40 +34,98 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 /**
  * MongoDB-backed implementation of {@link DlqStore}.
- * Stores failed events in the {@code _fw_dlq} collection.
+ *
+ * <p>Each stream may write to its own collection. The mapping is populated at
+ * startup via {@link #registerStream(String, String)} (called by the stream
+ * manager once per discovered {@code @ChangeStream} bean), with a default
+ * collection name resolved from {@link MongoDlqProperties}. Registering a
+ * stream also creates the TTL index on {@code expiresAt} for that
+ * collection.</p>
+ *
+ * <p>This class is internal and not part of the public API.</p>
  */
 public class MongoDlqStore implements DlqStore {
 
-    static final String COLLECTION = "_fw_dlq";
+    private static final Logger log = LoggerFactory.getLogger(MongoDlqStore.class);
 
     private final MongoTemplate mongoTemplate;
+    private final String defaultCollection;
+    private final ConcurrentMap<String, String> streamToCollection = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Boolean> ttlIndexCreated = new ConcurrentHashMap<>();
 
-    public MongoDlqStore(MongoTemplate mongoTemplate) {
+    public MongoDlqStore(MongoTemplate mongoTemplate, MongoDlqProperties properties) {
         this.mongoTemplate = mongoTemplate;
+        this.defaultCollection = properties.getCollection();
+    }
+
+    /**
+     * Registers a stream → collection binding. Called once per discovered
+     * {@code @ChangeStream} at startup. Creates the TTL index on
+     * {@code expiresAt} for the resolved collection on first registration.
+     *
+     * @param streamName  stream identifier
+     * @param collection  resolved Mongo collection name (empty/null → default)
+     */
+    public void registerStream(String streamName, String collection) {
+        String resolved = (collection == null || collection.isEmpty())
+                ? defaultCollection : collection;
+        streamToCollection.put(streamName, resolved);
+        ensureTtlIndex(resolved);
+    }
+
+    String collectionFor(String streamName) {
+        return streamToCollection.getOrDefault(streamName, defaultCollection);
+    }
+
+    private void ensureTtlIndex(String collection) {
+        ttlIndexCreated.computeIfAbsent(collection, c -> {
+            try {
+                mongoTemplate.indexOps(c)
+                        .ensureIndex(new Index().on("expiresAt", org.springframework.data.domain.Sort.Direction.ASC)
+                                .expire(0));
+                log.debug("Ensured TTL index on '{}.expiresAt' for DLQ collection", c);
+            } catch (Exception e) {
+                log.warn("Failed to create TTL index on '{}.expiresAt': {}", c, e.getMessage());
+            }
+            return Boolean.TRUE;
+        });
     }
 
     @Override
-    public void save(FailedEvent event) {
+    public void save(FailedEvent event, DlqPolicy policy) {
         Document doc = toDocument(event);
-        mongoTemplate.save(doc, COLLECTION);
+        mongoTemplate.save(doc, collectionFor(event.streamName()));
     }
 
     @Override
     public Optional<FailedEvent> findById(String id) {
-        Document doc = mongoTemplate.findById(id, Document.class, COLLECTION);
-        return Optional.ofNullable(doc).map(MongoDlqStore::fromDocument);
+        for (String collection : distinctCollections()) {
+            Document doc = mongoTemplate.findById(id, Document.class, collection);
+            if (doc != null) {
+                return Optional.of(fromDocument(doc));
+            }
+        }
+        return Optional.empty();
     }
 
     @Override
     public List<FailedEvent> findByStreamName(String streamName) {
         Query query = Query.query(Criteria.where("streamName").is(streamName));
-        return mongoTemplate.find(query, Document.class, COLLECTION)
+        return mongoTemplate.find(query, Document.class, collectionFor(streamName))
                 .stream()
                 .map(MongoDlqStore::fromDocument)
                 .toList();
+    }
+
+    private java.util.Set<String> distinctCollections() {
+        java.util.Set<String> all = new java.util.HashSet<>(streamToCollection.values());
+        all.add(defaultCollection);
+        return all;
     }
 
     static Document toDocument(FailedEvent event) {

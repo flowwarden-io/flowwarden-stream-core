@@ -31,7 +31,7 @@ final class NoOpDlqStore implements DlqStore {
     }
 
     @Override
-    public void save(FailedEvent event) {
+    public void save(FailedEvent event, DlqPolicy policy) {
     }
 
     @Override
