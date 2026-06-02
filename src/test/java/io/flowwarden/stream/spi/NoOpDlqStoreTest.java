@@ -41,7 +41,8 @@ class NoOpDlqStoreTest {
                 Instant.now(), Instant.now(), Instant.now(),
                 null, Collections.emptyMap()
         );
-        assertDoesNotThrow(() -> store.save(event));
+        DlqPolicy policy = new DlqPolicy(30, true, true);
+        assertDoesNotThrow(() -> store.save(event, policy));
     }
 
     @Test

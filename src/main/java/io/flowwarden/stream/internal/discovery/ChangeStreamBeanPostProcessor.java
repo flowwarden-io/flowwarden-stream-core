@@ -23,6 +23,7 @@ import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.ChangeStream;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
+import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.annotation.OnChange;
 import io.flowwarden.stream.annotation.RetryPolicy;
 import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
@@ -115,10 +116,25 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         }
 
         Checkpoint cpAnnotation = AnnotationUtils.findAnnotation(targetClass, Checkpoint.class);
-        if (cpAnnotation != null && cpAnnotation.saveIntervalSeconds() < 0) {
-            throw new BeanCreationException(beanName,
-                    "@Checkpoint on " + targetClass.getName()
-                            + " has negative saveIntervalSeconds: " + cpAnnotation.saveIntervalSeconds());
+        if (cpAnnotation != null) {
+            if (cpAnnotation.saveIntervalSeconds() < 0) {
+                throw new BeanCreationException(beanName,
+                        "@Checkpoint on " + targetClass.getName()
+                                + " has negative saveIntervalSeconds: " + cpAnnotation.saveIntervalSeconds());
+            }
+            if (cpAnnotation.saveEveryN() < 1) {
+                throw new BeanCreationException(beanName,
+                        "@Checkpoint on " + targetClass.getName()
+                                + " has saveEveryN=" + cpAnnotation.saveEveryN()
+                                + " (must be >= 1; saveEveryN controls how often lastProcessedToken is persisted)");
+            }
+            if (cpAnnotation.saveIntervalSeconds() == 0 && cpAnnotation.saveEveryN() > 1) {
+                log.warn("@Checkpoint on {} has saveIntervalSeconds=0 and saveEveryN={} — "
+                                + "the heartbeat timer is disabled, so the resume cascade level-2 safety net "
+                                + "(fallback to lastSeenToken when lastProcessedToken ages out) will not work. "
+                                + "Consider setting saveIntervalSeconds > 0 or saveEveryN = 1.",
+                        targetClass.getName(), cpAnnotation.saveEveryN());
+            }
         }
 
         RetryPolicy retryAnnotation = AnnotationUtils.findAnnotation(targetClass, RetryPolicy.class);
@@ -129,6 +145,12 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         DeadLetterQueue dlqAnnotation = AnnotationUtils.findAnnotation(targetClass, DeadLetterQueue.class);
         if (dlqAnnotation != null) {
             validateDeadLetterQueue(dlqAnnotation, targetClass, beanName);
+        }
+        MongoDlqOptions mongoDlqOptionsAnnotation = AnnotationUtils.findAnnotation(
+                targetClass, MongoDlqOptions.class);
+        if (mongoDlqOptionsAnnotation != null && dlqAnnotation == null) {
+            log.warn("@MongoDlqOptions on {} has no effect without @DeadLetterQueue on the same class.",
+                    targetClass.getName());
         }
 
         HandlerMethod onChangeHandler = findOnChangeHandler(targetClass, beanName, annotation);
@@ -147,10 +169,9 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                             + " must have at least one handler method (@OnChange, @OnInsert, @OnUpdate, @OnDelete, or @OnReplace)");
         }
 
-        // Validate: @Filter is incompatible with handlers that cover operations without fullDocument
+        // Validate: @Filter is incompatible with typed handlers that cover operations without fullDocument
         if (filterMethod != null) {
-            validateFilterCompatibility(filterMethod, onChangeHandler, typedHandlers,
-                    targetClass, beanName);
+            validateFilterCompatibility(typedHandlers, targetClass, beanName);
         }
 
         // Validate: fullDocument = DEFAULT with typed @OnUpdate handler
@@ -207,6 +228,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                 cpAnnotation,
                 retryAnnotation,
                 dlqAnnotation,
+                mongoDlqOptionsAnnotation,
                 errorHandlerResolver,
                 Collections.emptyMap());
 
@@ -643,18 +665,20 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
     // --- Validation helpers ---
 
     /**
-     * Validates that {@code @Filter} is not used on streams that handle operations
+     * Validates that {@code @Filter} is not combined with typed handlers covering operations
      * without {@code fullDocument} (DELETE, DROP, INVALIDATE).
      *
-     * <p>The filter predicate receives a {@link ChangeStreamContext} and typically
-     * accesses {@code getFullDocument()}, which returns {@code Optional.empty()} for
-     * these operations. Running the filter would be error-prone at runtime.</p>
+     * <p>The filter predicate receives a {@link ChangeStreamContext} and typically accesses
+     * {@code getFullDocument()}, which returns {@code Optional.empty()} for those operations.
+     * Running the filter on them would be error-prone at runtime.</p>
+     *
+     * <p>{@code @OnChange} is intentionally not checked here: it is a pure catch-all that
+     * always covers DROP/INVALIDATE. Users combining {@code @Filter} with {@code @OnChange}
+     * are expected to handle {@code Optional.empty()} in their filter predicate, or rely on
+     * a server-side {@code @Pipeline}.</p>
      */
-    private void validateFilterCompatibility(FilterMethod filterMethod,
-                                              HandlerMethod onChangeHandler,
-                                              Map<OperationType, HandlerMethod> typedHandlers,
+    private void validateFilterCompatibility(Map<OperationType, HandlerMethod> typedHandlers,
                                               Class<?> targetClass, String beanName) {
-        // Check typed handlers for no-fullDocument operations
         for (OperationType opType : NO_FULL_DOCUMENT_OPS) {
             if (typedHandlers.containsKey(opType)) {
                 throw new BeanCreationException(beanName,
@@ -665,37 +689,6 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                                 + "cannot safely access the document. "
                                 + "Use a server-side @Pipeline to filter these events, "
                                 + "or move the filtering logic into the handler method.");
-            }
-        }
-
-        // Check @OnChange if it covers no-fullDocument operations
-        if (onChangeHandler != null) {
-            OnChange onChangeAnn = AnnotationUtils.findAnnotation(
-                    onChangeHandler.method(), OnChange.class);
-            OperationType[] opTypes = (onChangeAnn != null) ? onChangeAnn.operationTypes()
-                    : new OperationType[0];
-            if (opTypes.length == 0) {
-                // Empty = all types, which includes DELETE/DROP/INVALIDATE
-                throw new BeanCreationException(beanName,
-                        "@ChangeStream class " + targetClass.getName()
-                                + " declares @Filter and @OnChange without operationTypes restriction. "
-                                + "@OnChange handles all operation types including DELETE/DROP/INVALIDATE "
-                                + "which have no fullDocument. Either restrict @OnChange(operationTypes = {...}) "
-                                + "to operations with fullDocument (INSERT, UPDATE, REPLACE), "
-                                + "use a server-side @Pipeline, or move the filtering logic into the handler.");
-            }
-            for (OperationType opType : opTypes) {
-                if (NO_FULL_DOCUMENT_OPS.contains(opType)) {
-                    throw new BeanCreationException(beanName,
-                            "@ChangeStream class " + targetClass.getName()
-                                    + " declares @Filter and @OnChange covering " + opType
-                                    + ", which is not allowed. "
-                                    + opType + " events have no fullDocument, so the @Filter predicate "
-                                    + "cannot safely access the document. "
-                                    + "Remove " + opType + " from @OnChange(operationTypes), "
-                                    + "use a server-side @Pipeline, "
-                                    + "or move the filtering logic into the handler method.");
-                }
             }
         }
     }
@@ -817,10 +810,10 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
     }
 
     private void validateDeadLetterQueue(DeadLetterQueue dlqAnnotation, Class<?> targetClass, String beanName) {
-        if (dlqAnnotation.ttlDays() < 0) {
+        if (dlqAnnotation.retentionDays() < 0) {
             throw new BeanCreationException(beanName,
                     "@DeadLetterQueue on " + targetClass.getName()
-                            + " has negative ttlDays: " + dlqAnnotation.ttlDays()
+                            + " has negative retentionDays: " + dlqAnnotation.retentionDays()
                             + ". Must be >= 0.");
         }
     }

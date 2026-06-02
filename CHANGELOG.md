@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `CheckpointStore.saveSeen(streamName, token, ts)` and `CheckpointStore.saveProcessed(streamName, token, ts)` SPI methods for targeted token writes. The default implementation delegates to `findByStreamName + save` so external store implementations continue to work unchanged. `MongoCheckpointStore` and `ReactiveMongoCheckpointStore` override with a native `upsert` that targets only the relevant pair of fields, avoiding a hot-path read.
+- 3-level resume cascade for `@Checkpoint`: `lastProcessedToken` → `lastSeenToken` → `onHistoryLost`. When the saved `lastProcessedToken` has aged out of the MongoDB oplog, the stream now falls back to `lastSeenToken` (advanced by the `saveIntervalSeconds` timer) before escalating to the `onHistoryLost` strategy. Emits a `WARN` log and a `flowwarden.stream.resume.fallback_to_seen` counter on level-2 fallback.
+- Startup validation: `@Checkpoint(saveEveryN < 1)` is now rejected with a clear error.
+- Startup warning: `@Checkpoint(saveIntervalSeconds = 0, saveEveryN > 1)` logs a warning (the combination disables the resume cascade level-2 safety net).
+- `StreamMetricsProvider` SPI: new default methods `onResumeFallbackToSeen(streamName)`, `onResumeFallbackToProcessed(streamName)`, `onResumeHistoryLost(streamName)`, and `onCheckpointLag(streamName, lagSeconds, lagEvents)` for monitoring the dual-token model.
+- `@Checkpoint(resumeStrategy = …)` and new `ResumeStrategy` enum (`PROCESSED_FIRST` default, `SEEN_FIRST`). `PROCESSED_FIRST` preserves the existing strict at-least-once behavior. `SEEN_FIRST` makes the resume cascade start from the heartbeat-fresh `lastSeenToken` instead of `lastProcessedToken`, trading re-delivery of in-flight events for fast restart on low-volume or filter-heavy streams. `lastProcessedToken` remains the cascade fallback before `onHistoryLost`. Emits `flowwarden.stream.resume.fallback_to_processed` on level-2 fallback.
+- `@Checkpoint` and `@Filter` Javadoc updated to describe the dual-token model explicitly.
+- `LockService` SPI in `io.flowwarden.stream.spi` for distributed lock backends supporting `DeploymentMode.SINGLE_LEADER`. Five methods — `tryAcquire`, `renew`, `release`, `getLockState`, `getCurrentLeader` — passing `instanceId` and `ttl` per call so the SPI is fully stateless and impl-agnostic. New `LockState` record exposed for Reporter / Console introspection. Default `MongoLockService` (backed by the `_fw_locks` collection) is now registered via `@ConditionalOnMissingBean LockService`, allowing user replacement with a Redis / Consul / JDBC implementation.
+- `@MongoDlqOptions` annotation in `io.flowwarden.stream.annotation` for MongoDB-specific per-stream DLQ tuning (currently `collection`). Used together with `@DeadLetterQueue` when the user wants to route failed events for a given stream to a non-default Mongo collection.
+- `flowwarden.dlq.mongo.collection` configuration property (default `_fw_dlq`) for the backend-level default collection used by streams without `@MongoDlqOptions`. Bound via `MongoDlqProperties`.
+- `DlqPolicy` SPI record (`retentionDays`, `includeOriginalDocument`, `includeStackTrace`) in `io.flowwarden.stream.spi`. Built from `@DeadLetterQueue` and passed to `DlqStore.save` so custom impls can honour cross-cutting policy without parsing annotations themselves.
+
+### Changed
+- **Breaking:** `@DeadLetterQueue` is now backend-agnostic. The `collection` attribute is removed (moved to `@MongoDlqOptions`) and `ttlDays` is renamed `retentionDays` to reflect that each backend translates retention to its native mechanism (Mongo TTL index, Kafka `retention.ms`, Rabbit `x-message-ttl`, JDBC scheduled cleanup).
+- **Breaking:** `DlqStore.save(FailedEvent)` is now `DlqStore.save(FailedEvent, DlqPolicy)`. Custom implementations must accept the policy argument; the cross-cutting policy is no longer hidden behind an internal annotation parser.
+- **Breaking:** `StreamConfiguration.DlqConfig` exposes `retentionDays` instead of `ttlDays`, and no longer exposes `collection` (backend-specific tuning is out of scope for the SPI snapshot).
+- Internal `DeadLetterQueueConfig` removed in favour of the public `DlqPolicy` record. `MongoDlqStore` and `ReactiveMongoDlqStore` now take `MongoDlqProperties` and expose `registerStream(streamName, collection)` so the runtime can bind per-stream collections at startup; unregistered streams fall through to the configured default.
+
+### Removed
+- **Breaking:** `@OnChange.operationTypes` attribute. `@OnChange` is now attribute-less and acts as a pure catch-all — it fires on every operation not covered by a typed handler (`@OnInsert`, `@OnUpdate`, `@OnDelete`, `@OnReplace`) in the same class, including `DROP` and `INVALIDATE`. To handle a specific subset of operation types, use two typed handlers delegating to a shared private method.
+- Boot-time validation rejecting `@Filter` combined with an unrestricted `@OnChange`. With the catch-all semantics, users are expected to handle `Optional.empty()` from `ChangeStreamContext.getFullDocument()` in their filter predicate, or use a server-side `@Pipeline` to scope the events.
+
+### Fixed
+- The `saveIntervalSeconds` heartbeat timer was writing both `lastSeenToken` AND `lastProcessedToken` with the same value, breaking the documented at-least-once delivery guarantee: a crash mid-handler could lose the event being processed because `lastProcessedToken` had already advanced past it on the previous timer tick. The timer now advances only `lastSeenToken`; `lastProcessedToken` advances only after confirmed handler success.
+- MongoDB TTL index on `expiresAt` is now created at startup for every collection bound to a `@DeadLetterQueue`-annotated stream. Previously the DLQ collection had no TTL index, so `retentionDays` had no effect — entries accumulated indefinitely until manual cleanup.
+
 ## [1.0.0-rc.1] — 2026-05-31
 
 First release candidate of FlowWarden Stream Core.

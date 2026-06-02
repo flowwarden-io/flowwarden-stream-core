@@ -18,12 +18,10 @@ package io.flowwarden.stream.internal.discovery;
 import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
-import io.flowwarden.stream.annotation.OnChange;
+import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.annotation.RetryPolicy;
-import org.springframework.core.annotation.AnnotationUtils;
 
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Holds everything needed to start a Change Stream subscription.
@@ -42,6 +40,7 @@ import java.util.Set;
  * @param checkpointAnnotation    the {@code @Checkpoint} annotation (nullable if not present)
  * @param retryPolicyAnnotation   the {@code @RetryPolicy} annotation (nullable if not present)
  * @param deadLetterQueueAnnotation the {@code @DeadLetterQueue} annotation (nullable if not present)
+ * @param mongoDlqOptionsAnnotation the {@code @MongoDlqOptions} annotation (nullable if not present)
  * @param errorHandlerResolver    the resolver for {@code @OnError} handlers (never null)
  * @param metadata                extensible metadata map for external modules (e.g., Javers handler names)
  */
@@ -59,13 +58,14 @@ public record ChangeStreamDefinition(
         Checkpoint checkpointAnnotation,
         RetryPolicy retryPolicyAnnotation,
         DeadLetterQueue deadLetterQueueAnnotation,
+        MongoDlqOptions mongoDlqOptionsAnnotation,
         ErrorHandlerResolver errorHandlerResolver,
         Map<String, Object> metadata) {
 
     /**
      * Resolves the best handler for a given operation type.
      *
-     * <p>Priority: typed handler &gt; {@code @OnChange} fallback (with operationTypes filter check).</p>
+     * <p>Priority: typed handler &gt; {@code @OnChange} catch-all.</p>
      *
      * @param opType the operation type of the current event
      * @return the handler to invoke, or {@code null} if no handler matches (skip silently)
@@ -75,22 +75,6 @@ public record ChangeStreamDefinition(
         if (typed != null) {
             return typed;
         }
-        if (onChangeHandler != null && matchesOnChangeFilter(opType)) {
-            return onChangeHandler;
-        }
-        return null;
-    }
-
-    private boolean matchesOnChangeFilter(OperationType opType) {
-        OnChange onChangeAnn = AnnotationUtils.findAnnotation(
-                onChangeHandler.method(), OnChange.class);
-        if (onChangeAnn == null) {
-            return true;
-        }
-        OperationType[] filter = onChangeAnn.operationTypes();
-        if (filter.length == 0) {
-            return true; // empty = all types
-        }
-        return Set.of(filter).contains(opType);
+        return onChangeHandler;
     }
 }

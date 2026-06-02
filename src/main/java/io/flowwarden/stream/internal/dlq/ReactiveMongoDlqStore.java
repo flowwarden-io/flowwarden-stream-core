@@ -15,15 +15,24 @@
  */
 package io.flowwarden.stream.internal.dlq;
 
+import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
 import io.flowwarden.stream.spi.FailedEvent;
 import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.data.domain.Sort;
 import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
+import org.springframework.data.mongodb.core.index.Index;
 import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Query;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 /**
  * {@link ReactiveMongoTemplate}-backed implementation of {@link DlqStore}.
@@ -32,38 +41,79 @@ import java.util.Optional;
  * is synchronous. This is acceptable since DLQ saves are lightweight
  * single-document operations.</p>
  *
- * <p>Stores failed events in the {@value MongoDlqStore#COLLECTION} collection
- * (same collection and format as the imperative variant).</p>
+ * <p>This class is internal and not part of the public API.</p>
  */
 public class ReactiveMongoDlqStore implements DlqStore {
 
-    private final ReactiveMongoTemplate reactiveMongoTemplate;
+    private static final Logger log = LoggerFactory.getLogger(ReactiveMongoDlqStore.class);
 
-    public ReactiveMongoDlqStore(ReactiveMongoTemplate reactiveMongoTemplate) {
+    private final ReactiveMongoTemplate reactiveMongoTemplate;
+    private final String defaultCollection;
+    private final ConcurrentMap<String, String> streamToCollection = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Boolean> ttlIndexCreated = new ConcurrentHashMap<>();
+
+    public ReactiveMongoDlqStore(ReactiveMongoTemplate reactiveMongoTemplate,
+                                 MongoDlqProperties properties) {
         this.reactiveMongoTemplate = reactiveMongoTemplate;
+        this.defaultCollection = properties.getCollection();
+    }
+
+    public void registerStream(String streamName, String collection) {
+        String resolved = (collection == null || collection.isEmpty())
+                ? defaultCollection : collection;
+        streamToCollection.put(streamName, resolved);
+        ensureTtlIndex(resolved);
+    }
+
+    String collectionFor(String streamName) {
+        return streamToCollection.getOrDefault(streamName, defaultCollection);
+    }
+
+    private void ensureTtlIndex(String collection) {
+        ttlIndexCreated.computeIfAbsent(collection, c -> {
+            try {
+                reactiveMongoTemplate.indexOps(c)
+                        .ensureIndex(new Index().on("expiresAt", Sort.Direction.ASC).expire(0))
+                        .block();
+                log.debug("Ensured TTL index on '{}.expiresAt' for DLQ collection", c);
+            } catch (Exception e) {
+                log.warn("Failed to create TTL index on '{}.expiresAt': {}", c, e.getMessage());
+            }
+            return Boolean.TRUE;
+        });
     }
 
     @Override
-    public void save(FailedEvent event) {
+    public void save(FailedEvent event, DlqPolicy policy) {
         Document doc = MongoDlqStore.toDocument(event);
-        reactiveMongoTemplate.save(doc, MongoDlqStore.COLLECTION).block();
+        reactiveMongoTemplate.save(doc, collectionFor(event.streamName())).block();
     }
 
     @Override
     public Optional<FailedEvent> findById(String id) {
-        Document doc = reactiveMongoTemplate.findById(id, Document.class,
-                MongoDlqStore.COLLECTION).block();
-        return Optional.ofNullable(doc).map(MongoDlqStore::fromDocument);
+        for (String collection : distinctCollections()) {
+            Document doc = reactiveMongoTemplate.findById(id, Document.class, collection).block();
+            if (doc != null) {
+                return Optional.of(MongoDlqStore.fromDocument(doc));
+            }
+        }
+        return Optional.empty();
     }
 
     @Override
     public List<FailedEvent> findByStreamName(String streamName) {
         Query query = Query.query(Criteria.where("streamName").is(streamName));
         List<Document> docs = reactiveMongoTemplate.find(query, Document.class,
-                MongoDlqStore.COLLECTION).collectList().block();
+                collectionFor(streamName)).collectList().block();
         if (docs == null) return List.of();
         return docs.stream()
                 .map(MongoDlqStore::fromDocument)
                 .toList();
+    }
+
+    private Set<String> distinctCollections() {
+        Set<String> all = new HashSet<>(streamToCollection.values());
+        all.add(defaultCollection);
+        return all;
     }
 }

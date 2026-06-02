@@ -22,17 +22,26 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * Catch-all handler for Change Stream events.
+ * Backend-specific overrides for the MongoDB-backed {@code DlqStore}.
  *
- * <p>Fires on every operation that is not covered by a typed handler
- * ({@code @OnInsert}, {@code @OnUpdate}, {@code @OnDelete}, {@code @OnReplace})
- * in the same class. This includes {@code DROP} and {@code INVALIDATE}, which
- * have no dedicated typed handler.</p>
+ * <p>Used together with {@link DeadLetterQueue} when the user wants to route
+ * failed events for a given stream to a non-default MongoDB collection. If
+ * absent, the collection name falls back to the global default configured via
+ * {@code flowwarden.dlq.mongo.collection} (defaults to {@code _fw_dlq}).</p>
  *
- * <p>Only one {@code @OnChange} method is allowed per {@link ChangeStream} class.</p>
+ * <p>This annotation has no effect when the configured {@code DlqStore}
+ * implementation is non-Mongo (e.g. Kafka, Rabbit, JDBC) — each backend ships
+ * its own companion annotation.</p>
  */
-@Target(ElementType.METHOD)
+@Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
-public @interface OnChange {
+public @interface MongoDlqOptions {
+
+    /**
+     * MongoDB collection name to use for this stream's DLQ entries.
+     * Empty (default) means the global default from
+     * {@code flowwarden.dlq.mongo.collection} applies.
+     */
+    String collection() default "";
 }

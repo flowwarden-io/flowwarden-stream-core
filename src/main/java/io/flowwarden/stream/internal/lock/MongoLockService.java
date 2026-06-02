@@ -18,53 +18,45 @@ package io.flowwarden.stream.internal.lock;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
+import io.flowwarden.stream.spi.LockService;
+import io.flowwarden.stream.spi.LockState;
 import org.bson.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.mongodb.core.MongoTemplate;
 
+import java.time.Duration;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.Date;
 import java.util.List;
 import java.util.Optional;
 
 /**
- * MongoDB-based distributed lock service for SINGLE_LEADER deployment mode (ARCH-025).
+ * MongoDB-backed {@link LockService}, used by default for
+ * {@code DeploymentMode.SINGLE_LEADER}.
  *
- * <p>Uses atomic {@code findOneAndUpdate} on the {@code _fw_locks} collection
- * to ensure only one instance holds a lock for a given stream at any time.</p>
- *
- * <p>Lock heartbeat (renewal) every 15 seconds, TTL 60 seconds.
- * If a leader fails to heartbeat, the lock expires and another instance can acquire it.</p>
+ * <p>Uses an atomic {@code findOneAndUpdate} on the {@code _fw_locks} collection so only
+ * one instance holds a lock for a given stream at any time. The collection name is internal
+ * to this implementation — the SPI does not expose it.</p>
  */
-public class MongoLockService {
+public class MongoLockService implements LockService {
 
     private static final Logger log = LoggerFactory.getLogger(MongoLockService.class);
 
     static final String COLLECTION = "_fw_locks";
-    static final long TTL_SECONDS = 60;
 
     private final MongoTemplate mongoTemplate;
-    private final String instanceId;
 
-    public MongoLockService(MongoTemplate mongoTemplate, String instanceId) {
+    public MongoLockService(MongoTemplate mongoTemplate) {
         this.mongoTemplate = mongoTemplate;
-        this.instanceId = instanceId;
     }
 
-    /**
-     * Attempts to acquire the lock for a stream.
-     * Succeeds if the lock doesn't exist, has expired, or is already owned by this instance.
-     *
-     * @param streamName the stream to lock
-     * @return true if this instance now holds the lock
-     */
-    public boolean tryAcquire(String streamName) {
+    @Override
+    public boolean tryAcquire(String streamName, String instanceId, Duration ttl) {
         try {
             MongoCollection<Document> collection = getCollection();
             Date now = new Date();
-            Date expiresAt = Date.from(Instant.now().plus(TTL_SECONDS, ChronoUnit.SECONDS));
+            Date expiresAt = Date.from(Instant.now().plus(ttl));
 
             Document filter = new Document("_id", streamName)
                     .append("$or", List.of(
@@ -110,16 +102,11 @@ public class MongoLockService {
         }
     }
 
-    /**
-     * Renews the lock for a stream. Only succeeds if this instance still holds it.
-     *
-     * @param streamName the stream to renew
-     * @return true if renewal succeeded
-     */
-    public boolean renew(String streamName) {
+    @Override
+    public boolean renew(String streamName, String instanceId, Duration ttl) {
         try {
             MongoCollection<Document> collection = getCollection();
-            Date expiresAt = Date.from(Instant.now().plus(TTL_SECONDS, ChronoUnit.SECONDS));
+            Date expiresAt = Date.from(Instant.now().plus(ttl));
 
             Document filter = new Document("_id", streamName)
                     .append("instanceId", instanceId);
@@ -135,12 +122,8 @@ public class MongoLockService {
         }
     }
 
-    /**
-     * Releases the lock for a stream if held by this instance.
-     *
-     * @param streamName the stream to release
-     */
-    public void release(String streamName) {
+    @Override
+    public void release(String streamName, String instanceId) {
         try {
             MongoCollection<Document> collection = getCollection();
             Document filter = new Document("_id", streamName)
@@ -154,42 +137,30 @@ public class MongoLockService {
         }
     }
 
-    /**
-     * Releases all locks held by this instance. Called during graceful shutdown.
-     */
-    public void releaseAll() {
-        try {
-            MongoCollection<Document> collection = getCollection();
-            Document filter = new Document("instanceId", instanceId);
-            long deleted = collection.deleteMany(filter).getDeletedCount();
-            if (deleted > 0) {
-                log.info("Released {} lock(s) during shutdown (instanceId={})", deleted, instanceId);
-            }
-        } catch (Exception e) {
-            log.warn("Failed to release locks during shutdown: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * Returns the current leader for a stream, if any.
-     *
-     * @param streamName the stream to check
-     * @return the leader's instance ID, or empty if no active lock
-     */
-    public Optional<String> currentLeader(String streamName) {
+    @Override
+    public Optional<LockState> getLockState(String streamName) {
         try {
             MongoCollection<Document> collection = getCollection();
             Document doc = collection.find(new Document("_id", streamName)
                             .append("expiresAt", new Document("$gt", new Date())))
                     .first();
-            return doc != null ? Optional.ofNullable(doc.getString("instanceId")) : Optional.empty();
+            if (doc == null) {
+                return Optional.empty();
+            }
+            String instanceId = doc.getString("instanceId");
+            Date acquiredAt = doc.getDate("acquiredAt");
+            Date expiresAt = doc.getDate("expiresAt");
+            if (instanceId == null || acquiredAt == null || expiresAt == null) {
+                return Optional.empty();
+            }
+            return Optional.of(new LockState(
+                    streamName,
+                    instanceId,
+                    acquiredAt.toInstant(),
+                    expiresAt.toInstant()));
         } catch (Exception e) {
             return Optional.empty();
         }
-    }
-
-    public String getInstanceId() {
-        return instanceId;
     }
 
     private MongoCollection<Document> getCollection() {

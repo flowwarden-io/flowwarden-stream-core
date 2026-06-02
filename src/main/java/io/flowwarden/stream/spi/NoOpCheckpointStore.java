@@ -15,6 +15,9 @@
  */
 package io.flowwarden.stream.spi;
 
+import org.bson.BsonDocument;
+
+import java.time.Instant;
 import java.util.Optional;
 
 /**
@@ -35,6 +38,14 @@ final class NoOpCheckpointStore implements CheckpointStore {
     @Override
     public Optional<Checkpoint> findByStreamName(String streamName) {
         return Optional.empty();
+    }
+
+    @Override
+    public void saveSeen(String streamName, BsonDocument token, Instant timestamp) {
+    }
+
+    @Override
+    public void saveProcessed(String streamName, BsonDocument token, Instant timestamp) {
     }
 
     @Override

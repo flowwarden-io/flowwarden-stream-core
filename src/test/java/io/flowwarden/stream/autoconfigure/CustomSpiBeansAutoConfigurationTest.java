@@ -111,7 +111,7 @@ class CustomSpiBeansAutoConfigurationTest {
 
     static class CustomDlqStore implements DlqStore {
         @Override
-        public void save(FailedEvent event) {}
+        public void save(FailedEvent event, io.flowwarden.stream.spi.DlqPolicy policy) {}
 
         @Override
         public Optional<FailedEvent> findById(String id) {

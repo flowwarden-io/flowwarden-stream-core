@@ -772,23 +772,9 @@ class ChangeStreamBeanPostProcessorTest {
     }
 
     @Test
-    void throwsWhenFilterWithUnrestrictedOnChange() {
-        FilterWithUnrestrictedOnChangeBean bean = new FilterWithUnrestrictedOnChangeBean();
-        assertThrows(BeanCreationException.class,
-                () -> processor.postProcessAfterInitialization(bean, "filterUnrestricted"));
-    }
-
-    @Test
-    void throwsWhenFilterWithOnChangeCoveringDelete() {
-        FilterWithOnChangeCoveringDeleteBean bean = new FilterWithOnChangeCoveringDeleteBean();
-        assertThrows(BeanCreationException.class,
-                () -> processor.postProcessAfterInitialization(bean, "filterCoveringDelete"));
-    }
-
-    @Test
-    void allowsFilterWithOnChangeRestrictedToFullDocOps() {
-        FilterWithSafeOnChangeBean bean = new FilterWithSafeOnChangeBean();
-        processor.postProcessAfterInitialization(bean, "filterSafeOnChange");
+    void allowsFilterWithOnChangeCatchAll() {
+        FilterWithOnChangeBean bean = new FilterWithOnChangeBean();
+        processor.postProcessAfterInitialization(bean, "filterOnChange");
 
         ChangeStreamDefinition def = processor.getDefinitions().get(0);
         assertNotNull(def.filterMethod());
@@ -818,26 +804,8 @@ class ChangeStreamBeanPostProcessorTest {
     }
 
     @ChangeStream(collection = "orders")
-    static class FilterWithUnrestrictedOnChangeBean {
+    static class FilterWithOnChangeBean {
         @OnChange
-        void handle(ChangeStreamContext<?> ctx) {}
-
-        @Filter
-        boolean filter(ChangeStreamContext<?> ctx) { return true; }
-    }
-
-    @ChangeStream(collection = "orders")
-    static class FilterWithOnChangeCoveringDeleteBean {
-        @OnChange(operationTypes = {OperationType.INSERT, OperationType.DELETE})
-        void handle(ChangeStreamContext<?> ctx) {}
-
-        @Filter
-        boolean filter(ChangeStreamContext<?> ctx) { return true; }
-    }
-
-    @ChangeStream(collection = "orders")
-    static class FilterWithSafeOnChangeBean {
-        @OnChange(operationTypes = {OperationType.INSERT, OperationType.UPDATE, OperationType.REPLACE})
         void handle(ChangeStreamContext<?> ctx) {}
 
         @Filter
@@ -937,8 +905,7 @@ class ChangeStreamBeanPostProcessorTest {
         ChangeStreamDefinition def = processor.getDefinitions().get(0);
         assertNotNull(def.deadLetterQueueAnnotation());
         assertTrue(def.deadLetterQueueAnnotation().enabled());
-        assertEquals("_fw_dlq", def.deadLetterQueueAnnotation().collection());
-        assertEquals(30, def.deadLetterQueueAnnotation().ttlDays());
+        assertEquals(30, def.deadLetterQueueAnnotation().retentionDays());
     }
 
     @Test
@@ -951,8 +918,8 @@ class ChangeStreamBeanPostProcessorTest {
     }
 
     @Test
-    void throwsWhenDeadLetterQueueHasNegativeTtlDays() {
-        InvalidDlqNegativeTtlHandler bean = new InvalidDlqNegativeTtlHandler();
+    void throwsWhenDeadLetterQueueHasNegativeRetentionDays() {
+        InvalidDlqNegativeRetentionHandler bean = new InvalidDlqNegativeRetentionHandler();
         assertThrows(BeanCreationException.class,
                 () -> processor.postProcessAfterInitialization(bean, "invalidDlq"));
     }
@@ -965,8 +932,8 @@ class ChangeStreamBeanPostProcessorTest {
     }
 
     @ChangeStream(collection = "orders")
-    @DeadLetterQueue(ttlDays = -1)
-    static class InvalidDlqNegativeTtlHandler {
+    @DeadLetterQueue(retentionDays = -1)
+    static class InvalidDlqNegativeRetentionHandler {
         @OnChange
         void handle(ChangeStreamContext<?> ctx) {}
     }
