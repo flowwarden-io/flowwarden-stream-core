@@ -16,6 +16,7 @@
 package io.flowwarden.stream.annotation;
 
 import io.flowwarden.stream.OnHistoryLost;
+import io.flowwarden.stream.ResumeStrategy;
 import io.flowwarden.stream.StartPosition;
 
 import java.lang.annotation.Documented;
@@ -48,12 +49,15 @@ import java.lang.annotation.Target;
  *
  * <h2>3-level resume cascade</h2>
  *
- * <p>On restart with {@link StartPosition#RESUME}, the stream resumes in order:</p>
+ * <p>On restart with {@link StartPosition#RESUME}, the stream resumes in order
+ * determined by {@link #resumeStrategy()}:</p>
  * <ol>
- *   <li>From {@code lastProcessedToken} (preserves strict at-least-once).</li>
- *   <li>If that token has aged out of the oplog, fall back to {@code lastSeenToken}
- *       — events still in flight at crash time (handler not yet acknowledged) are
- *       not redelivered, but the stream avoids a {@code ChangeStreamHistoryLost}.</li>
+ *   <li>From the <em>primary</em> token (default {@code lastProcessedToken}, which
+ *       preserves strict at-least-once).</li>
+ *   <li>If the primary has aged out of the oplog, fall back to the <em>secondary</em>
+ *       token — the stream avoids a {@code ChangeStreamHistoryLost} at the cost of
+ *       either re-delivering events ({@code lastProcessedToken} secondary) or
+ *       skipping in-flight events ({@code lastSeenToken} secondary).</li>
  *   <li>If both tokens are aged out, apply the {@link #onHistoryLost()} strategy.</li>
  * </ol>
  *
@@ -69,6 +73,8 @@ import java.lang.annotation.Target;
  *   <li>{@link #startPosition()} = whether to apply the cascade ({@code RESUME})
  *       or ignore both tokens ({@code LATEST}, bootstrap).</li>
  *   <li>{@link #onHistoryLost()} = strategy at cascade level 3 only.</li>
+ *   <li>{@link #resumeStrategy()} = which token is tried first in the cascade
+ *       (at-least-once vs fast restart).</li>
  * </ul>
  */
 @Target(ElementType.TYPE)
@@ -112,4 +118,17 @@ public @interface Checkpoint {
      * oplog window combined with timer not running).
      */
     OnHistoryLost onHistoryLost() default OnHistoryLost.FAIL;
+
+    /**
+     * Order in which the two persisted tokens are tried by the resume cascade.
+     *
+     * <p>{@link ResumeStrategy#PROCESSED_FIRST} (default) preserves strict
+     * at-least-once delivery: in-flight events at crash time are re-delivered,
+     * at the cost of a potentially long oplog scan on low-volume or
+     * filter-heavy streams. {@link ResumeStrategy#SEEN_FIRST} restarts fast
+     * from the heartbeat-fresh {@code lastSeenToken} and falls back to
+     * {@code lastProcessedToken} as the safety net before escalating to
+     * {@link #onHistoryLost()}.</p>
+     */
+    ResumeStrategy resumeStrategy() default ResumeStrategy.PROCESSED_FIRST;
 }

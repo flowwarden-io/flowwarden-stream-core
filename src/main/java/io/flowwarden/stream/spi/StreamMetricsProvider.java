@@ -82,7 +82,8 @@ public interface StreamMetricsProvider {
 
     /**
      * Called when a stream resumes from {@code lastSeenToken} because
-     * {@code lastProcessedToken} has aged out of the oplog (resume cascade level 2).
+     * {@code lastProcessedToken} has aged out of the oplog (resume cascade
+     * level 2 under {@code ResumeStrategy.PROCESSED_FIRST}).
      *
      * <p>This is a graceful degradation signal: the stream did not require
      * the operator to intervene, but events that were in flight at crash
@@ -91,6 +92,20 @@ public interface StreamMetricsProvider {
      * @param streamName stream identifier
      */
     default void onResumeFallbackToSeen(String streamName) {}
+
+    /**
+     * Called when a stream resumes from {@code lastProcessedToken} because
+     * {@code lastSeenToken} has aged out of the oplog (resume cascade
+     * level 2 under {@code ResumeStrategy.SEEN_FIRST}).
+     *
+     * <p>This is a graceful degradation signal: the heartbeat-fresh seen
+     * token was unusable, so the stream fell back to the older processed
+     * token. The MongoDB oplog scan may be long depending on how far behind
+     * {@code lastProcessedToken} is.</p>
+     *
+     * @param streamName stream identifier
+     */
+    default void onResumeFallbackToProcessed(String streamName) {}
 
     /**
      * Called when neither {@code lastProcessedToken} nor {@code lastSeenToken}
