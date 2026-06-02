@@ -772,23 +772,9 @@ class ChangeStreamBeanPostProcessorTest {
     }
 
     @Test
-    void throwsWhenFilterWithUnrestrictedOnChange() {
-        FilterWithUnrestrictedOnChangeBean bean = new FilterWithUnrestrictedOnChangeBean();
-        assertThrows(BeanCreationException.class,
-                () -> processor.postProcessAfterInitialization(bean, "filterUnrestricted"));
-    }
-
-    @Test
-    void throwsWhenFilterWithOnChangeCoveringDelete() {
-        FilterWithOnChangeCoveringDeleteBean bean = new FilterWithOnChangeCoveringDeleteBean();
-        assertThrows(BeanCreationException.class,
-                () -> processor.postProcessAfterInitialization(bean, "filterCoveringDelete"));
-    }
-
-    @Test
-    void allowsFilterWithOnChangeRestrictedToFullDocOps() {
-        FilterWithSafeOnChangeBean bean = new FilterWithSafeOnChangeBean();
-        processor.postProcessAfterInitialization(bean, "filterSafeOnChange");
+    void allowsFilterWithOnChangeCatchAll() {
+        FilterWithOnChangeBean bean = new FilterWithOnChangeBean();
+        processor.postProcessAfterInitialization(bean, "filterOnChange");
 
         ChangeStreamDefinition def = processor.getDefinitions().get(0);
         assertNotNull(def.filterMethod());
@@ -818,26 +804,8 @@ class ChangeStreamBeanPostProcessorTest {
     }
 
     @ChangeStream(collection = "orders")
-    static class FilterWithUnrestrictedOnChangeBean {
+    static class FilterWithOnChangeBean {
         @OnChange
-        void handle(ChangeStreamContext<?> ctx) {}
-
-        @Filter
-        boolean filter(ChangeStreamContext<?> ctx) { return true; }
-    }
-
-    @ChangeStream(collection = "orders")
-    static class FilterWithOnChangeCoveringDeleteBean {
-        @OnChange(operationTypes = {OperationType.INSERT, OperationType.DELETE})
-        void handle(ChangeStreamContext<?> ctx) {}
-
-        @Filter
-        boolean filter(ChangeStreamContext<?> ctx) { return true; }
-    }
-
-    @ChangeStream(collection = "orders")
-    static class FilterWithSafeOnChangeBean {
-        @OnChange(operationTypes = {OperationType.INSERT, OperationType.UPDATE, OperationType.REPLACE})
         void handle(ChangeStreamContext<?> ctx) {}
 
         @Filter

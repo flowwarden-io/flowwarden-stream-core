@@ -15,24 +15,15 @@
  */
 package io.flowwarden.stream.annotation;
 
-import io.flowwarden.stream.OperationType;
 import org.junit.jupiter.api.Test;
 
 import java.lang.annotation.ElementType;
 import java.lang.annotation.RetentionPolicy;
-import java.lang.reflect.Method;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class OnChangeTest {
-
-    static class Handler {
-        @OnChange
-        void handleAll() {}
-
-        @OnChange(operationTypes = {OperationType.INSERT, OperationType.UPDATE})
-        void handleFiltered() {}
-    }
 
     @Test
     void isRuntimeRetention() {
@@ -44,24 +35,5 @@ class OnChangeTest {
     void targetsMethod() {
         var target = OnChange.class.getAnnotation(java.lang.annotation.Target.class);
         assertArrayEquals(new ElementType[]{ElementType.METHOD}, target.value());
-    }
-
-    @Test
-    void defaultOperationTypesIsEmpty() throws Exception {
-        Method m = Handler.class.getDeclaredMethod("handleAll");
-        OnChange ann = m.getAnnotation(OnChange.class);
-        assertNotNull(ann);
-        assertArrayEquals(new OperationType[]{}, ann.operationTypes());
-    }
-
-    @Test
-    void customOperationTypes() throws Exception {
-        Method m = Handler.class.getDeclaredMethod("handleFiltered");
-        OnChange ann = m.getAnnotation(OnChange.class);
-        assertNotNull(ann);
-        assertArrayEquals(
-                new OperationType[]{OperationType.INSERT, OperationType.UPDATE},
-                ann.operationTypes()
-        );
     }
 }

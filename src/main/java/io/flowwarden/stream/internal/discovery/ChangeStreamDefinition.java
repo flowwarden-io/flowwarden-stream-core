@@ -18,12 +18,9 @@ package io.flowwarden.stream.internal.discovery;
 import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
-import io.flowwarden.stream.annotation.OnChange;
 import io.flowwarden.stream.annotation.RetryPolicy;
-import org.springframework.core.annotation.AnnotationUtils;
 
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Holds everything needed to start a Change Stream subscription.
@@ -65,7 +62,7 @@ public record ChangeStreamDefinition(
     /**
      * Resolves the best handler for a given operation type.
      *
-     * <p>Priority: typed handler &gt; {@code @OnChange} fallback (with operationTypes filter check).</p>
+     * <p>Priority: typed handler &gt; {@code @OnChange} catch-all.</p>
      *
      * @param opType the operation type of the current event
      * @return the handler to invoke, or {@code null} if no handler matches (skip silently)
@@ -75,22 +72,6 @@ public record ChangeStreamDefinition(
         if (typed != null) {
             return typed;
         }
-        if (onChangeHandler != null && matchesOnChangeFilter(opType)) {
-            return onChangeHandler;
-        }
-        return null;
-    }
-
-    private boolean matchesOnChangeFilter(OperationType opType) {
-        OnChange onChangeAnn = AnnotationUtils.findAnnotation(
-                onChangeHandler.method(), OnChange.class);
-        if (onChangeAnn == null) {
-            return true;
-        }
-        OperationType[] filter = onChangeAnn.operationTypes();
-        if (filter.length == 0) {
-            return true; // empty = all types
-        }
-        return Set.of(filter).contains(opType);
+        return onChangeHandler;
     }
 }
