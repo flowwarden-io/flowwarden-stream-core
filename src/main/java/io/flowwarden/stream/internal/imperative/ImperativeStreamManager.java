@@ -525,9 +525,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         int count = eventCounters.computeIfAbsent(def.streamName(), k -> new AtomicInteger(0))
                 .incrementAndGet();
         if (count % def.checkpointAnnotation().saveEveryN() == 0) {
-            checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
-                    def.streamName(), null, token, timestamp,
-                    token, timestamp, Collections.emptyMap()));
+            checkpointStore.saveProcessed(def.streamName(), token, timestamp);
             FlowWardenMetrics.get().onCheckpoint(def.streamName(), token.toJson());
         }
     }
