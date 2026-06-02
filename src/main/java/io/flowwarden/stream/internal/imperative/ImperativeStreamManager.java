@@ -28,6 +28,7 @@ import io.flowwarden.stream.FullDocumentMode;
 import io.flowwarden.stream.HistoryLostException;
 import io.flowwarden.stream.OnHistoryLost;
 import io.flowwarden.stream.OperationType;
+import io.flowwarden.stream.ResumeStrategy;
 import io.flowwarden.stream.StartPosition;
 import io.flowwarden.stream.core.FlowWardenStreamManager;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
@@ -540,9 +541,9 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
     }
 
     /**
-     * Resume cascade: try lastProcessedToken (level 1), fall back to
-     * lastSeenToken if processed has aged out (level 2), apply onHistoryLost
-     * strategy if both have aged out (level 3).
+     * Resume cascade: try the primary token chosen by {@link ResumeStrategy}
+     * (level 1), fall back to the secondary if the primary has aged out
+     * (level 2), apply onHistoryLost strategy if both have aged out (level 3).
      */
     private void applyResumeCascade(String streamName,
                                     ChangeStreamDefinition def,
@@ -556,22 +557,45 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         io.flowwarden.stream.spi.Checkpoint cp = cpOpt.get();
         BsonDocument processedToken = cp.lastProcessedToken();
         BsonDocument seenToken = cp.lastSeenToken();
+        ResumeStrategy strategy = def.checkpointAnnotation().resumeStrategy();
 
-        // Level 1: try lastProcessedToken (preserves at-least-once)
-        if (processedToken != null && isTokenValid(def.collection(), processedToken, streamTemplate)) {
-            builder.resumeAfter(processedToken);
-            log.info("Resuming stream '{}' from lastProcessedToken", streamName);
+        BsonDocument primary;
+        BsonDocument secondary;
+        String primaryLabel;
+        String secondaryLabel;
+        Runnable onFallback;
+        switch (strategy) {
+            case SEEN_FIRST -> {
+                primary = seenToken;
+                secondary = processedToken;
+                primaryLabel = "lastSeenToken";
+                secondaryLabel = "lastProcessedToken";
+                onFallback = () -> FlowWardenMetrics.get().onResumeFallbackToProcessed(streamName);
+            }
+            case PROCESSED_FIRST -> {
+                primary = processedToken;
+                secondary = seenToken;
+                primaryLabel = "lastProcessedToken";
+                secondaryLabel = "lastSeenToken";
+                onFallback = () -> FlowWardenMetrics.get().onResumeFallbackToSeen(streamName);
+            }
+            default -> throw new IllegalStateException("Unknown ResumeStrategy: " + strategy);
+        }
+
+        // Level 1: try the primary token
+        if (primary != null && isTokenValid(def.collection(), primary, streamTemplate)) {
+            builder.resumeAfter(primary);
+            log.info("Resuming stream '{}' from {}", streamName, primaryLabel);
             return;
         }
 
-        // Level 2: fallback to lastSeenToken if it's distinct and still valid
-        if (seenToken != null
-                && !seenToken.equals(processedToken)
-                && isTokenValid(def.collection(), seenToken, streamTemplate)) {
-            builder.resumeAfter(seenToken);
-            log.warn("Resuming stream '{}' from lastSeenToken: lastProcessedToken aged out of oplog "
-                    + "(in-flight events at crash time are not redelivered)", streamName);
-            FlowWardenMetrics.get().onResumeFallbackToSeen(streamName);
+        // Level 2: fallback to the secondary if it's distinct and still valid
+        if (secondary != null
+                && !secondary.equals(primary)
+                && isTokenValid(def.collection(), secondary, streamTemplate)) {
+            builder.resumeAfter(secondary);
+            log.warn("Resuming stream '{}' from {}: {} aged out of oplog", streamName, secondaryLabel, primaryLabel);
+            onFallback.run();
             return;
         }
 

@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 3-level resume cascade for `@Checkpoint`: `lastProcessedToken` → `lastSeenToken` → `onHistoryLost`. When the saved `lastProcessedToken` has aged out of the MongoDB oplog, the stream now falls back to `lastSeenToken` (advanced by the `saveIntervalSeconds` timer) before escalating to the `onHistoryLost` strategy. Emits a `WARN` log and a `flowwarden.stream.resume.fallback_to_seen` counter on level-2 fallback.
 - Startup validation: `@Checkpoint(saveEveryN < 1)` is now rejected with a clear error.
 - Startup warning: `@Checkpoint(saveIntervalSeconds = 0, saveEveryN > 1)` logs a warning (the combination disables the resume cascade level-2 safety net).
-- `StreamMetricsProvider` SPI: new default methods `onResumeFallbackToSeen(streamName)`, `onResumeHistoryLost(streamName)`, and `onCheckpointLag(streamName, lagSeconds, lagEvents)` for monitoring the dual-token model.
+- `StreamMetricsProvider` SPI: new default methods `onResumeFallbackToSeen(streamName)`, `onResumeFallbackToProcessed(streamName)`, `onResumeHistoryLost(streamName)`, and `onCheckpointLag(streamName, lagSeconds, lagEvents)` for monitoring the dual-token model.
+- `@Checkpoint(resumeStrategy = …)` and new `ResumeStrategy` enum (`PROCESSED_FIRST` default, `SEEN_FIRST`). `PROCESSED_FIRST` preserves the existing strict at-least-once behavior. `SEEN_FIRST` makes the resume cascade start from the heartbeat-fresh `lastSeenToken` instead of `lastProcessedToken`, trading re-delivery of in-flight events for fast restart on low-volume or filter-heavy streams. `lastProcessedToken` remains the cascade fallback before `onHistoryLost`. Emits `flowwarden.stream.resume.fallback_to_processed` on level-2 fallback.
 - `@Checkpoint` and `@Filter` Javadoc updated to describe the dual-token model explicitly.
 
 ### Removed
