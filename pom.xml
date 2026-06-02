@@ -13,7 +13,7 @@
 
     <groupId>io.flowwarden</groupId>
     <artifactId>flowwarden-stream-core</artifactId>
-    <version>1.0.0-rc.1</version>
+    <version>1.0.0-rc.2-SNAPSHOT</version>
     <packaging>jar</packaging>
 
     <name>FlowWarden Stream Core</name>
