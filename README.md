@@ -8,7 +8,7 @@
   <a href="https://www.apache.org/licenses/LICENSE-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
   <a href="https://www.oracle.com/java/technologies/javase/jdk17-archive-downloads.html"><img src="https://img.shields.io/badge/Java-17%2B-orange.svg" alt="Java 17+"></a>
   <a href="https://spring.io/projects/spring-boot"><img src="https://img.shields.io/badge/Spring_Boot-3.x-brightgreen.svg" alt="Spring Boot 3.x"></a>
-  <!-- <a href="https://central.sonatype.com/artifact/io.flowwarden/flowwarden-stream-core"><img src="https://img.shields.io/maven-central/v/io.flowwarden/flowwarden-stream-core.svg" alt="Maven Central"></a> -->
+  <a href="https://central.sonatype.com/artifact/io.flowwarden/flowwarden-stream-core"><img src="https://img.shields.io/maven-central/v/io.flowwarden/flowwarden-stream-core.svg" alt="Maven Central"></a>
 </p>
 
 ---
@@ -42,13 +42,13 @@ The library automatically handles **checkpoint/resume**, **retry with exponentia
 <dependency>
     <groupId>io.flowwarden</groupId>
     <artifactId>flowwarden-stream-core</artifactId>
-    <version>1.0.0-rc.1</version>
+    <version>1.0.0-rc.2</version>
 </dependency>
 ```
 
 **Gradle**
 ```groovy
-implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.1'
+implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.2'
 ```
 
 ### 2. Configure your application
@@ -101,7 +101,8 @@ That's it. Start your app and every insert, update, replace, or delete on the `o
 )
 @Checkpoint(saveEveryN = 10, saveIntervalSeconds = 10)
 @RetryPolicy(maxAttempts = 5, initialDelay = "500ms", multiplier = 2.0)
-@DeadLetterQueue(collection = "orders_dlq", ttlDays = 30)
+@DeadLetterQueue(retentionDays = 30)
+@MongoDlqOptions(collection = "orders_dlq")
 public class OrderStreamHandler {
 
     private static final Logger log = LoggerFactory.getLogger(OrderStreamHandler.class);
@@ -196,7 +197,8 @@ All stream-level settings are configured via annotations on your `@ChangeStream`
 |------------|---------|--------------|
 | `@Checkpoint` | Resume token persistence | `saveEveryN = 1`, `saveIntervalSeconds = 5`, `startPosition = RESUME` |
 | `@RetryPolicy` | Exponential backoff on failure | `maxAttempts = 3`, `initialDelay = "500ms"`, `multiplier = 2.0`, `maxDelay = "30s"`, `jitter = true` |
-| `@DeadLetterQueue` | Route failed events to a DLQ | `enabled = true`, `collection = "_fw_dlq"`, `ttlDays = 30` |
+| `@DeadLetterQueue` | Route failed events to a DLQ (backend-agnostic) | `enabled = true`, `retentionDays = 30` |
+| `@MongoDlqOptions` | MongoDB-specific DLQ tuning (collection override) | `collection = "_fw_dlq"` (overrides `flowwarden.dlq.mongo.collection`) |
 
 See the [Comprehensive Example](#comprehensive-example) above for usage, or the [documentation](https://docs.flowwarden.io) for the full reference.
 
