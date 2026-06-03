@@ -31,7 +31,7 @@ import java.util.List;
  * @param retry            retry policy configuration (null if not configured)
  * @param dlq              dead letter queue configuration (null if not configured)
  * @param handlers         list of registered handler types (e.g., "INSERT", "UPDATE", "ON_CHANGE")
- * @param deploymentMode   deployment strategy (ALL_INSTANCES, SINGLE_LEADER, PARTITIONED)
+ * @param deploymentMode   deployment strategy (ALL_INSTANCES, SINGLE_LEADER)
  */
 public record StreamConfiguration(
         String streamName,

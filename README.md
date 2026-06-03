@@ -168,7 +168,6 @@ For other Spring beans (e.g., a `MongoTemplate`), inject them via the handler cl
 |------|-------------|----------|
 | `ALL_INSTANCES` | Every instance receives every event independently. No coordination. | **Default.** Cache invalidation, local state refresh, read-model projections. |
 | `SINGLE_LEADER` | One active instance processes events; others are on standby. Automatic leader election via MongoDB distributed locks (`_fw_locks`). | Order processing, billing, notifications — anything requiring exactly-once semantics. |
-| `PARTITIONED` | *(Not yet implemented.)* Events distributed across instances based on a document key. | High-throughput streams where events for the same entity must be processed in order. |
 
 ## Compatibility
 
