@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Removed
+
+### Fixed
+
+### Deprecated
+
+### Security
+
+## [1.0.0-rc.2] — 2026-06-03
+
+### Added
 - `CheckpointStore.saveSeen(streamName, token, ts)` and `CheckpointStore.saveProcessed(streamName, token, ts)` SPI methods for targeted token writes. The default implementation delegates to `findByStreamName + save` so external store implementations continue to work unchanged. `MongoCheckpointStore` and `ReactiveMongoCheckpointStore` override with a native `upsert` that targets only the relevant pair of fields, avoiding a hot-path read.
 - 3-level resume cascade for `@Checkpoint`: `lastProcessedToken` → `lastSeenToken` → `onHistoryLost`. When the saved `lastProcessedToken` has aged out of the MongoDB oplog, the stream now falls back to `lastSeenToken` (advanced by the `saveIntervalSeconds` timer) before escalating to the `onHistoryLost` strategy. Emits a `WARN` log and a `flowwarden.stream.resume.fallback_to_seen` counter on level-2 fallback.
 - Startup validation: `@Checkpoint(saveEveryN < 1)` is now rejected with a clear error.
@@ -84,5 +98,6 @@ First release candidate of FlowWarden Stream Core.
 - `DeploymentMode.PARTITIONED` — defined in the enum but not yet implemented, reserved for a future release
 - Watchdog / zombie stream detection — planned for a future release
 
-[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.1...HEAD
+[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.2...HEAD
+[1.0.0-rc.2]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.1
