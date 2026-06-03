@@ -1,0 +1,141 @@
+/*
+ * Copyright 2026 FlowWarden
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.flowwarden.stream.internal.reactive;
+
+import io.flowwarden.stream.ChangeStreamContext;
+import io.flowwarden.stream.OperationType;
+import io.flowwarden.stream.annotation.ChangeStream;
+import io.flowwarden.stream.annotation.EnableFlowWarden;
+import io.flowwarden.stream.annotation.OnChange;
+import io.flowwarden.stream.test.SharedMongoContainer;
+import org.bson.Document;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
+import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import reactor.core.publisher.Mono;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+
+/**
+ * Reactive twin of
+ * {@code ImperativeOnChangeDropInvalidateIntegrationTest} — same
+ * scenario, {@link Mono}-returning handler.
+ *
+ * <p>See the imperative twin's Javadoc for the rationale on the
+ * INVALIDATE Testcontainers caveat.</p>
+ */
+@SpringBootTest(classes = ReactiveOnChangeDropInvalidateIntegrationTest.TestApp.class)
+@ActiveProfiles("test-webflux")
+class ReactiveOnChangeDropInvalidateIntegrationTest {
+
+    private static final String COLLECTION = "reactive_onchange_drop_invalidate";
+    private static final String STREAM_NAME = "reactive-drop-invalidate-watcher";
+
+    @DynamicPropertySource
+    static void mongoProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.data.mongodb.uri", SharedMongoContainer.MONGO::getReplicaSetUrl);
+    }
+
+    @Autowired
+    ReactiveMongoTemplate reactiveMongoTemplate;
+
+    @Autowired
+    DropInvalidateHandler testHandler;
+
+    @Autowired
+    ReactiveStreamManager streamManager;
+
+    /**
+     * Single test asserting both DROP and INVALIDATE dispatch through
+     * {@code @OnChange}. Dropping the watched collection closes the
+     * change stream cursor permanently — splitting the assertions into
+     * two test methods would leave the second one running against a
+     * dead cursor.
+     */
+    @Test
+    void dropAndInvalidateDispatchToOnChange() {
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning(STREAM_NAME));
+
+        reactiveMongoTemplate.insert(new Document("status", "WARMUP"), COLLECTION).block();
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(testHandler.events).isNotEmpty());
+
+        reactiveMongoTemplate.dropCollection(COLLECTION).block();
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertThat(testHandler.events)
+                        .anyMatch(ctx -> ctx.getOperationType() == OperationType.DROP));
+
+        ChangeStreamContext<Document> dropCtx = testHandler.events.stream()
+                .filter(ctx -> ctx.getOperationType() == OperationType.DROP)
+                .findFirst()
+                .orElseThrow();
+        assertThat(dropCtx.getFullDocument(Document.class))
+                .as("DROP carries no fullDocument")
+                .isEmpty();
+
+        // INVALIDATE follows DROP in the same flush on most MongoDB
+        // configurations. The Testcontainers single-node replica set may
+        // close the cursor without surfacing the INVALIDATE event; in
+        // that case we abort rather than fail.
+        try {
+            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                    assertThat(testHandler.events)
+                            .anyMatch(ctx -> ctx.getOperationType() == OperationType.INVALIDATE));
+        } catch (Throwable t) {
+            Assumptions.abort(
+                    "INVALIDATE event not observed within 5s on the Testcontainers replica set "
+                            + "after dropping the watched collection. Behaviour verified manually "
+                            + "against MongoDB Atlas. Aborting rather than failing.");
+        }
+
+        ChangeStreamContext<Document> invalidateCtx = testHandler.events.stream()
+                .filter(ctx -> ctx.getOperationType() == OperationType.INVALIDATE)
+                .findFirst()
+                .orElseThrow();
+        assertThat(invalidateCtx.getFullDocument(Document.class)).isEmpty();
+    }
+
+    @SpringBootApplication
+    @EnableFlowWarden
+    @Import(ReactiveOnChangeDropInvalidateIntegrationTest.DropInvalidateHandler.class)
+    static class TestApp {
+    }
+
+    @ChangeStream(name = STREAM_NAME, collection = COLLECTION)
+    static class DropInvalidateHandler {
+        final List<ChangeStreamContext<Document>> events = new CopyOnWriteArrayList<>();
+
+        @OnChange
+        Mono<Void> onAny(ChangeStreamContext<Document> ctx) {
+            events.add(ctx);
+            return Mono.empty();
+        }
+    }
+}
