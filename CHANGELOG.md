@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `@MongoDlqOptions` annotation in `io.flowwarden.stream.annotation` for MongoDB-specific per-stream DLQ tuning (currently `collection`). Used together with `@DeadLetterQueue` when the user wants to route failed events for a given stream to a non-default Mongo collection.
 - `flowwarden.dlq.mongo.collection` configuration property (default `_fw_dlq`) for the backend-level default collection used by streams without `@MongoDlqOptions`. Bound via `MongoDlqProperties`.
 - `DlqPolicy` SPI record (`retentionDays`, `includeOriginalDocument`, `includeStackTrace`) in `io.flowwarden.stream.spi`. Built from `@DeadLetterQueue` and passed to `DlqStore.save` so custom impls can honour cross-cutting policy without parsing annotations themselves.
+- `TransactionInfo` record in `io.flowwarden.stream` and `ChangeStreamContext.getTransactionInfo()` accessor. Exposes MongoDB transaction metadata (`lsid`, `txnNumber`) for handlers that need to group events of the same transaction — audit logs, aggregation, atomicity-preserving downstream propagation. Returns `Optional.empty()` for non-transactional operations. Additive SPI surface, backward compatible.
 
 ### Changed
 - **Breaking:** `@DeadLetterQueue` is now backend-agnostic. The `collection` attribute is removed (moved to `@MongoDlqOptions`) and `ttlDays` is renamed `retentionDays` to reflect that each backend translates retention to its native mechanism (Mongo TTL index, Kafka `retention.ms`, Rabbit `x-message-ttl`, JDBC scheduled cleanup).
