@@ -16,7 +16,6 @@
 package io.flowwarden.stream.internal.discovery;
 
 import io.flowwarden.stream.ChangeStreamContext;
-import io.flowwarden.stream.DeploymentMode;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.FullDocumentMode;
 import io.flowwarden.stream.OperationType;
@@ -179,13 +178,6 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
 
         // Validate: fullDocumentBeforeChange with only INSERT handlers (no pre-image)
         validateFullDocumentBeforeChangeCompatibility(annotation, typedHandlers, targetClass, beanName);
-
-        // Validate deployment mode
-        if (annotation.deploymentMode() == DeploymentMode.PARTITIONED) {
-            throw new BeanCreationException(beanName,
-                    "@ChangeStream on " + targetClass.getName()
-                            + " uses deploymentMode = PARTITIONED which is not yet implemented.");
-        }
 
         String streamName = resolveStreamName(annotation, targetClass);
         String collection = resolveCollection(annotation, targetClass, beanName);

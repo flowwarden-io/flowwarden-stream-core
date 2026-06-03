@@ -34,11 +34,5 @@ public enum DeploymentMode {
      * Other instances are on standby and take over if the leader fails.
      * Uses MongoDB-based distributed locking ({@code _fw_locks} collection).
      */
-    SINGLE_LEADER,
-
-    /**
-     * Each instance processes a subset of events based on a partition key hash.
-     * <b>Not yet implemented — reserved for future use.</b>
-     */
-    PARTITIONED
+    SINGLE_LEADER
 }
