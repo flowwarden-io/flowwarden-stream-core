@@ -8,8 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New artifact **`flowwarden-stream-core-testkit`** (`io.flowwarden:flowwarden-stream-core-testkit`) shipping abstract behavior contracts for the SPI surface: `LockServiceContractTest`, `CheckpointStoreContractTest`, `DlqStoreContractTest`. Backend implementors (e.g. a Redis-backed `LockService`) depend on this artifact in test scope and extend the contract class to validate their implementation against the public SPI semantics.
+- New artifact **`flowwarden-bom`** (`io.flowwarden:flowwarden-bom`, packaging `pom`) coordinating compatible versions of the FlowWarden ecosystem (currently `flowwarden-stream-core` and `flowwarden-stream-core-testkit`; satellite backends will be added as they ship). Import in your `dependencyManagement` to drop per-dependency `<version>` tags.
 
 ### Changed
+- The repo is now a Maven multi-module reactor (parent pom + `flowwarden-stream-core` + `flowwarden-stream-core-testkit` + `flowwarden-bom`). User-facing coordinates and behavior of `flowwarden-stream-core` are unchanged — no consumer migration required. The build commands at the repo root (`./mvnw clean verify`, `./mvnw -P release deploy`) keep working unchanged thanks to the reactor.
 
 ### Removed
 
