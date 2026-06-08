@@ -43,6 +43,7 @@ import io.flowwarden.stream.internal.discovery.HandlerMethod;
 import io.flowwarden.stream.internal.discovery.PipelineMethod;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
 import io.flowwarden.stream.spi.ChangeEventMetadata;
+import io.flowwarden.stream.spi.StopReason;
 import io.flowwarden.stream.spi.StreamConfiguration;
 import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
@@ -61,6 +62,7 @@ import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.messaging.ChangeStreamRequest;
 import org.springframework.data.mongodb.core.messaging.DefaultMessageListenerContainer;
 import org.springframework.data.mongodb.core.messaging.Message;
+import org.springframework.data.mongodb.core.messaging.MessageListener;
 import org.springframework.data.mongodb.core.messaging.MessageListenerContainer;
 import org.springframework.data.mongodb.core.messaging.Subscription;
 
@@ -162,9 +164,12 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         MongoTemplate streamTemplate = templateFor(def);
         MessageListenerContainer container = new DefaultMessageListenerContainer(streamTemplate);
 
+        MessageListener<ChangeStreamDocument<Document>, Document> listener =
+                new FlowWardenMessageListenerWrapper(
+                        message -> handleMessage(message, def), def.streamName());
         ChangeStreamRequest.ChangeStreamRequestBuilder<Document> builder = ChangeStreamRequest.builder()
                 .collection(def.collection())
-                .publishTo(message -> handleMessage(message, def));
+                .publishTo(listener);
 
         if (def.checkpointAnnotation() != null
                 && def.checkpointAnnotation().startPosition() == StartPosition.RESUME) {
@@ -218,7 +223,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             log.warn("Error stopping stream '{}'", streamName, e);
         }
 
-        FlowWardenMetrics.get().onStreamStopped(streamName);
+        FlowWardenMetrics.get().onStreamStopped(streamName, StopReason.GRACEFUL, null);
         log.info("Stopped Change Stream '{}'", streamName);
     }
 

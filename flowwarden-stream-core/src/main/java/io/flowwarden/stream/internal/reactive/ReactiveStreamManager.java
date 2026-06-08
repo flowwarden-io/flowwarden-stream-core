@@ -48,6 +48,7 @@ import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
 import io.flowwarden.stream.spi.FailedEvent;
+import io.flowwarden.stream.spi.StopReason;
 import io.flowwarden.stream.spi.StreamConfiguration;
 import jakarta.annotation.PreDestroy;
 import org.bson.BsonDocument;
@@ -75,6 +76,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -108,7 +110,9 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
     private record ReactiveStreamState(
             Disposable disposable,
-            ChangeStreamDefinition definition) {
+            ChangeStreamDefinition definition,
+            AtomicBoolean gracefulStop,
+            AtomicReference<Throwable> lastError) {
     }
 
     public ReactiveStreamManager(MongoTemplateRegistry templateRegistry,
@@ -184,6 +188,8 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         ChangeStreamOptions options = optionsBuilder.build();
 
         ReactiveMongoTemplate streamTemplate = templateFor(def);
+        AtomicBoolean gracefulStop = new AtomicBoolean(false);
+        AtomicReference<Throwable> lastError = new AtomicReference<>();
         Disposable disposable = streamTemplate
                 .changeStream(def.collection(), options, Document.class)
                 .concatMap(event -> {
@@ -193,15 +199,27 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     }
                     return Mono.empty();
                 })
-                .doOnError(e -> log.error("Error in reactive Change Stream '{}': {}",
-                        streamName, e.getMessage(), e))
+                .doOnError(e -> {
+                    lastError.set(e);
+                    log.error("Error in reactive Change Stream '{}': {}",
+                            streamName, e.getMessage(), e);
+                })
                 .onErrorResume(e -> {
                     FlowWardenMetrics.get().onEventError(streamName, e, true, 0, null);
                     return Mono.empty();
                 })
+                .doFinally(signal -> {
+                    if (gracefulStop.get()) {
+                        FlowWardenMetrics.get().onStreamStopped(
+                                streamName, StopReason.GRACEFUL, null);
+                    } else {
+                        FlowWardenMetrics.get().onStreamStopped(
+                                streamName, StopReason.CRASHED, lastError.get());
+                    }
+                })
                 .subscribe();
 
-        streams.put(streamName, new ReactiveStreamState(disposable, def));
+        streams.put(streamName, new ReactiveStreamState(disposable, def, gracefulStop, lastError));
         scheduleIntervalCheckpoint(def);
         log.info("Started reactive Change Stream '{}' on collection '{}'",
                 streamName, def.collection());
@@ -223,13 +241,15 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             return;
         }
 
+        state.gracefulStop().set(true);
         try {
             state.disposable().dispose();
         } catch (Exception e) {
             log.warn("Error stopping stream '{}'", streamName, e);
         }
 
-        FlowWardenMetrics.get().onStreamStopped(streamName);
+        // onStreamStopped(GRACEFUL) is emitted by the .doFinally hook on the pipeline
+        // once the dispose() above triggers the CANCEL signal.
         log.info("Stopped reactive Change Stream '{}'", streamName);
     }
 
