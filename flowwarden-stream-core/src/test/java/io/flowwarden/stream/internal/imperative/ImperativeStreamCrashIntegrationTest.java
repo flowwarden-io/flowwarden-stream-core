@@ -38,6 +38,7 @@ import org.springframework.test.context.DynamicPropertySource;
 
 import java.time.Duration;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -94,6 +95,14 @@ class ImperativeStreamCrashIntegrationTest {
                         eq("imp-crash-test"),
                         eq(StopReason.CRASHED),
                         same(injectedCause)));
+
+        // Per-stream state must be cleared so the public APIs stop lying
+        // once the container thread is dead.
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThat(streamManager.isRunning("imp-crash-test")).isFalse();
+                    assertThat(streamManager.getLastEventTime("imp-crash-test")).isNull();
+                });
     }
 
     @Test
@@ -108,6 +117,9 @@ class ImperativeStreamCrashIntegrationTest {
                         eq("imp-graceful-test"),
                         eq(StopReason.GRACEFUL),
                         isNull()));
+
+        assertThat(streamManager.isRunning("imp-graceful-test")).isFalse();
+        assertThat(streamManager.getLastEventTime("imp-graceful-test")).isNull();
     }
 
     @SpringBootApplication
