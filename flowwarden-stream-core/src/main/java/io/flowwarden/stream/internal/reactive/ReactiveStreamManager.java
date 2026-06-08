@@ -216,6 +216,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                         FlowWardenMetrics.get().onStreamStopped(
                                 streamName, StopReason.CRASHED, lastError.get());
                     }
+                    // Evict per-stream state so isRunning / getLastEventTime
+                    // stop lying once the pipeline has terminated.
+                    streams.remove(streamName);
+                    lastActivityTimes.remove(streamName);
+                    eventCounters.remove(streamName);
                 })
                 .subscribe();
 
@@ -241,6 +246,9 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             return;
         }
 
+        lastActivityTimes.remove(streamName);
+        eventCounters.remove(streamName);
+
         state.gracefulStop().set(true);
         try {
             state.disposable().dispose();
@@ -249,7 +257,8 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         }
 
         // onStreamStopped(GRACEFUL) is emitted by the .doFinally hook on the pipeline
-        // once the dispose() above triggers the CANCEL signal.
+        // once the dispose() above triggers the CANCEL signal. The doFinally also
+        // re-runs the state evictions above (idempotent) for the crash path.
         log.info("Stopped reactive Change Stream '{}'", streamName);
     }
 

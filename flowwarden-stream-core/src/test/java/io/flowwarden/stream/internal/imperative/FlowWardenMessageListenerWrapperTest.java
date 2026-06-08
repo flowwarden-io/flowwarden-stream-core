@@ -22,11 +22,14 @@ import io.flowwarden.stream.spi.StreamMetricsProvider;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.springframework.data.mongodb.core.messaging.Message;
 import org.springframework.data.mongodb.core.messaging.MessageListener;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -47,8 +50,9 @@ class FlowWardenMessageListenerWrapperTest {
         MessageListener<ChangeStreamDocument<Document>, Document> delegate = msg -> {
             throw cause;
         };
+        Runnable onCrash = mock(Runnable.class);
         FlowWardenMessageListenerWrapper wrapper =
-                new FlowWardenMessageListenerWrapper(delegate, "test-stream");
+                new FlowWardenMessageListenerWrapper(delegate, "test-stream", onCrash);
 
         assertThatThrownBy(() -> wrapper.onMessage(fakeMessage()))
                 .isSameAs(cause);
@@ -65,8 +69,9 @@ class FlowWardenMessageListenerWrapperTest {
         MessageListener<ChangeStreamDocument<Document>, Document> delegate = msg -> {
             throw cause;
         };
+        Runnable onCrash = mock(Runnable.class);
         FlowWardenMessageListenerWrapper wrapper =
-                new FlowWardenMessageListenerWrapper(delegate, "test-stream");
+                new FlowWardenMessageListenerWrapper(delegate, "test-stream", onCrash);
 
         assertThatThrownBy(() -> wrapper.onMessage(fakeMessage()))
                 .isSameAs(cause);
@@ -75,25 +80,69 @@ class FlowWardenMessageListenerWrapperTest {
     }
 
     @Test
-    void onMessage_successfulDelegate_doesNotEmitStreamStopped() {
+    void onMessage_crash_invokesOnCrashAfterEmittingStreamStopped() {
+        StreamMetricsProvider metrics = mock(StreamMetricsProvider.class);
+        FlowWardenMetrics.setProvider(metrics);
+
+        RuntimeException cause = new RuntimeException("boom");
+        MessageListener<ChangeStreamDocument<Document>, Document> delegate = msg -> {
+            throw cause;
+        };
+        Runnable onCrash = mock(Runnable.class);
+        FlowWardenMessageListenerWrapper wrapper =
+                new FlowWardenMessageListenerWrapper(delegate, "test-stream", onCrash);
+
+        assertThatThrownBy(() -> wrapper.onMessage(fakeMessage()))
+                .isSameAs(cause);
+
+        InOrder order = inOrder(metrics, onCrash);
+        order.verify(metrics).onStreamStopped("test-stream", StopReason.CRASHED, cause);
+        order.verify(onCrash).run();
+    }
+
+    @Test
+    void onMessage_successfulDelegate_doesNotEmitStreamStoppedNorInvokeOnCrash() {
         StreamMetricsProvider metrics = mock(StreamMetricsProvider.class);
         FlowWardenMetrics.setProvider(metrics);
 
         MessageListener<ChangeStreamDocument<Document>, Document> delegate = msg -> {
             // no-op, succeeds
         };
+        Runnable onCrash = mock(Runnable.class);
         FlowWardenMessageListenerWrapper wrapper =
-                new FlowWardenMessageListenerWrapper(delegate, "test-stream");
+                new FlowWardenMessageListenerWrapper(delegate, "test-stream", onCrash);
 
         wrapper.onMessage(fakeMessage());
 
         verify(metrics, never()).onStreamStopped(any(), any(), any());
+        verify(onCrash, never()).run();
+    }
+
+    @Test
+    void onMessage_onCrashThrows_originalCauseStillPropagatesWithSuppressed() {
+        FlowWardenMetrics.setProvider(mock(StreamMetricsProvider.class));
+
+        RuntimeException originalCause = new RuntimeException("delegate boom");
+        RuntimeException cleanupError = new RuntimeException("cleanup boom");
+        MessageListener<ChangeStreamDocument<Document>, Document> delegate = msg -> {
+            throw originalCause;
+        };
+        Runnable onCrash = () -> {
+            throw cleanupError;
+        };
+        FlowWardenMessageListenerWrapper wrapper =
+                new FlowWardenMessageListenerWrapper(delegate, "test-stream", onCrash);
+
+        assertThatThrownBy(() -> wrapper.onMessage(fakeMessage()))
+                .isSameAs(originalCause);
+
+        assertThat(originalCause.getSuppressed()).containsExactly(cleanupError);
     }
 
     @Test
     void constructor_rejectsNullDelegate() {
         assertThatThrownBy(() ->
-                new FlowWardenMessageListenerWrapper(null, "test-stream"))
+                new FlowWardenMessageListenerWrapper(null, "test-stream", () -> {}))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -101,7 +150,15 @@ class FlowWardenMessageListenerWrapperTest {
     void constructor_rejectsNullStreamName() {
         MessageListener<ChangeStreamDocument<Document>, Document> delegate = msg -> {};
         assertThatThrownBy(() ->
-                new FlowWardenMessageListenerWrapper(delegate, null))
+                new FlowWardenMessageListenerWrapper(delegate, null, () -> {}))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void constructor_rejectsNullOnCrash() {
+        MessageListener<ChangeStreamDocument<Document>, Document> delegate = msg -> {};
+        assertThatThrownBy(() ->
+                new FlowWardenMessageListenerWrapper(delegate, "test-stream", null))
                 .isInstanceOf(NullPointerException.class);
     }
 

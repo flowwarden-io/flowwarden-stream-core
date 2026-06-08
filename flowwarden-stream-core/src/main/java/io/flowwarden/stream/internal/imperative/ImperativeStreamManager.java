@@ -166,7 +166,9 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
 
         MessageListener<ChangeStreamDocument<Document>, Document> listener =
                 new FlowWardenMessageListenerWrapper(
-                        message -> handleMessage(message, def), def.streamName());
+                        message -> handleMessage(message, def),
+                        def.streamName(),
+                        () -> clearStreamState(def.streamName()));
         ChangeStreamRequest.ChangeStreamRequestBuilder<Document> builder = ChangeStreamRequest.builder()
                 .collection(def.collection())
                 .publishTo(listener);
@@ -216,6 +218,9 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             return;
         }
 
+        lastActivityTimes.remove(streamName);
+        eventCounters.remove(streamName);
+
         try {
             state.subscription().cancel();
             state.container().stop();
@@ -225,6 +230,23 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
 
         FlowWardenMetrics.get().onStreamStopped(streamName, StopReason.GRACEFUL, null);
         log.info("Stopped Change Stream '{}'", streamName);
+    }
+
+    /**
+     * Cleanup invoked by {@link FlowWardenMessageListenerWrapper} when the
+     * container thread dies on an uncaught throwable. Evicts the per-stream
+     * state so {@link #isRunning} and {@link #getLastEventTime} stop lying
+     * once the worker is dead.
+     */
+    private void clearStreamState(String streamName) {
+        streams.remove(streamName);
+        lastActivityTimes.remove(streamName);
+        eventCounters.remove(streamName);
+        latestTokens.remove(streamName);
+        ScheduledFuture<?> task = intervalTasks.remove(streamName);
+        if (task != null) {
+            task.cancel(false);
+        }
     }
 
     @Override

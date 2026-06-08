@@ -27,24 +27,36 @@ import java.util.Objects;
 /**
  * Wraps a {@link MessageListener} so any {@link Throwable} escaping the
  * delegate is reported via {@link FlowWardenMetrics#get()
- * onStreamStopped(streamName, CRASHED, cause)} before propagating to Spring.
+ * onStreamStopped(streamName, CRASHED, cause)} and the supplied {@code onCrash}
+ * cleanup callback fires before the throwable propagates to Spring.
  *
  * <p>Spring's {@code MessageListenerContainer} does not expose an error
  * callback that stream-core can hook. Without this wrapper, an uncaught
  * exception from the listener silently kills the container's worker thread
  * and the console keeps reporting the stream as {@code RUNNING} forever.</p>
+ *
+ * <p>The {@code onCrash} callback is the manager's hook to evict the stream's
+ * entries from its internal state maps (e.g. {@code streams},
+ * {@code lastActivityTimes}, {@code eventCounters}) so the public
+ * {@code isRunning} / {@code getLastEventTime} APIs stop lying once the
+ * container thread is dead. Any exception thrown by the cleanup callback is
+ * suppressed onto the original throwable &mdash; cleanup is best-effort and
+ * must never replace the cause Spring will see.</p>
  */
 final class FlowWardenMessageListenerWrapper
         implements MessageListener<ChangeStreamDocument<Document>, Document> {
 
     private final MessageListener<ChangeStreamDocument<Document>, Document> delegate;
     private final String streamName;
+    private final Runnable onCrash;
 
     FlowWardenMessageListenerWrapper(
             MessageListener<ChangeStreamDocument<Document>, Document> delegate,
-            String streamName) {
+            String streamName,
+            Runnable onCrash) {
         this.delegate = Objects.requireNonNull(delegate, "delegate must not be null");
         this.streamName = Objects.requireNonNull(streamName, "streamName must not be null");
+        this.onCrash = Objects.requireNonNull(onCrash, "onCrash must not be null");
     }
 
     @Override
@@ -53,6 +65,11 @@ final class FlowWardenMessageListenerWrapper
             delegate.onMessage(message);
         } catch (Throwable t) {
             FlowWardenMetrics.get().onStreamStopped(streamName, StopReason.CRASHED, t);
+            try {
+                onCrash.run();
+            } catch (RuntimeException cleanupError) {
+                t.addSuppressed(cleanupError);
+            }
             throw t;
         }
     }

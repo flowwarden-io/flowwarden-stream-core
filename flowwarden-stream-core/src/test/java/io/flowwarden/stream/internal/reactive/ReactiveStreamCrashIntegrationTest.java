@@ -39,6 +39,7 @@ import reactor.core.publisher.Mono;
 
 import java.time.Duration;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -97,6 +98,14 @@ class ReactiveStreamCrashIntegrationTest {
                         eq("rea-crash-test"),
                         eq(StopReason.CRASHED),
                         same(injectedCause)));
+
+        // Per-stream state must be cleared so the public APIs stop lying
+        // once the pipeline has terminated unexpectedly.
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThat(streamManager.isRunning("rea-crash-test")).isFalse();
+                    assertThat(streamManager.getLastEventTime("rea-crash-test")).isNull();
+                });
     }
 
     @Test
@@ -111,6 +120,9 @@ class ReactiveStreamCrashIntegrationTest {
                         eq("rea-graceful-test"),
                         eq(StopReason.GRACEFUL),
                         isNull()));
+
+        assertThat(streamManager.isRunning("rea-graceful-test")).isFalse();
+        assertThat(streamManager.getLastEventTime("rea-graceful-test")).isNull();
     }
 
     @SpringBootApplication
