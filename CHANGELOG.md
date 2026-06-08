@@ -10,13 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - New artifact **`flowwarden-stream-core-testkit`** (`io.flowwarden:flowwarden-stream-core-testkit`) shipping abstract behavior contracts for the SPI surface: `LockServiceContractTest`, `CheckpointStoreContractTest`, `DlqStoreContractTest`. Backend implementors (e.g. a Redis-backed `LockService`) depend on this artifact in test scope and extend the contract class to validate their implementation against the public SPI semantics.
 - New artifact **`flowwarden-bom`** (`io.flowwarden:flowwarden-bom`, packaging `pom`) coordinating compatible versions of the FlowWarden ecosystem (currently `flowwarden-stream-core` and `flowwarden-stream-core-testkit`; satellite backends will be added as they ship). Import in your `dependencyManagement` to drop per-dependency `<version>` tags.
+- `StreamMetricsProvider.onCheckpointFailed(streamName, cause)` — new SPI callback (default no-op) emitted when a `CheckpointStore` write throws. Use it to wire alerting on checkpoint store outages or stale-checkpoint detection in custom metrics providers.
 
 ### Changed
 - The repo is now a Maven multi-module reactor (parent pom + `flowwarden-stream-core` + `flowwarden-stream-core-testkit` + `flowwarden-bom`). User-facing coordinates and behavior of `flowwarden-stream-core` are unchanged — no consumer migration required. The build commands at the repo root (`./mvnw clean verify`, `./mvnw -P release deploy`) keep working unchanged thanks to the reactor.
+- `StreamMetricsProvider.onCheckpoint(streamName, resumeToken)` is now emitted **after** the checkpoint write succeeds, not before. The previous timing meant the metric reported success even on failed writes, which made it unsafe for monitoring. Custom providers relying on this signal will now see accurate state — failed writes route through `onCheckpointFailed` instead.
 
 ### Removed
 
 ### Fixed
+- Checkpoint write failures (e.g. `MongoWriteConcernException` on `wtimeout`, Redis command timeout, JDBC transient errors) no longer kill the imperative `MessageListenerContainer` thread nor escape the reactive pipeline. Previously, an exception thrown from the checkpoint store either silently terminated the imperative listener thread (leaving the console reporting the stream as `RUNNING` indefinitely) or escaped the reactive `doOnSuccess` side-effect and drifted the persisted token. The stream now keeps processing; the failure is logged at `WARN` and reported via the new `StreamMetricsProvider.onCheckpointFailed` signal. All three checkpoint paths are covered: post-handler `saveProcessed`, manual `ctx.saveCheckpointNow()`, and the periodic `saveSeen` timer.
 
 ### Deprecated
 
