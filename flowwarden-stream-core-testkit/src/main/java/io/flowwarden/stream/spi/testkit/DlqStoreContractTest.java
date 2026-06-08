@@ -13,50 +13,54 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.dlq;
+package io.flowwarden.stream.spi.testkit;
 
-import com.mongodb.client.MongoClients;
 import io.flowwarden.stream.spi.DlqPolicy;
+import io.flowwarden.stream.spi.DlqStore;
 import io.flowwarden.stream.spi.FailedEvent;
-import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.BsonDocument;
 import org.bson.BsonString;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.index.IndexInfo;
-import org.springframework.data.mongodb.core.query.Query;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Collections;
-import java.util.List;
 import java.util.Map;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class MongoDlqStoreIntegrationTest {
+/**
+ * Behavior contract that every {@link DlqStore} implementation must satisfy.
+ *
+ * <p>Subclass for each backend (Mongo, Redis, Kafka, …) and provide a fresh
+ * {@link DlqStore} via {@link #createDlqStore()} plus a {@link #cleanState()}
+ * hook that resets the backing storage between tests.</p>
+ */
+public abstract class DlqStoreContractTest {
 
-    private static final String DEFAULT_COLLECTION = "_fw_dlq";
-    private static final String CUSTOM_COLLECTION = "orders_dlq";
+    protected static final DlqPolicy DEFAULT_POLICY = new DlqPolicy(30, true, true);
 
-    private static final DlqPolicy DEFAULT_POLICY = new DlqPolicy(30, true, true);
+    protected DlqStore store;
 
-    private MongoTemplate mongoTemplate;
-    private MongoDlqStore store;
+    /**
+     * Returns a fresh {@link DlqStore} bound to a clean backend.
+     */
+    protected abstract DlqStore createDlqStore();
+
+    /**
+     * Clears all state in the backing storage so tests are isolated.
+     */
+    protected abstract void cleanState();
 
     @BeforeEach
-    void setUp() {
-        mongoTemplate = new MongoTemplate(
-                MongoClients.create(SharedMongoContainer.MONGO.getReplicaSetUrl()), "test"
-        );
-        mongoTemplate.remove(new Query(), DEFAULT_COLLECTION);
-        mongoTemplate.remove(new Query(), CUSTOM_COLLECTION);
-
-        MongoDlqProperties properties = new MongoDlqProperties();
-        store = new MongoDlqStore(mongoTemplate, properties);
+    void setUpContract() {
+        cleanState();
+        store = createDlqStore();
     }
 
     @Test
@@ -163,46 +167,7 @@ class MongoDlqStoreIntegrationTest {
         assertEquals(5, found.attempts());
     }
 
-    @Test
-    void registerStreamRoutesToCustomCollection() {
-        store.registerStream("orders-stream", CUSTOM_COLLECTION);
-
-        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
-        store.save(makeEvent("evt-orders", "orders-stream", now), DEFAULT_POLICY);
-
-        // Document landed in the custom collection, not the default one
-        assertThat(mongoTemplate.findAll(Document.class, CUSTOM_COLLECTION)).hasSize(1);
-        assertThat(mongoTemplate.findAll(Document.class, DEFAULT_COLLECTION)).isEmpty();
-
-        // findByStreamName routes back to the same custom collection
-        List<FailedEvent> found = store.findByStreamName("orders-stream");
-        assertEquals(1, found.size());
-        assertEquals("evt-orders", found.get(0).id());
-    }
-
-    @Test
-    void registerStreamWithEmptyCollectionUsesDefault() {
-        store.registerStream("default-stream", "");
-
-        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
-        store.save(makeEvent("evt-default", "default-stream", now), DEFAULT_POLICY);
-
-        assertThat(mongoTemplate.findAll(Document.class, DEFAULT_COLLECTION)).hasSize(1);
-    }
-
-    @Test
-    void registerStreamCreatesTtlIndexOnExpiresAt() {
-        store.registerStream("ttl-stream", CUSTOM_COLLECTION);
-
-        IndexInfo ttlIndex = mongoTemplate.indexOps(CUSTOM_COLLECTION).getIndexInfo().stream()
-                .filter(idx -> idx.getIndexFields().stream()
-                        .anyMatch(f -> "expiresAt".equals(f.getKey())))
-                .findFirst()
-                .orElseThrow(() -> new AssertionError("TTL index on expiresAt was not created"));
-        assertThat(ttlIndex.getExpireAfter()).isPresent();
-    }
-
-    private static FailedEvent makeEvent(String id, String streamName, Instant now) {
+    protected static FailedEvent makeEvent(String id, String streamName, Instant now) {
         return new FailedEvent(
                 id, streamName, "INSERT",
                 null, null, null,

@@ -13,8 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.spi;
+package io.flowwarden.stream.spi.testkit;
 
+import io.flowwarden.stream.spi.LockService;
+import io.flowwarden.stream.spi.LockState;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 

@@ -17,7 +17,7 @@ package io.flowwarden.stream.internal.lock;
 
 import com.mongodb.client.MongoClients;
 import io.flowwarden.stream.spi.LockService;
-import io.flowwarden.stream.spi.LockServiceContractTest;
+import io.flowwarden.stream.spi.testkit.LockServiceContractTest;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;

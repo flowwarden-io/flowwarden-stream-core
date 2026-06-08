@@ -12,12 +12,12 @@
     </parent>
 
     <groupId>io.flowwarden</groupId>
-    <artifactId>flowwarden-stream-core</artifactId>
+    <artifactId>flowwarden-stream-core-parent</artifactId>
     <version>1.0.0-rc.3-SNAPSHOT</version>
-    <packaging>jar</packaging>
+    <packaging>pom</packaging>
 
-    <name>FlowWarden Stream Core</name>
-    <description>Open source library for MongoDB Change Streams management with Spring Boot</description>
+    <name>FlowWarden Stream Core (parent)</name>
+    <description>Aggregator for the FlowWarden Stream Core library, its SPI testkit, and the FlowWarden BOM.</description>
     <url>https://github.com/flowwarden-io/flowwarden-stream-core</url>
 
     <licenses>
@@ -58,6 +58,13 @@
         <url>https://github.com/flowwarden-io/flowwarden-stream-core/issues</url>
     </issueManagement>
 
+    <modules>
+        <module>flowwarden-stream-core</module>
+        <module>flowwarden-stream-core-testkit</module>
+        <module>flowwarden-stream-core-mongo-it</module>
+        <module>flowwarden-bom</module>
+    </modules>
+
     <properties>
         <java.version>17</java.version>
         <testcontainers.version>1.21.4</testcontainers.version>
@@ -85,68 +92,30 @@
         </dependencies>
     </dependencyManagement>
 
-    <dependencies>
-        <!-- MongoDB Reactive -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-mongodb-reactive</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <!-- MongoDB Blocking -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-mongodb</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <!-- Auto-configuration -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-autoconfigure</artifactId>
-        </dependency>
-
-        <!-- Configuration metadata generation -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-configuration-processor</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <!-- Actuator (optional — only activated if user includes it) -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-actuator</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <!-- Test -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-            <scope>test</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>mongodb</artifactId>
-            <scope>test</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-
     <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>com.mycila</groupId>
+                    <artifactId>license-maven-plugin</artifactId>
+                    <version>5.0.0</version>
+                    <configuration>
+                        <licenseSets>
+                            <licenseSet>
+                                <header>${maven.multiModuleProjectDirectory}/.license-header.txt</header>
+                                <includes>
+                                    <include>src/**/*.java</include>
+                                </includes>
+                            </licenseSet>
+                        </licenseSets>
+                        <properties>
+                            <license.year>${license.year}</license.year>
+                        </properties>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -187,20 +156,6 @@
             <plugin>
                 <groupId>com.mycila</groupId>
                 <artifactId>license-maven-plugin</artifactId>
-                <version>5.0.0</version>
-                <configuration>
-                    <licenseSets>
-                        <licenseSet>
-                            <header>.license-header.txt</header>
-                            <includes>
-                                <include>src/**/*.java</include>
-                            </includes>
-                        </licenseSet>
-                    </licenseSets>
-                    <properties>
-                        <license.year>${license.year}</license.year>
-                    </properties>
-                </configuration>
                 <executions>
                     <execution>
                         <goals>
@@ -216,7 +171,7 @@
     <profiles>
         <!--
             Release profile — activated explicitly for Maven Central deployments.
-            Usage:  mvn -P release clean deploy
+            Usage:  ./mvnw -P release clean deploy
             Requires:
               - GPG key configured locally and on Sonatype keyserver
               - credentials for server id 'central' in ~/.m2/settings.xml

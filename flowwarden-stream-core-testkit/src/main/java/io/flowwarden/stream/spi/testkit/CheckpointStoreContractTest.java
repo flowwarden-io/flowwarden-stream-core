@@ -13,16 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.checkpoint;
+package io.flowwarden.stream.spi.testkit;
 
-import com.mongodb.reactivestreams.client.MongoClients;
 import io.flowwarden.stream.spi.Checkpoint;
-import io.flowwarden.stream.test.SharedMongoContainer;
+import io.flowwarden.stream.spi.CheckpointStore;
 import org.bson.BsonDocument;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
-import org.springframework.data.mongodb.core.query.Query;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -31,22 +28,34 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class ReactiveMongoCheckpointStoreIntegrationTest {
+/**
+ * Behavior contract that every {@link CheckpointStore} implementation must satisfy.
+ *
+ * <p>Subclass for each backend (Mongo, Redis, JDBC, …) and provide a fresh
+ * {@link CheckpointStore} via {@link #createCheckpointStore()} plus a
+ * {@link #cleanState()} hook that resets the backing storage between tests.</p>
+ */
+public abstract class CheckpointStoreContractTest {
 
-    private ReactiveMongoCheckpointStore store;
-    private ReactiveMongoTemplate reactiveMongoTemplate;
+    protected CheckpointStore store;
+
+    /**
+     * Returns a fresh {@link CheckpointStore} bound to a clean backend.
+     */
+    protected abstract CheckpointStore createCheckpointStore();
+
+    /**
+     * Clears all state in the backing storage so tests are isolated.
+     */
+    protected abstract void cleanState();
 
     @BeforeEach
-    void setUp() {
-        reactiveMongoTemplate = new ReactiveMongoTemplate(
-                MongoClients.create(SharedMongoContainer.MONGO.getReplicaSetUrl()), "test"
-        );
-        reactiveMongoTemplate.remove(new Query(), MongoCheckpointStore.COLLECTION).block();
-        store = new ReactiveMongoCheckpointStore(reactiveMongoTemplate);
+    void setUpContract() {
+        cleanState();
+        store = createCheckpointStore();
     }
 
     @Test
@@ -72,14 +81,28 @@ class ReactiveMongoCheckpointStoreIntegrationTest {
     }
 
     @Test
+    void saveUpdatesExisting() {
+        var token1 = BsonDocument.parse("{\"_data\": \"t1\"}");
+        var token2 = BsonDocument.parse("{\"_data\": \"t2\"}");
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+
+        store.save(new Checkpoint("s", null, token1, now, null, null, Collections.emptyMap()));
+        store.save(new Checkpoint("s", "pod-b", token2, now, token2, now, Collections.emptyMap()));
+
+        var found = store.findByStreamName("s");
+        assertTrue(found.isPresent());
+        assertEquals(token2, found.get().lastSeenToken());
+        assertEquals("pod-b", found.get().instanceId());
+    }
+
+    @Test
     void findReturnsEmptyWhenNotFound() {
         assertTrue(store.findByStreamName("nonexistent").isEmpty());
     }
 
     @Test
     void deleteRemovesCheckpoint() {
-        store.save(new Checkpoint("del", null, null, null, null, null,
-                Collections.emptyMap()));
+        store.save(new Checkpoint("del", null, null, null, null, null, Collections.emptyMap()));
         assertTrue(store.findByStreamName("del").isPresent());
 
         store.delete("del");
@@ -92,26 +115,6 @@ class ReactiveMongoCheckpointStoreIntegrationTest {
     }
 
     @Test
-    void tokenRoundTrip() {
-        var seenToken = BsonDocument.parse(
-                "{\"_data\": \"8263B5F100000000012B022C0100296E5A100484C0\"}"
-        );
-        var processedToken = BsonDocument.parse(
-                "{\"_data\": \"8263B5F200000000012B022C0100296E5A100484C1\"}"
-        );
-        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
-
-        store.save(new Checkpoint("token-test", null, seenToken, now,
-                processedToken, now, Collections.emptyMap()));
-
-        var found = store.findByStreamName("token-test").orElseThrow();
-        assertEquals(seenToken, found.lastSeenToken());
-        assertEquals(processedToken, found.lastProcessedToken());
-        assertNotSame(seenToken, found.lastSeenToken());
-        assertNotSame(processedToken, found.lastProcessedToken());
-    }
-
-    @Test
     void saveSeen_doesNotOverwriteProcessed() {
         var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
         var seen1 = BsonDocument.parse("{\"_data\": \"seen-1\"}");
@@ -119,14 +122,11 @@ class ReactiveMongoCheckpointStoreIntegrationTest {
         var seen2 = BsonDocument.parse("{\"_data\": \"seen-2\"}");
         var later = now.plusSeconds(10);
 
-        // Pre-seed with both tokens
         store.save(new Checkpoint("s", null, seen1, now, processed1, now,
                 Collections.emptyMap()));
 
-        // Update only the seen pair
         store.saveSeen("s", seen2, later);
 
-        // seen advanced, processed unchanged
         var found = store.findByStreamName("s").orElseThrow();
         assertEquals(seen2, found.lastSeenToken());
         assertEquals(later, found.lastSeenTimestamp());
@@ -159,7 +159,6 @@ class ReactiveMongoCheckpointStoreIntegrationTest {
         var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
         var seen = BsonDocument.parse("{\"_data\": \"first-seen\"}");
 
-        // No prior save — upsert should create the doc
         store.saveSeen("new-stream", seen, now);
 
         var found = store.findByStreamName("new-stream").orElseThrow();

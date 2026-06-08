@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.flowwarden</groupId>
+        <artifactId>flowwarden-stream-core-parent</artifactId>
+        <version>1.0.0-rc.3-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>flowwarden-stream-core-testkit</artifactId>
+    <packaging>jar</packaging>
+
+    <name>FlowWarden Stream Core Testkit</name>
+    <description>Abstract behavior contracts for FlowWarden Stream Core SPIs (LockService, CheckpointStore, DlqStore). Backend implementors depend on this artifact in test scope and extend the contract classes to validate their implementation against the public SPI behavior.</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.flowwarden</groupId>
+            <artifactId>flowwarden-stream-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <!-- Test framework exposed to subclasses (compile scope on purpose). -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+        </dependency>
+
+        <!-- BsonDocument is exposed in CheckpointStoreContractTest / DlqStoreContractTest method signatures. -->
+        <dependency>
+            <groupId>org.mongodb</groupId>
+            <artifactId>bson</artifactId>
+        </dependency>
+    </dependencies>
+
+</project>
