@@ -37,11 +37,29 @@ public interface StreamMetricsProvider {
     void onStreamStarted(String streamName, StreamConfiguration config);
 
     /**
-     * Called when a Change Stream is stopped (via actuator, shutdown, or leadership loss).
+     * Called when a Change Stream stops, for any reason.
+     *
+     * <p>Emitted in three situations:</p>
+     * <ul>
+     *   <li>{@link StopReason#GRACEFUL} &mdash; explicit {@code stopStream()},
+     *       JVM shutdown, leadership loss. {@code cause} is {@code null}.</li>
+     *   <li>{@link StopReason#CRASHED} &mdash; uncaught {@link Throwable} killed
+     *       the imperative listener container thread, or the reactive pipeline
+     *       terminated on an unexpected {@code onError} / {@code onComplete}
+     *       signal. {@code cause} carries the escaping throwable
+     *       (or {@code null} if it could not be captured).</li>
+     * </ul>
+     *
+     * <p>The {@code CRASHED} signal exists so monitoring can distinguish a
+     * silently dead stream from an intentional stop, instead of reporting
+     * {@code RUNNING} indefinitely.</p>
      *
      * @param streamName stream identifier
+     * @param reason     why the stream stopped
+     * @param cause      non-null {@code Throwable} when {@code reason == CRASHED}
+     *                   and capturable; {@code null} otherwise
      */
-    default void onStreamStopped(String streamName) {}
+    default void onStreamStopped(String streamName, StopReason reason, Throwable cause) {}
 
     /**
      * Called when an event is received from MongoDB, before handler execution.
