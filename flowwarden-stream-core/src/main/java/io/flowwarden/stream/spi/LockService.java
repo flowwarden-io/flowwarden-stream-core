@@ -39,6 +39,15 @@ import java.util.Optional;
  *   <li>{@link #release} removes the lock if and only if it is owned by {@code instanceId}. It
  *       is a no-op otherwise.</li>
  * </ul>
+ *
+ * <h2>Error contract for hot-path methods</h2>
+ * <p>Implementations of {@link #tryAcquire} and {@link #renew} must convert transient backend
+ * errors (network timeout, primary stepdown, command timeout, lost connection, etc.) into a
+ * {@code false} return rather than propagating exceptions. The leader election coordinator
+ * treats propagated exceptions defensively — a {@link #renew} throw triggers the same fail-stop
+ * path as {@code renew() == false} — but this is a safety net for non-conformant implementations,
+ * not the contract. A propagated cause is only logged at {@code WARN}, losing the structured
+ * signal that a {@code false} return provides.</p>
  */
 public interface LockService {
 
@@ -47,6 +56,10 @@ public interface LockService {
      *
      * <p>Succeeds if the lock doesn't exist, has expired, or is already owned by
      * {@code instanceId}. The operation must be atomic with respect to concurrent callers.</p>
+     *
+     * <p>Implementations must convert transient backend errors into a {@code false} return
+     * rather than propagating exceptions — see the class-level
+     * {@linkplain LockService error contract} for hot-path methods.</p>
      *
      * @param streamName the stream identifier to lock
      * @param instanceId the calling instance's identity
@@ -57,6 +70,12 @@ public interface LockService {
 
     /**
      * Renews the lock for {@code streamName}. Only succeeds if {@code instanceId} still owns it.
+     *
+     * <p>Implementations must convert transient backend errors into a {@code false} return
+     * rather than propagating exceptions — see the class-level
+     * {@linkplain LockService error contract} for hot-path methods. The leader election
+     * coordinator treats propagated exceptions as a fail-stop equivalent to {@code false}
+     * defensively, but loses the structured cause in the process.</p>
      *
      * @param streamName the stream identifier
      * @param instanceId the calling instance's identity
