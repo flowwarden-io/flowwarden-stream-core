@@ -157,28 +157,58 @@ public class LeaderElectionCoordinator {
         onBecameLeader.run();
 
         // Schedule heartbeat renewal
-        ScheduledFuture<?> heartbeat = scheduler.scheduleAtFixedRate(() -> {
-            try {
-                if (!lockService.renew(streamName, instanceId, lockTtl)) {
-                    log.warn("Lost leadership for stream '{}' — lock renewal failed", streamName);
-                    cancelTask(heartbeatTasks, streamName);
-                    roles.put(streamName, LeaderRole.STANDBY);
-
-                    // Stop the stream and re-enter standby polling
-                    try {
-                        onLostLeadership.run();
-                    } catch (Exception e) {
-                        log.error("Error during leadership loss handling for stream '{}': {}",
-                                streamName, e.getMessage());
-                    }
-                    becomeStandby(streamName, onBecameLeader, onLostLeadership);
-                }
-            } catch (Exception e) {
-                log.warn("Error during lock heartbeat for stream '{}': {}", streamName, e.getMessage());
-            }
-        }, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        ScheduledFuture<?> heartbeat = scheduler.scheduleAtFixedRate(
+                () -> heartbeatTick(streamName, onBecameLeader, onLostLeadership),
+                HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
 
         heartbeatTasks.put(streamName, heartbeat);
+    }
+
+    /**
+     * A single heartbeat tick: renew the lock; on {@code false} or on a propagated exception
+     * trigger the fail-stop path. Package-private so it can be exercised in unit tests without
+     * waiting for the scheduler to fire.
+     */
+    void heartbeatTick(String streamName, Runnable onBecameLeader, Runnable onLostLeadership) {
+        try {
+            if (!lockService.renew(streamName, instanceId, lockTtl)) {
+                handleLeadershipLoss(streamName, onBecameLeader, onLostLeadership,
+                        "lock renewal returned false");
+            }
+        } catch (Exception e) {
+            // Defensive: a conformant LockService should convert transient errors
+            // into a false return (see LockService Javadoc). Treat a propagated
+            // exception identically to renew() == false so a non-conformant backend
+            // can't strand us in a double-leader state — the underlying lease will
+            // expire and another instance may legitimately take over.
+            log.warn("Lock renewal for stream '{}' threw — treating as leadership loss: {}",
+                    streamName, e.getMessage(), e);
+            handleLeadershipLoss(streamName, onBecameLeader, onLostLeadership,
+                    "lock renewal threw " + e.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Common fail-stop path for the heartbeat loop: cancel the heartbeat, transition the role
+     * to {@code STANDBY}, invoke the user's {@code onLostLeadership} callback (best-effort),
+     * and re-enter standby polling so the instance can become leader again later. Called from
+     * both the {@code renew() == false} branch and the defensive {@code renew()} throw branch.
+     */
+    private void handleLeadershipLoss(String streamName,
+                                       Runnable onBecameLeader,
+                                       Runnable onLostLeadership,
+                                       String reason) {
+        log.warn("Lost leadership for stream '{}' — {}", streamName, reason);
+        cancelTask(heartbeatTasks, streamName);
+        roles.put(streamName, LeaderRole.STANDBY);
+
+        try {
+            onLostLeadership.run();
+        } catch (Exception e) {
+            log.error("Error during leadership loss handling for stream '{}': {}",
+                    streamName, e.getMessage());
+        }
+        becomeStandby(streamName, onBecameLeader, onLostLeadership);
     }
 
     private void becomeStandby(String streamName, Runnable onBecameLeader, Runnable onLostLeadership) {
