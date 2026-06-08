@@ -185,11 +185,34 @@ public interface StreamMetricsProvider {
     void onBackpressure(String streamName, BackpressureAction action);
 
     /**
-     * Called when a failed event is sent to the Dead Letter Queue.
+     * Called after a failed event has been successfully persisted to the
+     * Dead Letter Queue by the configured {@link DlqStore}.
+     *
+     * <p>Emitted only on confirmed write success. If the store throws, this
+     * callback is NOT invoked &mdash; see {@link #onEventDlqFailed} instead.</p>
      *
      * @param streamName stream identifier
      */
     void onEventSentToDlq(String streamName);
+
+    /**
+     * Called when a {@link DlqStore} write throws while persisting a failed
+     * event (e.g. {@code MongoWriteConcernException} on {@code wtimeout},
+     * Redis command timeout, JDBC transient error).
+     *
+     * <p>A DLQ write failure is operationally critical: the event has neither
+     * been processed by the handler nor archived for later replay. Stream-core
+     * logs the failure and emits this signal; the auto post-retry path then
+     * resumes the stream, while manual {@code ctx.sendToDlq(...)} paths
+     * re-throw to the user handler.</p>
+     *
+     * <p>Use this callback to wire alerts on DLQ store outages in custom
+     * metrics providers.</p>
+     *
+     * @param streamName stream identifier
+     * @param cause      the exception thrown by the {@code DlqStore}
+     */
+    default void onEventDlqFailed(String streamName, Throwable cause) {}
 
     /**
      * Called with oplog window size information collected from the MongoDB replica set.
