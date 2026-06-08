@@ -73,12 +73,34 @@ public interface StreamMetricsProvider {
                       int attemptNumber, ChangeEventMetadata metadata);
 
     /**
-     * Called when a resume token checkpoint is persisted.
+     * Called after a resume token checkpoint has been successfully persisted
+     * by the configured {@link CheckpointStore}.
+     *
+     * <p>Emitted only on confirmed write success. If the store throws, this
+     * callback is NOT invoked &mdash; see {@link #onCheckpointFailed} instead.</p>
      *
      * @param streamName  stream identifier
      * @param resumeToken the persisted resume token
      */
     void onCheckpoint(String streamName, String resumeToken);
+
+    /**
+     * Called when a {@link CheckpointStore} write throws while persisting a
+     * resume token (e.g. {@code MongoWriteConcernException} on {@code wtimeout},
+     * Redis command timeout, JDBC transient error).
+     *
+     * <p>A checkpoint write failure does NOT stop the stream: stream-core logs
+     * the failure, emits this signal, and keeps processing events. The
+     * checkpoint is resume metadata, so transient loss only matters if the
+     * process restarts before the next successful checkpoint.</p>
+     *
+     * <p>Use this callback to wire alerts (e.g. "checkpoint failure rate &gt; X
+     * over Y minutes") or stale-checkpoint detection in custom providers.</p>
+     *
+     * @param streamName stream identifier
+     * @param cause      the exception thrown by the {@code CheckpointStore}
+     */
+    default void onCheckpointFailed(String streamName, Throwable cause) {}
 
     /**
      * Called when a stream resumes from {@code lastSeenToken} because

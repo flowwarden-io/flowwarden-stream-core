@@ -295,10 +295,16 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     public void saveCheckpointNow() {
                         BsonDocument token = raw.getResumeToken();
                         if (token != null) {
-                            checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
-                                    def.streamName(), null, token, Instant.now(),
-                                    token, Instant.now(), Collections.emptyMap()));
-                            FlowWardenMetrics.get().onCheckpoint(def.streamName(), token.toJson());
+                            try {
+                                checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
+                                        def.streamName(), null, token, Instant.now(),
+                                        token, Instant.now(), Collections.emptyMap()));
+                                FlowWardenMetrics.get().onCheckpoint(def.streamName(), token.toJson());
+                            } catch (RuntimeException e) {
+                                FlowWardenMetrics.get().onCheckpointFailed(def.streamName(), e);
+                                log.warn("Failed to save manual checkpoint for stream '{}': {}",
+                                        def.streamName(), e.getMessage(), e);
+                            }
                         }
                     }
                 }
@@ -541,6 +547,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 FlowWardenMetrics.get().onCheckpoint(streamName, snapshot.token().toJson());
                 log.debug("Periodic lastSeenToken update for stream '{}'", streamName);
             } catch (Exception e) {
+                FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
                 log.warn("Failed to save periodic checkpoint for stream '{}': {}",
                         streamName, e.getMessage(), e);
             }
@@ -555,8 +562,14 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         int count = eventCounters.computeIfAbsent(def.streamName(), k -> new AtomicInteger(0))
                 .incrementAndGet();
         if (count % def.checkpointAnnotation().saveEveryN() == 0) {
-            checkpointStore.saveProcessed(def.streamName(), token, timestamp);
-            FlowWardenMetrics.get().onCheckpoint(def.streamName(), token.toJson());
+            try {
+                checkpointStore.saveProcessed(def.streamName(), token, timestamp);
+                FlowWardenMetrics.get().onCheckpoint(def.streamName(), token.toJson());
+            } catch (RuntimeException e) {
+                FlowWardenMetrics.get().onCheckpointFailed(def.streamName(), e);
+                log.warn("Failed to save checkpoint for stream '{}': {}",
+                        def.streamName(), e.getMessage(), e);
+            }
         }
     }
 
