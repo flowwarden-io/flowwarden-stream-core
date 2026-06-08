@@ -279,16 +279,23 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                         Document fullDocument = policy.includeOriginalDocument()
                                 ? raw.getFullDocument() : null;
                         Instant expiresAt = policy.computeExpiresAt(Instant.now());
-                        dlqStore.save(new FailedEvent(
-                                ctx.getEventId(), def.streamName(),
-                                ctx.getOperationType() != null ? ctx.getOperationType().name() : null,
-                                raw.getDocumentKey(), fullDocument,
-                                raw.getResumeToken(),
-                                new FailedEvent.ErrorInfo("ManualDlq", reason, null),
-                                ctx.getAttemptNumber(), FailedEvent.STATUS_PENDING,
-                                Instant.now(), Instant.now(), Instant.now(),
-                                expiresAt, ctx.getAllMetadata()), policy);
-                        FlowWardenMetrics.get().onEventSentToDlq(def.streamName());
+                        try {
+                            dlqStore.save(new FailedEvent(
+                                    ctx.getEventId(), def.streamName(),
+                                    ctx.getOperationType() != null ? ctx.getOperationType().name() : null,
+                                    raw.getDocumentKey(), fullDocument,
+                                    raw.getResumeToken(),
+                                    new FailedEvent.ErrorInfo("ManualDlq", reason, null),
+                                    ctx.getAttemptNumber(), FailedEvent.STATUS_PENDING,
+                                    Instant.now(), Instant.now(), Instant.now(),
+                                    expiresAt, ctx.getAllMetadata()), policy);
+                            FlowWardenMetrics.get().onEventSentToDlq(def.streamName());
+                        } catch (RuntimeException e) {
+                            FlowWardenMetrics.get().onEventDlqFailed(def.streamName(), e);
+                            log.warn("Failed to send manual DLQ event for stream '{}': {}",
+                                    def.streamName(), e.getMessage(), e);
+                            throw e;
+                        }
                     }
 
                     @Override
@@ -473,6 +480,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             FlowWardenMetrics.get().onEventSentToDlq(def.streamName());
             log.info("Event sent to DLQ for stream '{}'", def.streamName());
         } catch (Exception e) {
+            FlowWardenMetrics.get().onEventDlqFailed(def.streamName(), e);
             log.error("Failed to send event to DLQ for stream '{}': {}", def.streamName(), e.getMessage(), e);
         }
     }
