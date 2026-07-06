@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Removed
+
+### Fixed
+
+### Deprecated
+
+### Security
+
+## [1.0.0-rc.3] — 2026-07-06
+
+### Added
 - New artifact **`flowwarden-stream-core-testkit`** (`io.flowwarden:flowwarden-stream-core-testkit`) shipping abstract behavior contracts for the SPI surface: `LockServiceContractTest`, `CheckpointStoreContractTest`, `DlqStoreContractTest`. Backend implementors (e.g. a Redis-backed `LockService`) depend on this artifact in test scope and extend the contract class to validate their implementation against the public SPI semantics.
 - New artifact **`flowwarden-bom`** (`io.flowwarden:flowwarden-bom`, packaging `pom`) coordinating compatible versions of the FlowWarden ecosystem (currently `flowwarden-stream-core` and `flowwarden-stream-core-testkit`; satellite backends will be added as they ship). Import in your `dependencyManagement` to drop per-dependency `<version>` tags.
 - `StreamMetricsProvider.onCheckpointFailed(streamName, cause)` — new SPI callback (default no-op) emitted when a `CheckpointStore` write throws. Use it to wire alerting on checkpoint store outages or stale-checkpoint detection in custom metrics providers.
@@ -114,6 +128,7 @@ First release candidate of FlowWarden Stream Core.
 - `DeploymentMode.PARTITIONED` — defined in the enum but not yet implemented, reserved for a future release
 - Watchdog / zombie stream detection — planned for a future release
 
-[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.2...HEAD
+[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.3...HEAD
+[1.0.0-rc.3]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.1
