@@ -238,6 +238,20 @@
                             <!-- Manual publish from Central portal for safety on first releases. -->
                             <autoPublish>false</autoPublish>
                             <waitUntil>validated</waitUntil>
+                            <!--
+                                Keep the internal integration-test module out of the aggregated
+                                Central bundle. In a multi-module reactor this plugin builds a
+                                single bundle for the whole reactor; a child <skipPublishing>true</skipPublishing>
+                                does not remove that module's artifacts from the aggregate, so the
+                                unsigned mongo-it jar/pom would otherwise reach Central and fail
+                                validation. Exclude it here on the aggregator instead.
+                            -->
+                            <excludeArtifacts>
+                                <artifact>
+                                    <groupId>io.flowwarden</groupId>
+                                    <artifactId>flowwarden-stream-core-mongo-it</artifactId>
+                                </artifact>
+                            </excludeArtifacts>
                         </configuration>
                     </plugin>
                 </plugins>
