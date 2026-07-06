@@ -246,11 +246,11 @@
                                 unsigned mongo-it jar/pom would otherwise reach Central and fail
                                 validation. Exclude it here on the aggregator instead.
                             -->
+                            <!-- Matched against artifactId only (the plugin filters on
+                                 Artifact.getArtifactId()); a structured groupId/artifactId
+                                 element fails config parsing. -->
                             <excludeArtifacts>
-                                <artifact>
-                                    <groupId>io.flowwarden</groupId>
-                                    <artifactId>flowwarden-stream-core-mongo-it</artifactId>
-                                </artifact>
+                                <artifact>flowwarden-stream-core-mongo-it</artifact>
                             </excludeArtifacts>
                         </configuration>
                     </plugin>
