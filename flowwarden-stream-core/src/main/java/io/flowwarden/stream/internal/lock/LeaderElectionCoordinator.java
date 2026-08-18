@@ -16,7 +16,9 @@
 package io.flowwarden.stream.internal.lock;
 
 import io.flowwarden.stream.FlowWardenMetrics;
+import io.flowwarden.stream.HistoryLostException;
 import io.flowwarden.stream.spi.LockService;
+import io.flowwarden.stream.spi.StopReason;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -152,16 +154,90 @@ public class LeaderElectionCoordinator {
     private void becomeLeader(String streamName, Runnable onBecameLeader, Runnable onLostLeadership) {
         roles.put(streamName, LeaderRole.LEADER);
         log.info("Instance became LEADER for stream '{}' (instanceId={})", streamName, instanceId);
-        FlowWardenMetrics.get().onLeadershipChange(streamName, "LEADER", instanceId);
+        emitLeadershipChange(streamName, "LEADER");
 
-        onBecameLeader.run();
+        try {
+            onBecameLeader.run();
+        } catch (HistoryLostException e) {
+            // Terminal: the next attempt fails identically (the checkpoint is
+            // the problem), and handing over to a standby is pointless — it
+            // would fail on the same checkpoint. Stop the election entirely
+            // and surface the crash; an operator action is required.
+            log.error("Leader callback failed terminally for stream '{}' — stopping its "
+                    + "election (no retry, no standby handover): {}",
+                    streamName, e.getMessage(), e);
+            cancelTask(heartbeatTasks, streamName);
+            cancelTask(pollingTasks, streamName);
+            // Compensation BEFORE the release: a throwing callback may have
+            // partially started the stream (a registered container, an
+            // installed subscription); releasing the lease first would let a
+            // standby become leader while this consumer is still active.
+            invokeLostLeadership(streamName, onLostLeadership);
+            releaseQuietly(streamName);
+            roles.remove(streamName);
+            // Emitted LAST: the compensation is typically stopStream, which
+            // publishes its own GRACEFUL stop — the terminal status must be
+            // the final word for last-status-wins consumers, and a throwing
+            // provider must not short-circuit the cleanup above.
+            emitStreamCrashed(streamName, e);
+            return;
+        } catch (RuntimeException e) {
+            // Transient (network error during the resume cascade, template
+            // resolution failure, …): hand the lease back and re-enter
+            // standby polling — the poll retries the whole election.
+            log.warn("Leader callback failed for stream '{}' — releasing the lock and "
+                    + "re-entering standby (retry in {}s): {}",
+                    streamName, STANDBY_POLL_INTERVAL_SECONDS, e.getMessage(), e);
+            // Same compensation-before-release ordering as the terminal
+            // branch — a partial start must be undone before another
+            // instance can acquire the lease.
+            invokeLostLeadership(streamName, onLostLeadership);
+            releaseQuietly(streamName);
+            becomeStandby(streamName, onBecameLeader, onLostLeadership);
+            return;
+        }
 
-        // Schedule heartbeat renewal
+        // Schedule heartbeat renewal — only after the callback returned
+        // normally: a leader whose startup failed must never renew the lease.
         ScheduledFuture<?> heartbeat = scheduler.scheduleAtFixedRate(
                 () -> heartbeatTick(streamName, onBecameLeader, onLostLeadership),
                 HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
 
         heartbeatTasks.put(streamName, heartbeat);
+    }
+
+    /**
+     * Best-effort metrics emission: a {@link io.flowwarden.stream.spi.StreamMetricsProvider}
+     * is external SPI code and must stay observational — its failure must
+     * never drive (or interrupt) the election state machine.
+     */
+    private void emitLeadershipChange(String streamName, String role) {
+        try {
+            FlowWardenMetrics.get().onLeadershipChange(streamName, role, instanceId);
+        } catch (Exception e) {
+            log.warn("Metrics provider failed on leadership change ({} → {}): {}",
+                    streamName, role, e.getMessage());
+        }
+    }
+
+    /** Best-effort crash signal — same isolation rationale as {@link #emitLeadershipChange}. */
+    private void emitStreamCrashed(String streamName, Throwable cause) {
+        try {
+            FlowWardenMetrics.get().onStreamStopped(streamName, StopReason.CRASHED, cause);
+        } catch (Exception e) {
+            log.warn("Metrics provider failed on crash signal for stream '{}': {}",
+                    streamName, e.getMessage());
+        }
+    }
+
+    private void releaseQuietly(String streamName) {
+        try {
+            lockService.release(streamName, instanceId);
+        } catch (Exception e) {
+            // Best-effort: the lease expires on its own TTL, after which a
+            // standby (or this instance's poll) can acquire it normally.
+            log.warn("Failed to release lock for stream '{}': {}", streamName, e.getMessage());
+        }
     }
 
     /**
@@ -202,35 +278,69 @@ public class LeaderElectionCoordinator {
         cancelTask(heartbeatTasks, streamName);
         roles.put(streamName, LeaderRole.STANDBY);
 
+        invokeLostLeadership(streamName, onLostLeadership);
+        becomeStandby(streamName, onBecameLeader, onLostLeadership);
+    }
+
+    /**
+     * Runs the user's {@code onLostLeadership} callback, best-effort: its
+     * failure must never prevent the role transition, the lock release or the
+     * standby re-entry of the caller. Used on genuine leadership loss and as
+     * the compensation for a failed {@code onBecameLeader} (which may have
+     * partially started the stream before throwing).
+     */
+    private void invokeLostLeadership(String streamName, Runnable onLostLeadership) {
         try {
             onLostLeadership.run();
         } catch (Exception e) {
             log.error("Error during leadership loss handling for stream '{}': {}",
                     streamName, e.getMessage());
         }
-        becomeStandby(streamName, onBecameLeader, onLostLeadership);
     }
 
     private void becomeStandby(String streamName, Runnable onBecameLeader, Runnable onLostLeadership) {
         roles.put(streamName, LeaderRole.STANDBY);
         log.info("Instance is STANDBY for stream '{}' — polling for leadership (instanceId={})",
                 streamName, instanceId);
-        FlowWardenMetrics.get().onLeadershipChange(streamName, "STANDBY", instanceId);
+        emitLeadershipChange(streamName, "STANDBY");
 
         // Schedule standby polling
-        ScheduledFuture<?> polling = scheduler.scheduleAtFixedRate(() -> {
-            try {
-                if (lockService.tryAcquire(streamName, instanceId, lockTtl)) {
-                    log.info("Standby acquired leadership for stream '{}'", streamName);
-                    cancelTask(pollingTasks, streamName);
-                    becomeLeader(streamName, onBecameLeader, onLostLeadership);
-                }
-            } catch (Exception e) {
-                log.debug("Standby poll failed for stream '{}': {}", streamName, e.getMessage());
-            }
-        }, STANDBY_POLL_INTERVAL_SECONDS, STANDBY_POLL_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        ScheduledFuture<?> polling = scheduler.scheduleAtFixedRate(
+                () -> standbyPollTick(streamName, onBecameLeader, onLostLeadership),
+                STANDBY_POLL_INTERVAL_SECONDS, STANDBY_POLL_INTERVAL_SECONDS, TimeUnit.SECONDS);
 
         pollingTasks.put(streamName, polling);
+    }
+
+    /**
+     * A single standby poll: try to acquire the lock and, on success, become
+     * the leader. Callback failures are classified and contained by
+     * {@code becomeLeader} itself and never reach the catch below — it
+     * remains as the safety net for {@code tryAcquire} errors (a conformant
+     * {@link LockService} returns {@code false} instead of throwing) and for
+     * unexpected internal transition errors. Package-private so it can be
+     * exercised in unit tests without waiting for the scheduler.
+     */
+    void standbyPollTick(String streamName, Runnable onBecameLeader, Runnable onLostLeadership) {
+        try {
+            if (lockService.tryAcquire(streamName, instanceId, lockTtl)) {
+                log.info("Standby acquired leadership for stream '{}'", streamName);
+                cancelTask(pollingTasks, streamName);
+                becomeLeader(streamName, onBecameLeader, onLostLeadership);
+            }
+        } catch (Exception e) {
+            log.debug("Standby poll failed for stream '{}': {}", streamName, e.getMessage());
+        }
+    }
+
+    /** Test hook: whether a heartbeat renewal task is registered for the stream. */
+    boolean hasHeartbeatTask(String streamName) {
+        return heartbeatTasks.containsKey(streamName);
+    }
+
+    /** Test hook: whether a standby polling task is registered for the stream. */
+    boolean hasPollingTask(String streamName) {
+        return pollingTasks.containsKey(streamName);
     }
 
     private void cancelTask(Map<String, ScheduledFuture<?>> tasks, String streamName) {
