@@ -8,12 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Checkpoint heartbeat probe: when no event arrived since the previous `saveIntervalSeconds` tick, stream-core now opens an ephemeral, bounded change stream cursor chained with `resumeAfter` from the last delivered position (same collection, same resolved `@Pipeline` stages, same `fullDocument`/`fullDocumentBeforeChange` options) and — when the server certifies the interval empty — advances `lastSeenToken` to the returned post-batch resume token. Idle streams stay recoverable indefinitely: the persisted resume point surfs the oplog head instead of freezing at the last event until it ages out. Probe cursors are stamped with a `comment` (`flowwarden:heartbeat:<stream>`) for attribution in `$currentOp`/profiler views.
+- New checkpoint field `lastHeartbeatTimestamp`: the last time a recoverable position was *confirmed* (fresh event token saved, or successful empty probe — including a re-certification of the unchanged position). Never updated on probe abstentions or failures, so its age is the single operational signal for resume-point health.
+- `CheckpointStore.saveHeartbeat(streamName, timestamp)` and `CheckpointStore.saveSeen(streamName, token, timestamp, heartbeatTimestamp)` — new SPI default methods (backward compatible). The four-arg overload documents its default two-write fallback as non-atomic; the shipped Mongo stores override it with a single atomic update.
+- `StreamMetricsProvider.onHeartbeatProbeFailed(streamName, cause)` — new SPI callback (default no-op) emitted when a heartbeat probe fails (transient error, timeout, null post-batch resume token, or a resume token already aged out of the oplog) while the stream itself keeps running. Distinct from `onResumeHistoryLost`, which stays reserved for the startup resume cascade.
+- Bootstrap position for new streams: a stream with `@Checkpoint(startPosition = RESUME)` and no prior checkpoint now captures an initial server-certified position *before* opening the main stream, resumes from it, and persists it immediately — closing the window where a crash before the first event silently lost everything since startup.
 
 ### Changed
+- **Breaking:** the `Checkpoint` record gains a `lastHeartbeatTimestamp` component. Code deconstructing the record or using the canonical constructor must update; a convenience constructor with the previous seven-argument signature is preserved.
+- The periodic timer now persists `lastSeenTimestamp` only when the position actually changes, with the time the position was established — and never rewrites the same `(token, timestamp)` pair forever. Previously an idle stream's checkpoint document appeared frozen at the last event's receipt time even though the timer was running, making resume-point erosion undetectable.
 
 ### Removed
 
 ### Fixed
+- Idle streams no longer lose their resume point to oplog rollover. The `saveIntervalSeconds` timer only re-persisted the token of the last *received* event, so a collection with no writes kept a frozen `lastSeenToken` until it aged out of the oplog — after which any restart escalated to the `onHistoryLost` strategy (`ChangeStreamHistoryLost`, code 286). The heartbeat probe keeps the persisted position within the oplog window with zero traffic, exactly as the `@Checkpoint` Javadoc always promised for idle workloads.
+- Reactive stream lifecycle is now race-free around start and termination: per-stream state and the heartbeat task are installed before subscribing and fully evicted (including `latestTokens` and the interval task) whenever the pipeline terminates — even when it terminates synchronously during `subscribe()`. Previously a crashed reactive stream left its checkpoint timer running forever, rewriting a dead stream's frozen token and masking the failure.
 
 ### Deprecated
 

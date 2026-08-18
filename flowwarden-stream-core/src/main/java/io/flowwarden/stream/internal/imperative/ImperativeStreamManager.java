@@ -45,6 +45,8 @@ import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
 import io.flowwarden.stream.spi.ChangeEventMetadata;
 import io.flowwarden.stream.spi.StopReason;
 import io.flowwarden.stream.spi.StreamConfiguration;
+import io.flowwarden.stream.internal.checkpoint.CheckpointHeartbeat;
+import io.flowwarden.stream.internal.checkpoint.ProbeOutcome;
 import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqPolicy;
@@ -173,9 +175,18 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                 .collection(def.collection())
                 .publishTo(listener);
 
+        // Resolve the @Pipeline stages once: the main stream and the heartbeat
+        // probe MUST observe the exact same pipeline documents.
+        List<Document> resolvedPipeline = def.pipelineMethod() != null
+                ? def.pipelineMethod().resolve(def.bean())
+                : List.of();
+        ImperativeHeartbeatProbe probe =
+                new ImperativeHeartbeatProbe(streamTemplate, def, resolvedPipeline);
+
+        BsonDocument seedToken = null;
         if (def.checkpointAnnotation() != null
                 && def.checkpointAnnotation().startPosition() == StartPosition.RESUME) {
-            applyResumeCascade(streamName, def, builder, streamTemplate);
+            seedToken = applyResumeCascade(streamName, def, builder, streamTemplate, probe);
         }
 
         if (def.config().fullDocument() != FullDocumentMode.DEFAULT) {
@@ -186,10 +197,10 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                     FullDocumentBeforeChange.valueOf(def.config().fullDocumentBeforeChange().name()));
         }
 
-        if (def.pipelineMethod() != null) {
-            List<Document> pipeline = def.pipelineMethod().resolve(def.bean());
-            builder.filter(pipeline.toArray(new Document[0]));
-            log.debug("Applied @Pipeline with {} stages to stream '{}'", pipeline.size(), streamName);
+        if (!resolvedPipeline.isEmpty()) {
+            builder.filter(resolvedPipeline.toArray(new Document[0]));
+            log.debug("Applied @Pipeline with {} stages to stream '{}'",
+                    resolvedPipeline.size(), streamName);
         }
 
         ChangeStreamRequest<Document> request = builder.build();
@@ -197,8 +208,15 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         container.start();
         Subscription subscription = container.register(request, Document.class);
 
+        // Seed the in-memory snapshot with the resume position so the first
+        // heartbeat probe chains from it instead of waiting for an event.
+        if (seedToken != null) {
+            latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>())
+                    .set(new TokenSnapshot(seedToken, Instant.now()));
+        }
+
         streams.put(streamName, new StreamState(container, subscription, def));
-        scheduleIntervalCheckpoint(def);
+        scheduleIntervalCheckpoint(def, probe);
         log.info("Started Change Stream '{}' on collection '{}'", streamName, def.collection());
 
         FlowWardenMetrics.get().onStreamStarted(streamName, buildStreamConfiguration(def, "IMPERATIVE"));
@@ -325,9 +343,10 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                         BsonDocument token = raw.getResumeToken();
                         if (token != null) {
                             try {
+                                Instant now = Instant.now();
                                 checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
-                                        def.streamName(), null, token, Instant.now(),
-                                        token, Instant.now(), Collections.emptyMap()));
+                                        def.streamName(), null, token, now,
+                                        token, now, now, Collections.emptyMap()));
                                 FlowWardenMetrics.get().onCheckpoint(def.streamName(), token.toJson());
                             } catch (RuntimeException e) {
                                 FlowWardenMetrics.get().onCheckpointFailed(def.streamName(), e);
@@ -527,7 +546,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         return sw.toString();
     }
 
-    private void scheduleIntervalCheckpoint(ChangeStreamDefinition def) {
+    private void scheduleIntervalCheckpoint(ChangeStreamDefinition def, ImperativeHeartbeatProbe probe) {
         if (def.checkpointAnnotation() == null) {
             return;
         }
@@ -536,27 +555,16 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             return;
         }
         String streamName = def.streamName();
-        ScheduledFuture<?> future = intervalScheduler.scheduleAtFixedRate(() -> {
-            try {
-                AtomicReference<TokenSnapshot> ref = latestTokens.get(streamName);
-                if (ref == null) {
-                    return;
-                }
-                TokenSnapshot snapshot = ref.get();
-                if (snapshot == null) {
-                    return;
-                }
-                // The timer advances ONLY lastSeenToken. lastProcessedToken is
-                // managed by saveCheckpointIfNeeded after confirmed handler success.
-                checkpointStore.saveSeen(streamName, snapshot.token(), snapshot.timestamp());
-                FlowWardenMetrics.get().onCheckpoint(streamName, snapshot.token().toJson());
-                log.debug("Periodic lastSeenToken update for stream '{}'", streamName);
-            } catch (Exception e) {
-                FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
-                log.warn("Failed to save periodic checkpoint for stream '{}': {}",
-                        streamName, e.getMessage(), e);
-            }
-        }, intervalSeconds, intervalSeconds, TimeUnit.SECONDS);
+        // The heartbeat advances ONLY lastSeenToken (+ lastHeartbeatTimestamp).
+        // lastProcessedToken is managed by saveCheckpointIfNeeded after
+        // confirmed handler success.
+        CheckpointHeartbeat heartbeat = new CheckpointHeartbeat(
+                streamName, checkpointStore, probe,
+                () -> latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>()));
+        // initialDelay 0: the first tick runs the probe right away so an
+        // incompatible pipeline fails loudly at startup, not weeks later.
+        ScheduledFuture<?> future = intervalScheduler.scheduleAtFixedRate(
+                heartbeat::tick, 0, intervalSeconds, TimeUnit.SECONDS);
         intervalTasks.put(streamName, future);
     }
 
@@ -603,15 +611,22 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
      * Resume cascade: try the primary token chosen by {@link ResumeStrategy}
      * (level 1), fall back to the secondary if the primary has aged out
      * (level 2), apply onHistoryLost strategy if both have aged out (level 3).
+     *
+     * @return the resume position the stream starts from ({@code null} when
+     *         the stream starts from "now"), used to seed the heartbeat chain
      */
-    private void applyResumeCascade(String streamName,
+    private BsonDocument applyResumeCascade(String streamName,
                                     ChangeStreamDefinition def,
                                     ChangeStreamRequest.ChangeStreamRequestBuilder<Document> builder,
-                                    MongoTemplate streamTemplate) {
+                                    MongoTemplate streamTemplate,
+                                    ImperativeHeartbeatProbe probe) {
         java.util.Optional<io.flowwarden.stream.spi.Checkpoint> cpOpt =
                 checkpointStore.findByStreamName(streamName);
         if (cpOpt.isEmpty()) {
-            return; // no prior checkpoint → stream starts from now
+            // No prior checkpoint → bootstrap: capture an initial PBRT and
+            // start the main stream from it, so no window is ever unprotected
+            // and the heartbeat always has a position to chain from.
+            return bootstrapInitialPosition(streamName, builder, probe);
         }
         io.flowwarden.stream.spi.Checkpoint cp = cpOpt.get();
         BsonDocument processedToken = cp.lastProcessedToken();
@@ -645,7 +660,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         if (primary != null && isTokenValid(def.collection(), primary, streamTemplate)) {
             builder.resumeAfter(primary);
             log.info("Resuming stream '{}' from {}", streamName, primaryLabel);
-            return;
+            return primary;
         }
 
         // Level 2: fallback to the secondary if it's distinct and still valid
@@ -655,15 +670,53 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             builder.resumeAfter(secondary);
             log.warn("Resuming stream '{}' from {}: {} aged out of oplog", streamName, secondaryLabel, primaryLabel);
             onFallback.run();
-            return;
+            return secondary;
         }
 
         // Level 3: both tokens unusable → apply onHistoryLost strategy
         if (processedToken != null || seenToken != null) {
             FlowWardenMetrics.get().onResumeHistoryLost(streamName);
             handleHistoryLost(streamName, def, builder, cp.lastProcessedTimestamp());
+            return null;
         }
-        // else: checkpoint document exists but both tokens are null → start from now
+        // Checkpoint document exists but both tokens are null → bootstrap,
+        // same as a stream with no prior checkpoint.
+        return bootstrapInitialPosition(streamName, builder, probe);
+    }
+
+    /**
+     * Bootstrap for a stream with no usable prior position: capture an initial
+     * PBRT via the heartbeat probe, resume the main stream after it, and
+     * persist it immediately. Falls back to starting from "now" (current
+     * behavior) when the probe sees traffic or fails — incoming events then
+     * seed the checkpoint on delivery.
+     */
+    private BsonDocument bootstrapInitialPosition(String streamName,
+                                                  ChangeStreamRequest.ChangeStreamRequestBuilder<Document> builder,
+                                                  ImperativeHeartbeatProbe probe) {
+        ProbeOutcome outcome = probe.probe(null);
+        if (outcome.type() != ProbeOutcome.Type.EMPTY) {
+            if (outcome.type() == ProbeOutcome.Type.FAILED) {
+                FlowWardenMetrics.get().onHeartbeatProbeFailed(streamName, outcome.cause());
+                log.warn("Bootstrap probe failed for stream '{}' — starting from now: {}",
+                        streamName,
+                        outcome.cause() != null ? outcome.cause().getMessage() : "unknown");
+            }
+            return null; // traffic or failure → start from now, events will seed
+        }
+        BsonDocument pbrt = outcome.pbrt();
+        builder.resumeAfter(pbrt);
+        Instant now = Instant.now();
+        try {
+            checkpointStore.saveSeen(streamName, pbrt, now, now);
+            FlowWardenMetrics.get().onCheckpoint(streamName, pbrt.toJson());
+        } catch (RuntimeException e) {
+            FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
+            log.warn("Failed to persist bootstrap position for stream '{}': {}",
+                    streamName, e.getMessage(), e);
+        }
+        log.info("Bootstrapped stream '{}' from an initial server-certified position", streamName);
+        return pbrt;
     }
 
     private void handleHistoryLost(String streamName,
