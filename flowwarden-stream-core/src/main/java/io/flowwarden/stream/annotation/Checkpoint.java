@@ -35,12 +35,18 @@ import java.lang.annotation.Target;
  * <h2>Dual-token model</h2>
  *
  * <ul>
- *   <li><strong>{@code lastSeenToken}</strong> — advances on <em>every</em> event
- *       received from MongoDB (including events rejected by {@code @Filter}, events
- *       with no matching handler, and events being retried), flushed on the
+ *   <li><strong>{@code lastSeenToken}</strong> — advances on every <em>settled</em>
+ *       event: one whose outcome is decided — handler success, rejection by
+ *       {@code @Filter}, no matching handler, or a terminal skip/DLQ decision.
+ *       An event still being processed or retried never advances it, so this
+ *       token can never certify past a delivery that a crash would need to
+ *       replay. Note the DLQ reserve: the terminal <em>decision</em> settles
+ *       the event even when the best-effort DLQ write itself fails (signaled
+ *       via {@code onEventDlqFailed}) — an event abandoned after exhaustion
+ *       is settled, durably dead-lettered or not. Flushed on the
  *       {@link #saveIntervalSeconds()} cadence — and, when the stream goes idle,
  *       through the {@link #idleHeartbeatIntervalSeconds() idle heartbeat}: a
- *       bounded, ephemeral change stream probe chained from the last delivered
+ *       bounded, ephemeral change stream probe chained from the last settled
  *       position fetches a server-certified post-batch resume token, so the
  *       persisted position keeps tracking the oplog head with zero traffic. As
  *       long as probes succeed within the oplog window, this keeps idle or
@@ -61,7 +67,9 @@ import java.lang.annotation.Target;
  *   <li>If the primary has aged out of the oplog, fall back to the <em>secondary</em>
  *       token — the stream avoids a {@code ChangeStreamHistoryLost} at the cost of
  *       either re-delivering events ({@code lastProcessedToken} secondary) or
- *       skipping in-flight events ({@code lastSeenToken} secondary).</li>
+ *       skipping the re-delivery of events that settled without handler
+ *       success — terminal skip/DLQ decisions ({@code lastSeenToken}
+ *       secondary).</li>
  *   <li>If both tokens are aged out, apply the {@link #onHistoryLost()} strategy.</li>
  * </ol>
  *
@@ -114,9 +122,9 @@ public @interface Checkpoint {
      * Idle heartbeat interval in seconds — the oplog-rollover protection
      * policy for streams that stop receiving events.
      *
-     * <p>When the main cursor has not delivered any token for this long, the
+     * <p>When the main cursor has not settled any event for this long, the
      * heartbeat opens an ephemeral, bounded change stream probe chained from
-     * the last delivered position (same collection, same resolved
+     * the last settled position (same collection, same resolved
      * {@code @Pipeline} stages and {@code fullDocument} options as the
      * stream, stamped with a {@code flowwarden:heartbeat:&lt;stream&gt;}
      * comment). When the server certifies the interval empty, the returned

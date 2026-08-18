@@ -21,6 +21,7 @@ import io.flowwarden.stream.internal.checkpoint.HeartbeatProbe;
 import io.flowwarden.stream.internal.checkpoint.ProbeOutcome;
 import io.flowwarden.stream.internal.discovery.ChangeStreamDefinition;
 import org.bson.BsonDocument;
+import org.bson.BsonTimestamp;
 import org.bson.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -70,6 +71,18 @@ final class ReactiveHeartbeatProbe implements HeartbeatProbe {
     @Override
     public ProbeOutcome probe(BsonDocument resumeAfter) {
         Objects.requireNonNull(resumeAfter, "resumeAfter must not be null — use initialPosition()");
+        return boundedRead(
+                ChangeStreamProbeCommands.aggregateCommand(def, pipeline, resumeAfter));
+    }
+
+    @Override
+    public ProbeOutcome probeFromOperationTime(BsonTimestamp operationTime) {
+        Objects.requireNonNull(operationTime, "operationTime must not be null");
+        return boundedRead(
+                ChangeStreamProbeCommands.aggregateCommand(def, pipeline, null, operationTime));
+    }
+
+    private ProbeOutcome boundedRead(Document aggregateCommand) {
         MongoDatabase db;
         try {
             db = database();
@@ -79,8 +92,7 @@ final class ReactiveHeartbeatProbe implements HeartbeatProbe {
 
         long cursorId = 0;
         try {
-            Document reply = runCommand(db,
-                    ChangeStreamProbeCommands.aggregateCommand(def, pipeline, resumeAfter));
+            Document reply = runCommand(db, aggregateCommand);
             Document cursor = reply.get("cursor", Document.class);
             cursorId = ((Number) cursor.get("id")).longValue();
             List<Document> firstBatch = cursor.getList("firstBatch", Document.class);

@@ -339,11 +339,13 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             return;
         }
 
-        // Track the latest token for periodic checkpoint timer
-        if (def.checkpointAnnotation() != null && raw.getResumeToken() != null) {
-            latestTokens.computeIfAbsent(def.streamName(), k -> new AtomicReference<>())
-                    .set(new TokenSnapshot(raw.getResumeToken(), Instant.now()));
-        }
+        // The resume token is published to the heartbeat only once the event
+        // reaches a terminal-safe outcome (handler success after
+        // saveProcessed, filter rejection, no handler, terminal SKIP/DLQ) —
+        // see publishSettledToken. Publishing at receipt would let a recovery
+        // certify past an event whose handler is still in flight, and the
+        // history-lost reset removes the processed anchor that would
+        // otherwise guarantee its redelivery.
 
         DefaultChangeStreamContext<Document> ctx = new DefaultChangeStreamContext<>(
                 raw, def.streamName(), DefaultChangeStreamContext.NOOP_ACTIONS,
@@ -414,12 +416,14 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         HandlerMethod handler = def.resolveHandler(ctx.getOperationType());
         if (handler == null) {
             log.debug("No handler for {} in stream '{}'", ctx.getOperationType(), def.streamName());
+            publishSettledToken(def, raw);
             return;
         }
 
         if (def.filterMethod() != null) {
             if (!def.filterMethod().evaluate(def.bean(), ctx)) {
                 log.debug("Event filtered by @Filter in stream '{}'", def.streamName());
+                publishSettledToken(def, raw);
                 return;
             }
         }
@@ -429,6 +433,11 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
 
         long startNanos = System.nanoTime();
         boolean success = false;
+        // Terminal-outcome marker: only handler success, SKIP or a DLQ
+        // decision settle the event. An interrupted retry backoff exits the
+        // loop with the outcome still undecided — publishing its token would
+        // let a probe certify past a delivery that must be replayed.
+        boolean settled = false;
         int attempt = 1;
 
         outerLoop:
@@ -442,6 +451,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                 if (!ctx.isCheckpointSavedManually()) {
                     saveCheckpointIfNeeded(def, raw.getResumeToken(), ctx.getClusterTime());
                 }
+                settled = true;
                 break;
             } catch (InvocationTargetException e) {
                 Throwable cause = e.getCause() != null ? e.getCause() : e;
@@ -453,12 +463,14 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                     case SKIP -> {
                         log.warn("@OnError SKIP for stream '{}': {}", def.streamName(), cause.getMessage());
                         FlowWardenMetrics.get().onEventError(def.streamName(), cause, false, attempt, eventMetadata);
+                        settled = true;
                         break outerLoop;
                     }
                     case DLQ -> {
                         log.warn("@OnError DLQ for stream '{}': {}", def.streamName(), cause.getMessage());
                         FlowWardenMetrics.get().onEventError(def.streamName(), cause, false, attempt, eventMetadata);
                         sendToDlqAfterExhaustion(def, ctx, raw, cause, attempt);
+                        settled = true;
                         break outerLoop;
                     }
                     case RETRY -> {
@@ -480,6 +492,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                         log.warn("@OnError RETRY exhausted for stream '{}': {}", def.streamName(), cause.getMessage());
                         FlowWardenMetrics.get().onEventError(def.streamName(), cause, false, attempt, eventMetadata);
                         sendToDlqAfterExhaustion(def, ctx, raw, cause, attempt);
+                        settled = true;
                         break outerLoop;
                     }
                     case RETHROW -> {
@@ -508,12 +521,14 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                             handler, def.streamName(), cause.getMessage(), cause);
                     FlowWardenMetrics.get().onEventError(def.streamName(), cause, false, attempt, eventMetadata);
                     sendToDlqAfterExhaustion(def, ctx, raw, cause, attempt);
+                    settled = true;
                     break;
                 }
             } catch (IllegalAccessException e) {
                 log.error("Cannot invoke handler for stream '{}'", def.streamName(), e);
                 FlowWardenMetrics.get().onEventError(def.streamName(), e, false, attempt, eventMetadata);
                 sendToDlqAfterExhaustion(def, ctx, raw, e, attempt);
+                settled = true;
                 break;
             }
         }
@@ -521,6 +536,26 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         long durationNanos = System.nanoTime() - startNanos;
         FlowWardenMetrics.get().onEventProcessed(def.streamName(), durationNanos, success);
         lastActivityTimes.put(def.streamName(), Instant.now());
+        // Publish only on terminal outcomes (success after saveProcessed,
+        // SKIP, DLQ decision, exhaustion). An interrupted retry backoff
+        // leaves the outcome undecided — the event must be replayable, its
+        // token must never become a certification chain source.
+        if (settled) {
+            publishSettledToken(def, raw);
+        }
+    }
+
+    /**
+     * Publishes a resume token to the heartbeat's shared snapshot. Only
+     * called on terminal-safe outcomes — a token observed at receipt is
+     * never certifiable while its handler outcome is undecided.
+     */
+    private void publishSettledToken(ChangeStreamDefinition def,
+                                     ChangeStreamDocument<Document> raw) {
+        if (def.checkpointAnnotation() != null && raw.getResumeToken() != null) {
+            latestTokens.computeIfAbsent(def.streamName(), k -> new AtomicReference<>())
+                    .set(new TokenSnapshot(raw.getResumeToken(), Instant.now()));
+        }
     }
 
     private ErrorAction resolveErrorAction(ChangeStreamDefinition def, Throwable cause,
@@ -595,7 +630,12 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         }
         int flushSeconds = def.checkpointAnnotation().saveIntervalSeconds();
         int idleSeconds = def.checkpointAnnotation().idleHeartbeatIntervalSeconds();
-        if (flushSeconds <= 0 && idleSeconds <= 0) {
+        boolean needsEstablishmentChain =
+                resumeContext.startInCatchUp() || resumeContext.initialOperationTime() != null;
+        if (flushSeconds <= 0 && idleSeconds <= 0 && !needsEstablishmentChain) {
+            // No periodic policy AND no pending recovery/catch-up transition:
+            // nothing to schedule. The establishment chain, when needed, runs
+            // even with both periodic policies opted out.
             return;
         }
         String streamName = def.streamName();
@@ -614,7 +654,9 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                 () -> latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>()),
                 resumeContext.allowPersistedFallback(),
                 Duration.ofSeconds(idleSeconds),
-                resumeContext.startInCatchUp());
+                resumeContext.startInCatchUp(),
+                resumeContext.initialOperationTime(),
+                resumeContext.deadProcessedToken());
         heartbeats.put(streamName, heartbeat);
         if (flushSeconds > 0) {
             intervalTasks.put(streamName, intervalScheduler.scheduleAtFixedRate(
@@ -631,11 +673,12 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             idleProbeTasks.put(streamName, probeScheduler.scheduleAtFixedRate(
                     heartbeat::idleTick, initialDelay, checkSeconds, TimeUnit.SECONDS));
         }
-        if (resumeContext.startInCatchUp()) {
-            // Transient catch-up chain: immediate certification attempt, then
-            // bounded retries until the server certifies the backlog consumed.
-            // Independent of the idle policy — opting out of idle probing must
-            // never disable the correction the flush depends on.
+        if (needsEstablishmentChain) {
+            // Transient establishment chain: immediate certification attempt,
+            // then bounded retries until the server certifies the backlog
+            // consumed (catch-up) or a durable position exists (OPLOG_START
+            // recovery). Independent of both periodic policies — opting out
+            // of them must never disable a correction the flush depends on.
             scheduleCatchUpAttempt(heartbeat, 0);
         } else if (idleSeconds > 0) {
             // Async diagnostic probe: an incompatible probe pipeline surfaces
@@ -652,13 +695,23 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         try {
             probeScheduler.schedule(() -> {
                 heartbeat.probeNow();
-                if (heartbeat.isActive() && heartbeat.isCatchingUp()) {
+                if (heartbeat.isActive() && heartbeat.needsEstablishment()) {
                     scheduleCatchUpAttempt(heartbeat, CATCH_UP_RETRY_SECONDS);
                 }
             }, delaySeconds, TimeUnit.SECONDS);
         } catch (java.util.concurrent.RejectedExecutionException e) {
             // Scheduler shut down — the stream is going away with it.
         }
+    }
+
+    private static Instant mostRecent(Instant... candidates) {
+        Instant best = null;
+        for (Instant candidate : candidates) {
+            if (candidate != null && (best == null || candidate.isAfter(best))) {
+                best = candidate;
+            }
+        }
+        return best;
     }
 
     private void saveCheckpointIfNeeded(ChangeStreamDefinition def, BsonDocument token, Instant timestamp) {
@@ -720,7 +773,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             // No prior checkpoint → bootstrap: capture an initial PBRT and
             // start the main stream from it, so no window is ever unprotected
             // and the heartbeat always has a position to chain from.
-            return bootstrapInitialPosition(streamName, builder, probe);
+            return bootstrapInitialPosition(streamName, builder, probe, null);
         }
         io.flowwarden.stream.spi.Checkpoint cp = cpOpt.get();
         BsonDocument processedToken = cp.lastProcessedToken();
@@ -757,24 +810,35 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             return new ResumeContext(primary, seenToken);
         }
 
-        // Level 2: fallback to the secondary if it's distinct and still valid
+        // Level 2: the secondary, validated exactly once. With a null primary
+        // (never recorded — typical after a history-lost self-repair) this is
+        // not a degradation: INFO, no "aged out" warning, no fallback metric.
         if (secondary != null
-                && !secondary.equals(primary)
+                && (primary == null || !secondary.equals(primary))
                 && isTokenValid(def.collection(), secondary, streamTemplate)) {
             builder.resumeAfter(secondary);
-            log.warn("Resuming stream '{}' from {}: {} aged out of oplog", streamName, secondaryLabel, primaryLabel);
-            onFallback.run();
+            if (primary == null) {
+                log.info("Resuming stream '{}' from {} ({} not recorded)",
+                        streamName, secondaryLabel, primaryLabel);
+            } else {
+                log.warn("Resuming stream '{}' from {}: {} aged out of oplog",
+                        streamName, secondaryLabel, primaryLabel);
+                onFallback.run();
+            }
             return new ResumeContext(secondary, seenToken);
         }
 
         // Level 3: both tokens unusable → apply onHistoryLost strategy
         if (processedToken != null || seenToken != null) {
             FlowWardenMetrics.get().onResumeHistoryLost(streamName);
-            return handleHistoryLost(streamName, def, builder, cp.lastProcessedTimestamp(), probe);
+            return handleHistoryLost(streamName, def, builder,
+                    mostRecent(cp.lastProcessedTimestamp(), cp.lastSeenTimestamp(),
+                            cp.lastHeartbeatTimestamp()),
+                    processedToken, probe);
         }
         // Checkpoint document exists but both tokens are null → bootstrap,
         // same as a stream with no prior checkpoint.
-        return bootstrapInitialPosition(streamName, builder, probe);
+        return bootstrapInitialPosition(streamName, builder, probe, null);
     }
 
     /**
@@ -787,11 +851,21 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
      */
     private ResumeContext bootstrapInitialPosition(String streamName,
                                                   ChangeStreamRequest.ChangeStreamRequestBuilder<Document> builder,
-                                                  ImperativeHeartbeatProbe probe) {
+                                                  ImperativeHeartbeatProbe probe,
+                                                  BsonDocument deadProcessedToken) {
         BsonDocument pbrt = probe.initialPosition();
         Instant now = Instant.now();
         try {
-            checkpointStore.saveSeen(streamName, pbrt, now, now);
+            if (deadProcessedToken != null) {
+                // History-lost recovery: the history is explicitly abandoned,
+                // so the dead processed pair is removed along with installing
+                // the fresh position — atomically, guarded on the value read
+                // at detection, preserving instanceId, metadata and any
+                // fields unknown to the SPI.
+                checkpointStore.resetAfterHistoryLost(streamName, pbrt, deadProcessedToken, now);
+            } else {
+                checkpointStore.saveSeen(streamName, pbrt, now, now);
+            }
         } catch (RuntimeException e) {
             // A non-durable position cannot guarantee at-least-once: a crash
             // before the next checkpoint would silently restart from a newer
@@ -810,6 +884,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                                    ChangeStreamDefinition def,
                                    ChangeStreamRequest.ChangeStreamRequestBuilder<Document> builder,
                                    java.time.Instant lastCheckpointTimestamp,
+                                   BsonDocument deadProcessedToken,
                                    ImperativeHeartbeatProbe probe) {
         OnHistoryLost strategy = def.checkpointAnnotation().onHistoryLost();
         log.warn("Resume token expired for stream '{}' (last checkpoint: {}). Applying strategy: {}",
@@ -824,13 +899,14 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                 // immediately and the heartbeat never consults the expired
                 // token again.
                 log.info("Stream '{}' will start from a fresh certified position", streamName);
-                return bootstrapInitialPosition(streamName, builder, probe);
+                return bootstrapInitialPosition(streamName, builder, probe, deadProcessedToken);
             }
             case RESUME_FROM_OPLOG_START -> {
+                BsonTimestamp oldestTs;
                 try {
-                    Instant oldestTs = getOldestOplogTimestamp();
-                    builder.resumeAt(oldestTs);
-                    log.info("Stream '{}' will resume from oldest oplog entry at {}", streamName, oldestTs);
+                    // The stream's own template: on multi-cluster setups the
+                    // default template's oplog may be a different cluster's.
+                    oldestTs = getOldestOplogTimestamp(templateFor(def));
                 } catch (Exception e) {
                     // Same self-repair as RESUME_FROM_NOW (matching the logged
                     // fallback): a fresh certified position instead of an
@@ -839,18 +915,25 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                     // starts on a non-durable position.
                     log.warn("Failed to read oplog for stream '{}': {}. Falling back to RESUME_FROM_NOW.",
                             streamName, e.getMessage());
-                    return bootstrapInitialPosition(streamName, builder, probe);
+                    return bootstrapInitialPosition(streamName, builder, probe, deadProcessedToken);
                 }
+                // The dead tokens deliberately STAY in the checkpoint: they
+                // are the only durable marker that a recovery is due. A crash
+                // before the establishment write re-enters this recovery on
+                // restart (re-replaying is at-least-once safe) instead of
+                // silently bootstrapping "from now". The establishment write
+                // performs the deferred cleanup, guarded by the dead
+                // processed token carried in the context.
+                builder.resumeAt(Instant.ofEpochSecond(oldestTs.getTime()));
+                log.info("Stream '{}' will resume from oldest oplog entry at {}", streamName, oldestTs);
+                return new ResumeContext(null, null, oldestTs, deadProcessedToken);
             }
         }
-        // OPLOG_START catch-up from the oldest oplog entry: no established
-        // position — the heartbeat must abstain rather than fall back to the
-        // invalid checkpoint.
-        return ResumeContext.NONE;
+        throw new IllegalStateException("Unknown OnHistoryLost strategy: " + strategy);
     }
 
-    private Instant getOldestOplogTimestamp() {
-        Document oldestEntry = defaultTemplate.getMongoDatabaseFactory()
+    private BsonTimestamp getOldestOplogTimestamp(MongoTemplate template) {
+        Document oldestEntry = template.getMongoDatabaseFactory()
                 .getMongoDatabase("local")
                 .getCollection("oplog.rs")
                 .find()
@@ -860,8 +943,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         if (oldestEntry == null) {
             throw new IllegalStateException("oplog.rs is empty or not accessible");
         }
-        org.bson.BsonTimestamp ts = oldestEntry.get("ts", org.bson.BsonTimestamp.class);
-        return Instant.ofEpochSecond(ts.getTime());
+        return oldestEntry.get("ts", org.bson.BsonTimestamp.class);
     }
 
     private ChangeStreamDefinition findDefinition(String streamName) {

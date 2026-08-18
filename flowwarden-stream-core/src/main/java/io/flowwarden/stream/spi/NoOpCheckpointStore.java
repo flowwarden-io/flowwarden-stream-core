@@ -58,6 +58,11 @@ final class NoOpCheckpointStore implements CheckpointStore {
     }
 
     @Override
+    public void resetAfterHistoryLost(String streamName, BsonDocument freshSeenToken,
+                                      BsonDocument expectedDeadProcessed, Instant timestamp) {
+    }
+
+    @Override
     public void delete(String streamName) {
     }
 }

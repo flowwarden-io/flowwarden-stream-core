@@ -60,6 +60,7 @@ class CheckpointHeartbeatTest {
     private static final BsonDocument EVENT_B = BsonDocument.parse("{\"_data\": \"event-b\"}");
     private static final BsonDocument PBRT = BsonDocument.parse("{\"_data\": \"pbrt\"}");
     private static final BsonDocument PERSISTED_SEEN = BsonDocument.parse("{\"_data\": \"persisted\"}");
+    private static final BsonDocument DEAD_PROCESSED = BsonDocument.parse("{\"_data\": \"dead-processed\"}");
 
     private RecordingStore store;
     private RecordingMetrics metrics;
@@ -80,19 +81,30 @@ class CheckpointHeartbeatTest {
         FlowWardenMetrics.setProvider(StreamMetricsProvider.noOp());
     }
 
+    private final List<org.bson.BsonTimestamp> opTimeProbes = new ArrayList<>();
+
     private CheckpointHeartbeat heartbeat(Function<BsonDocument, ProbeOutcome> probeFn) {
         return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
-                true, IDLE_THRESHOLD, false);
+                true, IDLE_THRESHOLD, false, null, null);
     }
 
     private CheckpointHeartbeat catchUpHeartbeat(Function<BsonDocument, ProbeOutcome> probeFn) {
         return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
-                true, IDLE_THRESHOLD, true);
+                true, IDLE_THRESHOLD, true, null, null);
     }
 
     private CheckpointHeartbeat noFallbackHeartbeat(Function<BsonDocument, ProbeOutcome> probeFn) {
         return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
-                false, IDLE_THRESHOLD, false);
+                false, IDLE_THRESHOLD, false, null, null);
+    }
+
+    private CheckpointHeartbeat opTimeHeartbeat(org.bson.BsonTimestamp opTime,
+                                                Function<BsonDocument, ProbeOutcome> probeFn) {
+        // RESUME_FROM_OPLOG_START recovery: no fallback, no catch-up, an
+        // operation time as last-resort chain source, the dead processed
+        // token as the deferred-cleanup guard.
+        return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
+                false, IDLE_THRESHOLD, false, opTime, DEAD_PROCESSED);
     }
 
     private HeartbeatProbe probeOf(Function<BsonDocument, ProbeOutcome> fn) {
@@ -101,6 +113,12 @@ class CheckpointHeartbeatTest {
             public ProbeOutcome probe(BsonDocument resumeAfter) {
                 probed.add(resumeAfter);
                 return fn.apply(resumeAfter);
+            }
+
+            @Override
+            public ProbeOutcome probeFromOperationTime(org.bson.BsonTimestamp operationTime) {
+                opTimeProbes.add(operationTime);
+                return fn.apply(null);
             }
 
             @Override
@@ -430,6 +448,71 @@ class CheckpointHeartbeatTest {
         assertThat(store.calls).containsExactly("saveSeen+hb:pbrt");
     }
 
+    // --- OPLOG_START recovery: operation time as last-resort chain source ---
+
+    @Test
+    void opTimeRecovery_noPositionAnywhere_probesFromOperationTime_neverFromNow() {
+        org.bson.BsonTimestamp opTime = new org.bson.BsonTimestamp(1234, 1);
+        CheckpointHeartbeat hb = opTimeHeartbeat(opTime, r -> ProbeOutcome.empty(PBRT));
+        assertThat(hb.needsEstablishment()).isTrue();
+
+        hb.probeNow();
+
+        assertThat(opTimeProbes).containsExactly(opTime);
+        assertThat(probed).as("never a token probe, never 'now'").isEmpty();
+        // Deferred cleanup: the establishment write replaces the dead tokens,
+        // guarded on the dead processed value read at detection.
+        assertThat(store.calls).containsExactly("reset:pbrt/guard:dead-processed");
+        assertThat(hb.needsEstablishment())
+                .as("a DURABLE position ends the establishment chain")
+                .isFalse();
+    }
+
+    @Test
+    void opTimeRecovery_deliveredTokenIsOnlyAChainSource_notADurableWrite() {
+        // Review blocker: a delivered token must NOT end the chain — only a
+        // successful durable write does. Filtered events produce tokens
+        // without any saveProcessed, and the flush may be disabled.
+        org.bson.BsonTimestamp opTime = new org.bson.BsonTimestamp(1234, 1);
+        java.util.concurrent.atomic.AtomicReference<ProbeOutcome> outcome =
+                new java.util.concurrent.atomic.AtomicReference<>(ProbeOutcome.eventPending());
+        CheckpointHeartbeat hb = opTimeHeartbeat(opTime, r -> outcome.get());
+
+        hb.probeNow(); // replay flowing → abstain
+        assertThat(store.calls).isEmpty();
+        assertThat(hb.needsEstablishment()).isTrue();
+
+        // The main cursor delivers a (possibly filtered) event: still no
+        // durable write — the chain must keep going.
+        ref.set(new TokenSnapshot(EVENT_A, NOW));
+        assertThat(hb.needsEstablishment())
+                .as("a delivered token is only a chain source, not a durable write")
+                .isTrue();
+
+        // Next chain probe chains from the delivered token and certifies.
+        outcome.set(ProbeOutcome.empty(PBRT));
+        hb.probeNow();
+        assertThat(probed).contains(EVENT_A);
+        assertThat(opTimeProbes).hasSize(1); // op-time source not reused
+        assertThat(store.calls).containsExactly("reset:pbrt/guard:dead-processed");
+        assertThat(hb.needsEstablishment()).isFalse();
+    }
+
+    @Test
+    void opTimeRecovery_samePbrtAsChainToken_stillGoesThroughTheReset() {
+        // Fast-path guard: during a pending reset, even a PBRT identical to
+        // the chained token must NOT degrade to a heartbeat-only write — the
+        // deferred cleanup would never run and the chain would never end.
+        org.bson.BsonTimestamp opTime = new org.bson.BsonTimestamp(1234, 1);
+        CheckpointHeartbeat hb = opTimeHeartbeat(opTime, r -> ProbeOutcome.empty(EVENT_A));
+        ref.set(new TokenSnapshot(EVENT_A, NOW)); // delivered during replay
+
+        hb.probeNow();
+
+        assertThat(store.calls).containsExactly("reset:event-a/guard:dead-processed");
+        assertThat(hb.needsEstablishment()).isFalse();
+    }
+
     // --- startup probe ---
 
     @Test
@@ -527,6 +610,19 @@ class CheckpointHeartbeatTest {
             }
             calls.add("saveHeartbeat");
             lastHeartbeatTimestamp = heartbeatTimestamp;
+        }
+
+        @Override
+        public void resetAfterHistoryLost(String streamName, BsonDocument freshSeenToken,
+                                          BsonDocument expectedDeadProcessed, Instant timestamp) {
+            if (throwOnWrite) {
+                throw new RuntimeException("store down");
+            }
+            calls.add("reset:" + (freshSeenToken != null
+                    ? freshSeenToken.getString("_data").getValue() : "null")
+                    + "/guard:" + (expectedDeadProcessed != null
+                    ? expectedDeadProcessed.getString("_data").getValue() : "null"));
+            lastHeartbeatTimestamp = freshSeenToken != null ? timestamp : null;
         }
 
         @Override

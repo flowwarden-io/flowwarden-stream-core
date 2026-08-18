@@ -68,16 +68,26 @@ class ReactiveIdleHeartbeatIntegrationTest {
     @Autowired CheckpointStore checkpointStore;
     @Autowired ReactiveIdleHandler handler;
     @Autowired ReactiveCatchUpOptOutHandler catchUpOptOutHandler;
+    @Autowired ReactiveOplogStartHandler oplogStartHandler;
+    @Autowired ReactiveRedeliveryHandler redeliveryHandler;
 
     @BeforeEach
     void setUp() {
         handler.clear();
         catchUpOptOutHandler.clear();
+        oplogStartHandler.clear();
+        redeliveryHandler.reset();
+        reactiveMongoTemplate.dropCollection(OPLOG_COLLECTION)
+                .onErrorResume(e -> Mono.empty()).block();
+        checkpointStore.delete(OPLOG_STREAM);
         reactiveMongoTemplate.dropCollection(COLLECTION).onErrorResume(e -> Mono.empty()).block();
         reactiveMongoTemplate.dropCollection(OTHER_COLLECTION).onErrorResume(e -> Mono.empty()).block();
         reactiveMongoTemplate.dropCollection(CATCHUP_OPTOUT_COLLECTION)
                 .onErrorResume(e -> Mono.empty()).block();
+        reactiveMongoTemplate.dropCollection(REDELIVERY_COLLECTION)
+                .onErrorResume(e -> Mono.empty()).block();
         checkpointStore.delete(CATCHUP_OPTOUT_STREAM);
+        checkpointStore.delete(REDELIVERY_STREAM);
         checkpointStore.delete(STREAM_NAME);
         streamManager.startStream(STREAM_NAME);
         await().atMost(Duration.ofSeconds(5))
@@ -88,8 +98,10 @@ class ReactiveIdleHeartbeatIntegrationTest {
     void tearDown() {
         try { streamManager.stopStream(STREAM_NAME); } catch (Exception ignored) {}
         try { streamManager.stopStream(CATCHUP_OPTOUT_STREAM); } catch (Exception ignored) {}
+        try { streamManager.stopStream(REDELIVERY_STREAM); } catch (Exception ignored) {}
         checkpointStore.delete(STREAM_NAME);
         checkpointStore.delete(CATCHUP_OPTOUT_STREAM);
+        checkpointStore.delete(REDELIVERY_STREAM);
     }
 
     @Test
@@ -226,13 +238,227 @@ class ReactiveIdleHeartbeatIntegrationTest {
         return BsonDocument.parse(pbrt.toJson());
     }
 
+    @Test
+    void expiredCheckpoint_oplogStart_selfRepairs_secondRestartIsClean() {
+        // Reactive twin of the OPLOG_START self-repair: the reactive
+        // probeFromOperationTime is a distinct raw-command path.
+        var recordingMetrics = new RecordingResumeMetrics();
+        io.flowwarden.stream.FlowWardenMetrics.setProvider(recordingMetrics);
+        try {
+            Instant past = Instant.now().minusSeconds(86_400);
+            BsonDocument expired = BsonDocument.parse("{\"_data\": \"0000DEAD\"}");
+            checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
+                    OPLOG_STREAM, null, expired, past, expired, past,
+                    java.util.Collections.emptyMap()));
+
+            streamManager.startStream(OPLOG_STREAM);
+            await().atMost(Duration.ofSeconds(5))
+                    .until(() -> streamManager.isRunning(OPLOG_STREAM));
+
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                var cp = checkpointStore.findByStreamName(OPLOG_STREAM).orElseThrow();
+                assertThat(cp.lastProcessedToken()).isNull();
+                assertThat(cp.lastSeenToken())
+                        .as("the establishment chain must produce a durable fresh position")
+                        .isNotNull()
+                        .isNotEqualTo(expired);
+            });
+
+            streamManager.stopStream(OPLOG_STREAM);
+            recordingMetrics.historyLostCount.set(0);
+            streamManager.startStream(OPLOG_STREAM);
+            await().atMost(Duration.ofSeconds(5))
+                    .until(() -> streamManager.isRunning(OPLOG_STREAM));
+            assertThat(recordingMetrics.historyLostCount.get())
+                    .as("the second restart must not replay the history-lost path")
+                    .isZero();
+
+            reactiveMongoTemplate.insert(
+                    new Document("tag", "after-repair"), OPLOG_COLLECTION).block();
+            await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                    assertThat(oplogStartHandler.tags()).contains("after-repair"));
+        } finally {
+            streamManager.stopStream(OPLOG_STREAM);
+            checkpointStore.delete(OPLOG_STREAM);
+            io.flowwarden.stream.FlowWardenMetrics.setProvider(
+                    io.flowwarden.stream.spi.StreamMetricsProvider.noOp());
+        }
+    }
+
+    @Test
+    void oplogStartRecovery_inFlightHandlerAtCrash_eventIsRedeliveredOnRestart() throws Exception {
+        // Reactive twin of the settled-token at-least-once test: the first
+        // delivery's Mono never completes, so the event never settles and
+        // recovery must not certify past it. The "crash" is the stream
+        // disposal cancelling the pending Mono — cancellation is not a
+        // terminal outcome, nothing may settle from it.
+        Instant past = Instant.now().minusSeconds(86_400);
+        BsonDocument expired = BsonDocument.parse("{\"_data\": \"0000DEAD\"}");
+        checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
+                REDELIVERY_STREAM, null, expired, past, expired, past,
+                java.util.Collections.emptyMap()));
+        // The event belongs to the replay the recovery promises to deliver.
+        reactiveMongoTemplate.insert(new Document("seq", 1), REDELIVERY_COLLECTION).block();
+
+        streamManager.startStream(REDELIVERY_STREAM);
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning(REDELIVERY_STREAM));
+        assertThat(redeliveryHandler.awaitEntered(10)).isTrue();
+
+        // Longer than one chain retry (5s): several establishment attempts
+        // ran against the unsettled event — the durable marker must survive.
+        Thread.sleep(7_000);
+        var atCrash = checkpointStore.findByStreamName(REDELIVERY_STREAM).orElseThrow();
+        assertThat(atCrash.lastSeenToken()).isEqualTo(expired);
+        assertThat(atCrash.lastProcessedToken()).isEqualTo(expired);
+        assertThat(redeliveryHandler.completedCount()).isZero();
+
+        streamManager.stopStream(REDELIVERY_STREAM);
+
+        // Restart: the intact marker re-enters the recovery and the event is
+        // REDELIVERED; this time the Mono completes and saveProcessed writes
+        // a fresh anchor BEFORE the token settles.
+        streamManager.startStream(REDELIVERY_STREAM);
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning(REDELIVERY_STREAM));
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(redeliveryHandler.completedCount()).isEqualTo(1));
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            var cp = checkpointStore.findByStreamName(REDELIVERY_STREAM).orElseThrow();
+            assertThat(cp.lastSeenToken()).isNotNull().isNotEqualTo(expired);
+            assertThat(cp.lastProcessedToken())
+                    .as("a processed anchor reacquired during the replay must never be unset")
+                    .isNotNull()
+                    .isNotEqualTo(expired);
+        });
+    }
+
+    private static final class RecordingResumeMetrics
+            implements io.flowwarden.stream.spi.StreamMetricsProvider {
+        final java.util.concurrent.atomic.AtomicInteger historyLostCount =
+                new java.util.concurrent.atomic.AtomicInteger();
+
+        @Override
+        public void onResumeHistoryLost(String streamName) {
+            historyLostCount.incrementAndGet();
+        }
+
+        @Override
+        public void onStreamStarted(String streamName,
+                io.flowwarden.stream.spi.StreamConfiguration config) {
+        }
+
+        @Override
+        public void onEventReceived(String streamName,
+                io.flowwarden.stream.spi.ChangeEventMetadata metadata) {
+        }
+
+        @Override
+        public void onEventProcessed(String streamName, long durationNanos, boolean success) {
+        }
+
+        @Override
+        public void onEventError(String streamName, Throwable error, boolean willRetry,
+                int attemptNumber, io.flowwarden.stream.spi.ChangeEventMetadata metadata) {
+        }
+
+        @Override
+        public void onCheckpoint(String streamName, String resumeToken) {
+        }
+
+        @Override
+        public void onBufferStatus(String streamName, int currentSize, int maxSize) {
+        }
+
+        @Override
+        public void onBackpressure(String streamName,
+                io.flowwarden.stream.spi.BackpressureAction action) {
+        }
+
+        @Override
+        public void onEventSentToDlq(String streamName) {
+        }
+
+        @Override
+        public void onOplogStats(double logLengthHours, String status) {
+        }
+    }
+
+    private static final String OPLOG_STREAM = "idle-hb-reactive-oplog-start";
+    private static final String OPLOG_COLLECTION = "idle_hb_reactive_oplog_start";
+
     private static final String CATCHUP_OPTOUT_STREAM = "idle-hb-reactive-catchup-optout";
     private static final String CATCHUP_OPTOUT_COLLECTION = "idle_hb_reactive_catchup_optout";
 
+    private static final String REDELIVERY_STREAM = "idle-hb-reactive-redelivery";
+    private static final String REDELIVERY_COLLECTION = "idle_hb_reactive_redelivery";
+
     @SpringBootApplication
     @EnableFlowWarden
-    @Import({ReactiveIdleHandler.class, ReactiveCatchUpOptOutHandler.class})
+    @Import({ReactiveIdleHandler.class, ReactiveCatchUpOptOutHandler.class,
+            ReactiveOplogStartHandler.class, ReactiveRedeliveryHandler.class})
     static class TestApp {}
+
+    @ChangeStream(name = REDELIVERY_STREAM, collection = REDELIVERY_COLLECTION,
+            documentType = Document.class, autoStart = false)
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 1,
+            onHistoryLost = io.flowwarden.stream.OnHistoryLost.RESUME_FROM_OPLOG_START)
+    static class ReactiveRedeliveryHandler {
+
+        private final java.util.concurrent.atomic.AtomicInteger invocations =
+                new java.util.concurrent.atomic.AtomicInteger();
+        private volatile java.util.concurrent.CountDownLatch entered =
+                new java.util.concurrent.CountDownLatch(1);
+        private final List<Document> completed = new CopyOnWriteArrayList<>();
+
+        @OnInsert
+        Mono<Void> handle(ChangeStreamContext<Document> ctx) {
+            if (invocations.incrementAndGet() == 1) {
+                entered.countDown();
+                // First delivery: never completes — the stream disposal
+                // ("crash") cancels it without settling the event.
+                return Mono.never();
+            }
+            ctx.getFullDocument(Document.class).ifPresent(completed::add);
+            return Mono.empty();
+        }
+
+        boolean awaitEntered(int seconds) throws InterruptedException {
+            return entered.await(seconds, java.util.concurrent.TimeUnit.SECONDS);
+        }
+
+        int completedCount() {
+            return completed.size();
+        }
+
+        void reset() {
+            entered = new java.util.concurrent.CountDownLatch(1);
+            invocations.set(0);
+            completed.clear();
+        }
+    }
+
+    @ChangeStream(name = OPLOG_STREAM, collection = OPLOG_COLLECTION,
+            documentType = Document.class, autoStart = false)
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 1,
+            onHistoryLost = io.flowwarden.stream.OnHistoryLost.RESUME_FROM_OPLOG_START)
+    static class ReactiveOplogStartHandler {
+
+        private final List<Document> events = new CopyOnWriteArrayList<>();
+
+        @OnInsert
+        Mono<Void> handle(ChangeStreamContext<Document> ctx) {
+            ctx.getFullDocument(Document.class).ifPresent(events::add);
+            return Mono.empty();
+        }
+
+        List<String> tags() {
+            return events.stream().map(d -> d.getString("tag")).toList();
+        }
+
+        void clear() { events.clear(); }
+    }
 
     @ChangeStream(name = CATCHUP_OPTOUT_STREAM, collection = CATCHUP_OPTOUT_COLLECTION,
             documentType = Document.class, autoStart = false)
