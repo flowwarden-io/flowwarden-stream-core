@@ -218,7 +218,7 @@ All stream-level settings are configured via annotations on your `@ChangeStream`
 
 | Annotation | Purpose | Key defaults |
 |------------|---------|--------------|
-| `@Checkpoint` | Resume token persistence | `saveEveryN = 1`, `saveIntervalSeconds = 5`, `startPosition = RESUME` |
+| `@Checkpoint` | Resume token persistence | `saveEveryN = 1`, `saveIntervalSeconds = 5`, `idleHeartbeatIntervalSeconds = 300` (idle-stream oplog-rollover protection, `0` opts out), `startPosition = RESUME` |
 | `@RetryPolicy` | Exponential backoff on failure | `maxAttempts = 3`, `initialDelay = "500ms"`, `multiplier = 2.0`, `maxDelay = "30s"`, `jitter = true` |
 | `@DeadLetterQueue` | Route failed events to a DLQ (backend-agnostic) | `enabled = true`, `retentionDays = 30` |
 | `@MongoDlqOptions` | MongoDB-specific DLQ tuning (collection override) | `collection = "_fw_dlq"` (overrides `flowwarden.dlq.mongo.collection`) |

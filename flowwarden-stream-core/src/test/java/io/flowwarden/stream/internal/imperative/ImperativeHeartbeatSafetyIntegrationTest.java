@@ -161,12 +161,13 @@ class ImperativeHeartbeatSafetyIntegrationTest {
     }
 
     @Test
-    void expiredChainToken_probeFailsLoudly_streamKeepsDelivering_nextEventRecovers() {
-        // A checkpoint whose seen token is unusable, with RESUME_FROM_NOW so
-        // the stream starts anyway. The stale token stays in the checkpoint
-        // (recovery self-repair is a separate issue), so the heartbeat's
-        // persisted-fallback chains from it and fails.
+    void expiredCheckpoint_resumeFromNow_selfRepairsImmediately_withoutProbeErrorLoop() throws Exception {
+        // A checkpoint whose tokens are unusable, with RESUME_FROM_NOW: the
+        // recovery must bootstrap a fresh certified position immediately —
+        // the heartbeat never consults the expired token, so no repeated
+        // probe errors (the pre-redesign failure loop from the PR review).
         Instant past = Instant.now().minusSeconds(86_400);
+        Instant beforeStart = Instant.now();
         checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
                 EXPIRED_STREAM, null, EXPIRED_TOKEN, past, EXPIRED_TOKEN, past,
                 Collections.emptyMap()));
@@ -175,26 +176,22 @@ class ImperativeHeartbeatSafetyIntegrationTest {
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning(EXPIRED_STREAM));
 
-        // The probe fails, loudly and without writing.
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                assertThat(metrics.probeFailures).isNotEmpty());
-        assertThat(checkpointStore.findByStreamName(EXPIRED_STREAM)
-                .orElseThrow().lastHeartbeatTimestamp())
-                .as("a failed probe must not confirm anything")
-                .isNull();
+        // Self-repair happened at startup, before any event.
+        var repaired = checkpointStore.findByStreamName(EXPIRED_STREAM).orElseThrow();
+        assertThat(repaired.lastSeenToken()).isNotEqualTo(EXPIRED_TOKEN);
+        assertThat(repaired.lastHeartbeatTimestamp()).isAfterOrEqualTo(beforeStart);
 
-        // The stream itself is unaffected: events are delivered...
-        Instant beforeRecovery = Instant.now();
+        // Several probe cycles later (idle interval = 1s): no probe failures —
+        // the expired token is never chained from again.
+        Thread.sleep(3_000);
+        assertThat(metrics.probeFailures)
+                .as("the recovery must not leave the heartbeat probing a dead token")
+                .isEmpty();
+
+        // The stream delivers, and the checkpoint keeps advancing normally.
         mongoTemplate.insert(new Document("type", "recovery"), EXPIRED_COLLECTION);
         await().atMost(Duration.ofSeconds(10))
                 .untilAsserted(() -> assertThat(expiredTokenHandler.count()).isEqualTo(1));
-
-        // ...and the delivered event re-seeds the chain: the heartbeat recovers.
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            var cp = checkpointStore.findByStreamName(EXPIRED_STREAM).orElseThrow();
-            assertThat(cp.lastSeenToken()).isNotEqualTo(EXPIRED_TOKEN);
-            assertThat(cp.lastHeartbeatTimestamp()).isAfterOrEqualTo(beforeRecovery);
-        });
     }
 
     @SpringBootApplication

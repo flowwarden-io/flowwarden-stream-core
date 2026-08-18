@@ -37,12 +37,14 @@ import java.lang.annotation.Target;
  * <ul>
  *   <li><strong>{@code lastSeenToken}</strong> — advances on <em>every</em> event
  *       received from MongoDB (including events rejected by {@code @Filter}, events
- *       with no matching handler, and events being retried), and — when no event
- *       arrives — through the {@link #saveIntervalSeconds() heartbeat}: a bounded,
- *       ephemeral change stream probe chained from the last delivered position
- *       fetches a server-certified post-batch resume token, so the persisted
- *       position keeps tracking the oplog head with zero traffic. This keeps the
- *       stream recoverable on idle or massively-filtered workloads.</li>
+ *       with no matching handler, and events being retried), flushed on the
+ *       {@link #saveIntervalSeconds()} cadence — and, when the stream goes idle,
+ *       through the {@link #idleHeartbeatIntervalSeconds() idle heartbeat}: a
+ *       bounded, ephemeral change stream probe chained from the last delivered
+ *       position fetches a server-certified post-batch resume token, so the
+ *       persisted position keeps tracking the oplog head with zero traffic. As
+ *       long as probes succeed within the oplog window, this keeps idle or
+ *       massively-filtered streams recoverable.</li>
  *   <li><strong>{@code lastProcessedToken}</strong> — advances only when a handler
  *       method returns successfully (or the event is acknowledged by the DLQ
  *       pipeline). The {@link #saveEveryN() counter} persists this token at the
@@ -119,10 +121,11 @@ public @interface Checkpoint {
      * stream, stamped with a {@code flowwarden:heartbeat:&lt;stream&gt;}
      * comment). When the server certifies the interval empty, the returned
      * post-batch resume token is persisted as {@code lastSeenToken}: the
-     * resume point keeps tracking the oplog head with zero traffic, and the
-     * stream stays recoverable indefinitely. Any activity of the main cursor
-     * re-arms the idle delay; active streams never probe. This is the level-2
-     * safety net of the resume cascade for idle workloads.</p>
+     * resume point keeps tracking the oplog head with zero traffic — the
+     * stream stays recoverable as long as probes keep succeeding within the
+     * oplog window. Any activity of the main cursor re-arms the idle delay;
+     * active streams never probe. This is the level-2 safety net of the
+     * resume cascade for idle workloads.</p>
      *
      * <p>The checkpoint's {@code lastHeartbeatTimestamp} records the last time
      * a recoverable position was confirmed (fresh event flush or successful
@@ -130,11 +133,12 @@ public @interface Checkpoint {
      * health.</p>
      *
      * <p>The interval must stay well below the expected oplog window, with
-     * enough margin to absorb transient probe failures — there is no
-     * universally safe value, but {@code 300} (default) sits orders of
-     * magnitude under any realistic window at a negligible probe cost. Set to
-     * {@code 0} to disable idle probing entirely: the stream is then exposed
-     * to oplog rollover whenever it stays idle longer than the window.</p>
+     * enough margin to absorb transient probe failures and outages — there is
+     * no universally safe value: {@code 300} (default) is a reasonable
+     * trade-off for typical windows, not a guarantee against an oplog that
+     * rolls faster or probes that keep failing. Set to {@code 0} to disable
+     * idle probing entirely: the stream is then exposed to oplog rollover
+     * whenever it stays idle longer than the window.</p>
      */
     int idleHeartbeatIntervalSeconds() default 300;
 

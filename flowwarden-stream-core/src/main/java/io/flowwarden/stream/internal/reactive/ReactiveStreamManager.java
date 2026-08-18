@@ -77,6 +77,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -108,6 +109,19 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     private final ScheduledExecutorService intervalScheduler =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "fw-checkpoint-interval-reactive");
+                t.setDaemon(true);
+                return t;
+            });
+    /**
+     * Dedicated single thread for heartbeat probes: bounds the concurrent
+     * probe count to one per instance, prevents two probes of the same
+     * stream from overlapping, provides natural backpressure (excess probes
+     * queue among themselves) — and keeps blocking probe I/O off the flush
+     * scheduler, so one slow probe never delays other streams' flush cadence.
+     */
+    private final ScheduledExecutorService probeScheduler =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "fw-heartbeat-probe-reactive");
                 t.setDaemon(true);
                 return t;
             });
@@ -223,7 +237,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
         streams.put(streamName,
                 new ReactiveStreamState(disposableHolder, def, gracefulStop, lastError));
-        scheduleIntervalCheckpoint(def, probe);
+        scheduleIntervalCheckpoint(def, probe, seedToken);
 
         Disposable disposable = streamTemplate
                 .changeStream(def.collection(), options, Document.class)
@@ -361,6 +375,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             stopStream(streamName);
         }
         intervalScheduler.shutdownNow();
+        probeScheduler.shutdownNow();
     }
 
     private Mono<Void> handleEventReactive(ChangeStreamDocument<Document> raw,
@@ -640,40 +655,58 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         return sw.toString();
     }
 
-    private void scheduleIntervalCheckpoint(ChangeStreamDefinition def, ReactiveHeartbeatProbe probe) {
+    private void scheduleIntervalCheckpoint(ChangeStreamDefinition def,
+                                            ReactiveHeartbeatProbe probe,
+                                            BsonDocument seedToken) {
         if (def.checkpointAnnotation() == null) {
             return;
         }
-        int intervalSeconds = def.checkpointAnnotation().saveIntervalSeconds();
-        if (intervalSeconds <= 0 && def.checkpointAnnotation().idleHeartbeatIntervalSeconds() <= 0) {
+        int flushSeconds = def.checkpointAnnotation().saveIntervalSeconds();
+        int idleSeconds = def.checkpointAnnotation().idleHeartbeatIntervalSeconds();
+        if (flushSeconds <= 0 && idleSeconds <= 0) {
             return;
         }
         String streamName = def.streamName();
-        // Two independent cadences on the shared scheduler thread:
-        // - flush (saveIntervalSeconds): dirty-only write coalescing, no cursor;
-        // - idle heartbeat (idleHeartbeatIntervalSeconds): probe-based oplog
-        //   rollover protection, active only when the main cursor stalls.
+        // Two independent cadences on two separate threads:
+        // - flush (saveIntervalSeconds, flush scheduler): dirty-only write
+        //   coalescing, no cursor, never blocking;
+        // - idle heartbeat (idleHeartbeatIntervalSeconds, probe scheduler):
+        //   probe-based oplog rollover protection, active when the main
+        //   cursor stalls or while catching up after a behind resume.
         // Both advance ONLY lastSeenToken (+ lastHeartbeatTimestamp);
         // lastProcessedToken is managed by saveCheckpointIfNeeded after
-        // confirmed handler success. The persisted-token fallback is limited
-        // to RESUME streams: LATEST semantics ignore persisted tokens.
-        int idleSeconds = def.checkpointAnnotation().idleHeartbeatIntervalSeconds();
+        // confirmed handler success.
+        // The persisted-token fallback follows the cascade's actual outcome:
+        // no established position (LATEST, OPLOG_START recovery) → never
+        // chain from an ignored or known-invalid checkpoint. Catch-up state:
+        // the stream resumed behind the persisted seen position
+        // (PROCESSED_FIRST or a level-2 fallback).
+        boolean startInCatchUp = seedToken != null
+                && !seedToken.equals(checkpointStore.findByStreamName(streamName)
+                        .map(io.flowwarden.stream.spi.Checkpoint::lastSeenToken)
+                        .orElse(null));
         CheckpointHeartbeat heartbeat = new CheckpointHeartbeat(
                 streamName, checkpointStore, probe,
                 () -> latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>()),
-                def.checkpointAnnotation().startPosition() == StartPosition.RESUME,
-                Duration.ofSeconds(idleSeconds));
+                seedToken != null,
+                Duration.ofSeconds(idleSeconds),
+                startInCatchUp);
         heartbeats.put(streamName, heartbeat);
-        if (intervalSeconds > 0) {
+        if (flushSeconds > 0) {
             intervalTasks.put(streamName, intervalScheduler.scheduleAtFixedRate(
-                    heartbeat::flushTick, intervalSeconds, intervalSeconds, TimeUnit.SECONDS));
+                    heartbeat::flushTick, flushSeconds, flushSeconds, TimeUnit.SECONDS));
         }
         if (idleSeconds > 0) {
-            idleProbeTasks.put(streamName, intervalScheduler.scheduleAtFixedRate(
-                    heartbeat::idleTick, idleSeconds, idleSeconds, TimeUnit.SECONDS));
-            // Explicit one-shot validation: an incompatible probe pipeline
-            // fails loudly at startup, not an idle-interval later.
-            intervalScheduler.execute(heartbeat::startupValidation);
+            // Jitter desynchronizes streams started together so their probes
+            // don't all land on the same second.
+            long initialDelay = idleSeconds
+                    + ThreadLocalRandom.current().nextLong(0, Math.max(1, idleSeconds / 2));
+            idleProbeTasks.put(streamName, probeScheduler.scheduleAtFixedRate(
+                    heartbeat::idleTick, initialDelay, idleSeconds, TimeUnit.SECONDS));
+            // Async diagnostic probe: an incompatible probe pipeline surfaces
+            // shortly after start (WARN + onHeartbeatProbeFailed), and a
+            // catch-up resume gets its first certification chance right away.
+            probeScheduler.execute(heartbeat::startupProbe);
         }
     }
 
@@ -793,8 +826,8 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         // Level 3: both tokens unusable → apply onHistoryLost strategy
         if (processedToken != null || seenToken != null) {
             FlowWardenMetrics.get().onResumeHistoryLost(streamName);
-            handleHistoryLost(streamName, def, optionsBuilder, cp.lastProcessedTimestamp());
-            return null;
+            return handleHistoryLost(streamName, def, optionsBuilder,
+                    cp.lastProcessedTimestamp(), probe);
         }
         // Checkpoint document exists but both tokens are null → bootstrap,
         // same as a stream with no prior checkpoint.
@@ -829,10 +862,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         return pbrt;
     }
 
-    private void handleHistoryLost(String streamName,
+    private BsonDocument handleHistoryLost(String streamName,
                                    ChangeStreamDefinition def,
                                    ChangeStreamOptions.ChangeStreamOptionsBuilder optionsBuilder,
-                                   java.time.Instant lastCheckpointTimestamp) {
+                                   java.time.Instant lastCheckpointTimestamp,
+                                   ReactiveHeartbeatProbe probe) {
         OnHistoryLost strategy = def.checkpointAnnotation().onHistoryLost();
         log.warn("Resume token expired for stream '{}' (last checkpoint: {}). Applying strategy: {}",
                 streamName, lastCheckpointTimestamp, strategy);
@@ -840,9 +874,13 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         switch (strategy) {
             case FAIL -> throw new HistoryLostException(streamName, lastCheckpointTimestamp);
             case RESUME_FROM_NOW -> {
-                // Don't set resumeAfter — stream starts from current moment.
-                // The stale checkpoint will be overwritten once the stream processes its first event.
-                log.info("Stream '{}' will start from current moment", streamName);
+                // This strategy explicitly accepts abandoning history, so a
+                // fresh server-certified position is strictly better than an
+                // implicit non-durable "from now": the checkpoint self-repairs
+                // immediately and the heartbeat never consults the expired
+                // token again.
+                log.info("Stream '{}' will start from a fresh certified position", streamName);
+                return bootstrapInitialPosition(streamName, optionsBuilder, probe);
             }
             case RESUME_FROM_OPLOG_START -> {
                 try {
@@ -856,6 +894,9 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 }
             }
         }
+        // No established position (OPLOG_START catch-up): the heartbeat must
+        // abstain rather than fall back to the invalid checkpoint.
+        return null;
     }
 
     private BsonTimestamp getOldestOplogTimestamp() {
@@ -885,6 +926,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             var cp = def.checkpointAnnotation();
             cpConfig = new StreamConfiguration.CheckpointConfig(
                     cp.saveEveryN(), cp.saveIntervalSeconds(),
+                    cp.idleHeartbeatIntervalSeconds(),
                     cp.startPosition().name(), cp.onHistoryLost().name());
         }
 

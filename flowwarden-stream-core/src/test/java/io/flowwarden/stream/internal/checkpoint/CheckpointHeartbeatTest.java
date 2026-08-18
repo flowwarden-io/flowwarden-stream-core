@@ -32,6 +32,8 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
@@ -40,12 +42,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Unit tests for the split heartbeat responsibilities:
  *
- * <p>{@code flushTick} (saveIntervalSeconds) — dirty-only event-token
- * coalescing, never probes. {@code idleTick} (idleHeartbeatIntervalSeconds) —
- * probes only past the idle threshold, with the three-outcome contract
- * (EMPTY advance / re-certification, EVENT_PENDING abstention, FAILED
- * signal), the CAS against concurrent events, the monotonicity guard, the
- * SEED/EVENT distinction and the cancellation flag.</p>
+ * <p>{@code flushTick} — dirty-only event-token coalescing, never probes,
+ * never blocks (skips when this stream's probe holds the lock).
+ * {@code idleTick} — probes past the idle threshold or while catching up,
+ * with the three-outcome contract, the CAS against concurrent events, the
+ * persist-then-publish ordering, the explicit catch-up state (no client-side
+ * token ordering) and the cancellation flag.</p>
  */
 class CheckpointHeartbeatTest {
 
@@ -53,10 +55,11 @@ class CheckpointHeartbeatTest {
     private static final Duration IDLE_THRESHOLD = Duration.ofSeconds(60);
     private static final Instant NOW = Instant.now();
     private static final Instant IDLE_SINCE = NOW.minusSeconds(120);
-    // _data values are ordered: T10 < T20 < T30 (lexicographic, like real tokens)
-    private static final BsonDocument T10 = BsonDocument.parse("{\"_data\": \"10\"}");
-    private static final BsonDocument T20 = BsonDocument.parse("{\"_data\": \"20\"}");
-    private static final BsonDocument T30 = BsonDocument.parse("{\"_data\": \"30\"}");
+    private static final BsonDocument SEED = BsonDocument.parse("{\"_data\": \"seed\"}");
+    private static final BsonDocument EVENT_A = BsonDocument.parse("{\"_data\": \"event-a\"}");
+    private static final BsonDocument EVENT_B = BsonDocument.parse("{\"_data\": \"event-b\"}");
+    private static final BsonDocument PBRT = BsonDocument.parse("{\"_data\": \"pbrt\"}");
+    private static final BsonDocument PERSISTED_SEEN = BsonDocument.parse("{\"_data\": \"persisted\"}");
 
     private RecordingStore store;
     private RecordingMetrics metrics;
@@ -79,12 +82,17 @@ class CheckpointHeartbeatTest {
 
     private CheckpointHeartbeat heartbeat(Function<BsonDocument, ProbeOutcome> probeFn) {
         return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
-                true, IDLE_THRESHOLD);
+                true, IDLE_THRESHOLD, false);
     }
 
-    private CheckpointHeartbeat latestModeHeartbeat(Function<BsonDocument, ProbeOutcome> probeFn) {
+    private CheckpointHeartbeat catchUpHeartbeat(Function<BsonDocument, ProbeOutcome> probeFn) {
         return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
-                false, IDLE_THRESHOLD);
+                true, IDLE_THRESHOLD, true);
+    }
+
+    private CheckpointHeartbeat noFallbackHeartbeat(Function<BsonDocument, ProbeOutcome> probeFn) {
+        return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
+                false, IDLE_THRESHOLD, false);
     }
 
     private HeartbeatProbe probeOf(Function<BsonDocument, ProbeOutcome> fn) {
@@ -102,40 +110,37 @@ class CheckpointHeartbeatTest {
         };
     }
 
-    // --- flushTick: dirty-only coalescing, never a probe ---
+    // --- flushTick: dirty-only coalescing, never a probe, never blocking ---
 
     @Test
     void flush_dirtyEventToken_isPersistedWithHeartbeat_withoutProbing() {
         Instant eventTime = NOW.minusSeconds(3);
-        ref.set(new TokenSnapshot(T10, eventTime));
+        ref.set(new TokenSnapshot(EVENT_A, eventTime));
 
         heartbeat(r -> ProbeOutcome.eventPending()).flushTick();
 
         assertThat(probed).isEmpty();
-        assertThat(store.calls).containsExactly("saveSeen+hb:10");
+        assertThat(store.calls).containsExactly("saveSeen+hb:event-a");
         assertThat(store.lastSeenTimestamp).isEqualTo(eventTime);
         assertThat(store.lastHeartbeatTimestamp).isAfterOrEqualTo(eventTime);
     }
 
     @Test
     void flush_cleanTick_writesNothing() {
-        ref.set(new TokenSnapshot(T10, NOW));
+        ref.set(new TokenSnapshot(EVENT_A, NOW));
         CheckpointHeartbeat hb = heartbeat(r -> ProbeOutcome.eventPending());
 
         hb.flushTick(); // dirty → persisted
         hb.flushTick(); // clean → zero writes
         hb.flushTick();
 
-        assertThat(store.calls).containsExactly("saveSeen+hb:10");
+        assertThat(store.calls).containsExactly("saveSeen+hb:event-a");
         assertThat(probed).isEmpty();
     }
 
     @Test
     void flush_seedSnapshot_isNeverPersistedAsDelivery() {
-        // PROCESSED_FIRST resume: the seed is the OLD processed token (T10)
-        // while the persisted seen is fresher (T20).
-        store.persisted = checkpointWithSeen(T20);
-        ref.set(new TokenSnapshot(T10, NOW, TokenSnapshot.Source.SEED));
+        ref.set(new TokenSnapshot(SEED, NOW, TokenSnapshot.Source.SEED));
 
         heartbeat(r -> ProbeOutcome.eventPending()).flushTick();
 
@@ -144,31 +149,47 @@ class CheckpointHeartbeatTest {
     }
 
     @Test
-    void flush_replayedEventBelowHighWaterMark_doesNotRegressSeen() {
-        // Replay after a PROCESSED_FIRST resume: the delivered event's token
-        // (T10) is older than the persisted seen (T20).
-        store.persisted = checkpointWithSeen(T20);
-        ref.set(new TokenSnapshot(T10, NOW)); // EVENT source
-        CheckpointHeartbeat hb = heartbeat(r -> ProbeOutcome.eventPending());
+    void flush_skipsWithoutBlocking_whileThisStreamsProbeIsInFlight() throws Exception {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        CountDownLatch probeStarted = new CountDownLatch(1);
+        CountDownLatch releaseProbe = new CountDownLatch(1);
+        CheckpointHeartbeat hb = heartbeat(r -> {
+            probeStarted.countDown();
+            try {
+                releaseProbe.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return ProbeOutcome.eventPending();
+        });
 
-        hb.flushTick();
-        assertThat(store.calls)
-                .as("a replayed event below the high-water mark is heartbeat-only")
-                .containsExactly("saveHeartbeat");
+        Thread probeThread = new Thread(hb::idleTick);
+        probeThread.start();
+        assertThat(probeStarted.await(5, TimeUnit.SECONDS)).isTrue();
 
-        // Once the stream catches up past the mark, seen advances again.
-        ref.set(new TokenSnapshot(T30, NOW));
+        // The flush must return immediately without writing — never wait
+        // behind the in-flight probe.
+        long start = System.nanoTime();
         hb.flushTick();
-        assertThat(store.calls).containsExactly("saveHeartbeat", "saveSeen+hb:30");
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        assertThat(elapsedMillis).isLessThan(1_000);
+        assertThat(store.calls).isEmpty();
+
+        releaseProbe.countDown();
+        probeThread.join(5_000);
+
+        // The token stayed dirty: the next flush persists it.
+        hb.flushTick();
+        assertThat(store.calls).containsExactly("saveSeen+hb:event-a");
     }
 
     // --- idleTick: probes only past the idle threshold ---
 
     @Test
     void idle_beforeThreshold_neverProbes() {
-        ref.set(new TokenSnapshot(T10, NOW)); // fresh activity
+        ref.set(new TokenSnapshot(EVENT_A, NOW)); // fresh activity
 
-        heartbeat(r -> ProbeOutcome.empty(T20)).idleTick();
+        heartbeat(r -> ProbeOutcome.empty(PBRT)).idleTick();
 
         assertThat(probed).isEmpty();
         assertThat(store.calls).isEmpty();
@@ -176,30 +197,32 @@ class CheckpointHeartbeatTest {
 
     @Test
     void idle_pastThreshold_probeAdvancesPosition() {
-        ref.set(new TokenSnapshot(T10, IDLE_SINCE));
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        CheckpointHeartbeat hb = heartbeat(r -> ProbeOutcome.empty(PBRT));
+        hb.flushTick(); // persist the event token first
 
-        heartbeat(r -> ProbeOutcome.empty(T20)).idleTick();
+        hb.idleTick();
 
-        assertThat(probed).containsExactly(T10);
-        assertThat(store.calls).containsExactly("saveSeen+hb:20");
-        assertThat(ref.get().token()).isEqualTo(T20);
+        assertThat(probed).containsExactly(EVENT_A);
+        assertThat(store.calls).containsExactly("saveSeen+hb:event-a", "saveSeen+hb:pbrt");
         // The probe result re-arms the idle delay (fresh SEED snapshot).
+        assertThat(ref.get().token()).isEqualTo(PBRT);
         assertThat(ref.get().source()).isEqualTo(TokenSnapshot.Source.SEED);
     }
 
     @Test
-    void idle_probeReturnsSamePbrt_writesHeartbeatOnly() {
-        ref.set(new TokenSnapshot(T10, IDLE_SINCE));
+    void idle_probeReturnsSamePosition_writesHeartbeatOnly() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
 
-        heartbeat(r -> ProbeOutcome.empty(T10)).idleTick();
+        heartbeat(r -> ProbeOutcome.empty(EVENT_A)).idleTick();
 
         assertThat(store.calls).containsExactly("saveHeartbeat");
-        assertThat(ref.get().token()).isEqualTo(T10);
+        assertThat(ref.get().token()).isEqualTo(EVENT_A);
     }
 
     @Test
     void idle_probeEventPending_abstains_noWrites() {
-        ref.set(new TokenSnapshot(T10, IDLE_SINCE));
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
 
         heartbeat(r -> ProbeOutcome.eventPending()).idleTick();
 
@@ -208,7 +231,7 @@ class CheckpointHeartbeatTest {
 
     @Test
     void idle_probeFailure_noWrites_emitsDedicatedSignal() {
-        ref.set(new TokenSnapshot(T10, IDLE_SINCE));
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
         RuntimeException boom = new RuntimeException("history lost");
 
         heartbeat(r -> ProbeOutcome.failed(boom)).idleTick();
@@ -218,53 +241,65 @@ class CheckpointHeartbeatTest {
     }
 
     @Test
-    void idle_eventArrivingDuringProbe_winsTheCas_probeResultDiscarded() {
-        ref.set(new TokenSnapshot(T10, IDLE_SINCE));
+    void idle_eventArrivingDuringProbe_staysInMemory_probeResultStillPersisted() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
         CheckpointHeartbeat hb = heartbeat(r -> {
             // Simulate the main stream delivering an event mid-probe.
-            ref.set(new TokenSnapshot(T20, Instant.now()));
-            return ProbeOutcome.empty(T30);
+            ref.set(new TokenSnapshot(EVENT_B, Instant.now()));
+            return ProbeOutcome.empty(PBRT);
         });
+        hb.flushTick(); // persist EVENT_A first
 
         hb.idleTick();
 
-        assertThat(store.calls).isEmpty();
-        assertThat(ref.get().token()).isEqualTo(T20);
+        // The certified PBRT is persisted (safe interval), but the concurrent
+        // event wins the in-memory race and stays dirty for the next flush.
+        assertThat(store.calls).containsExactly("saveSeen+hb:event-a", "saveSeen+hb:pbrt");
+        assertThat(ref.get().token()).isEqualTo(EVENT_B);
 
-        // The winning event token is persisted by the next flush.
         hb.flushTick();
-        assertThat(store.calls).containsExactly("saveSeen+hb:20");
+        assertThat(store.calls)
+                .containsExactly("saveSeen+hb:event-a", "saveSeen+hb:pbrt", "saveSeen+hb:event-b");
     }
 
     @Test
-    void idle_probePbrtBelowHighWaterMark_isDowngradedToHeartbeatOnly() {
-        // Bounded-scan intermediate PBRT below the persisted mark (probe
-        // chained from an old processed seed).
-        store.persisted = checkpointWithSeen(T30);
-        ref.set(new TokenSnapshot(T10, IDLE_SINCE, TokenSnapshot.Source.SEED));
+    void idle_storeFailureOnProbeResult_keepsEventTokenDirty_flushRetries() {
+        // Codex addendum: the CAS must not publish the SEED before the store
+        // write succeeded, or a failed write silently loses the event token.
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        CheckpointHeartbeat hb = heartbeat(r -> ProbeOutcome.empty(PBRT));
 
-        heartbeat(r -> ProbeOutcome.empty(T20)).idleTick();
+        store.throwOnWrite = true;
+        hb.idleTick(); // probe EMPTY → saveSeen throws
 
-        assertThat(store.calls).containsExactly("saveHeartbeat");
+        assertThat(ref.get().token())
+                .as("a failed store write must not replace the event snapshot")
+                .isEqualTo(EVENT_A);
+        assertThat(metrics.checkpointFailures).hasSize(1);
+
+        store.throwOnWrite = false;
+        hb.flushTick(); // the event token is still dirty → retried and persisted
+
+        assertThat(store.calls).containsExactly("saveSeen+hb:event-a");
     }
 
     @Test
-    void idle_noInMemoryToken_resumeMode_chainsFromPersistedSeen() {
-        store.persisted = checkpointWithSeen(T10);
+    void idle_noInMemoryToken_withEstablishedPosition_chainsFromPersistedSeen() {
+        store.persisted = checkpointWithSeen(PERSISTED_SEEN);
 
-        heartbeat(r -> ProbeOutcome.empty(T20)).idleTick();
+        heartbeat(r -> ProbeOutcome.empty(PBRT)).idleTick();
 
-        assertThat(probed).containsExactly(T10);
-        assertThat(store.calls).containsExactly("saveSeen+hb:20");
+        assertThat(probed).containsExactly(PERSISTED_SEEN);
+        assertThat(store.calls).containsExactly("saveSeen+hb:pbrt");
     }
 
     @Test
-    void idle_noInMemoryToken_latestMode_neverFallsBackToPersistedCheckpoint() {
-        // LATEST semantics ignore persisted tokens: chaining from one would
-        // strand the probe on history the main stream will never consume.
-        store.persisted = checkpointWithSeen(T10);
+    void idle_noEstablishedPosition_neverFallsBackToPersistedCheckpoint() {
+        // Cascade produced no position (LATEST, or RESUME_FROM_OPLOG_START
+        // recovery): the checkpoint is ignored or known-invalid.
+        store.persisted = checkpointWithSeen(PERSISTED_SEEN);
 
-        latestModeHeartbeat(r -> ProbeOutcome.empty(T20)).idleTick();
+        noFallbackHeartbeat(r -> ProbeOutcome.empty(PBRT)).idleTick();
 
         assertThat(probed).isEmpty();
         assertThat(store.calls).isEmpty();
@@ -272,30 +307,102 @@ class CheckpointHeartbeatTest {
 
     @Test
     void idle_noPositionAnywhere_neverProbes() {
-        heartbeat(r -> ProbeOutcome.empty(T20)).idleTick();
+        heartbeat(r -> ProbeOutcome.empty(PBRT)).idleTick();
 
         assertThat(probed).isEmpty();
         assertThat(store.calls).isEmpty();
     }
 
-    // --- startup validation ---
+    // --- catch-up state: resume behind the persisted position ---
 
     @Test
-    void startupValidation_probesRegardlessOfIdleness() {
-        ref.set(new TokenSnapshot(T10, NOW, TokenSnapshot.Source.SEED)); // fresh
+    void catchUp_replayedEvents_areNeitherPersistedNorHealthRefreshed() {
+        store.persisted = checkpointWithSeen(PERSISTED_SEEN);
+        ref.set(new TokenSnapshot(EVENT_A, NOW)); // replayed event, EVENT source
 
-        heartbeat(r -> ProbeOutcome.empty(T10)).startupValidation();
+        catchUpHeartbeat(r -> ProbeOutcome.eventPending()).flushTick();
 
-        assertThat(probed).containsExactly(T10);
+        assertThat(store.calls)
+                .as("replayed events certify nothing about the persisted position")
+                .isEmpty();
+    }
+
+    @Test
+    void catchUp_probeBypassesIdleness_andEmptyEndsCatchUp() {
+        // Continuous replay: the snapshot is FRESH, yet the catch-up probe
+        // must still run.
+        ref.set(new TokenSnapshot(EVENT_A, NOW));
+        CheckpointHeartbeat hb = catchUpHeartbeat(r -> ProbeOutcome.empty(PBRT));
+
+        hb.idleTick();
+
+        assertThat(probed).containsExactly(EVENT_A);
+        assertThat(store.calls).containsExactly("saveSeen+hb:pbrt");
+        assertThat(hb.isCatchingUp()).isFalse();
+
+        // Normal semantics resumed: delivered events flush again.
+        ref.set(new TokenSnapshot(EVENT_B, NOW));
+        hb.flushTick();
+        assertThat(store.calls).containsExactly("saveSeen+hb:pbrt", "saveSeen+hb:event-b");
+    }
+
+    @Test
+    void catchUp_probeEventPending_staysCatchingUp() {
+        ref.set(new TokenSnapshot(EVENT_A, NOW));
+        CheckpointHeartbeat hb = catchUpHeartbeat(r -> ProbeOutcome.eventPending());
+
+        hb.idleTick();
+
+        assertThat(hb.isCatchingUp()).isTrue();
+        assertThat(store.calls).isEmpty();
+    }
+
+    @Test
+    void catchUp_probeReturnsChainPosition_persistsItAndEndsCatchUp() {
+        // Backlog consumed and the cluster position did not move: the
+        // delivered position itself is the certified safe position.
+        ref.set(new TokenSnapshot(EVENT_A, NOW));
+        CheckpointHeartbeat hb = catchUpHeartbeat(r -> ProbeOutcome.empty(EVENT_A));
+
+        hb.idleTick();
+
+        assertThat(store.calls).containsExactly("saveSeen+hb:event-a");
+        assertThat(hb.isCatchingUp()).isFalse();
+    }
+
+    @Test
+    void catchUp_storeFailure_keepsCatchingUp_untilAWriteSucceeds() {
+        ref.set(new TokenSnapshot(EVENT_A, NOW));
+        CheckpointHeartbeat hb = catchUpHeartbeat(r -> ProbeOutcome.empty(PBRT));
+
+        store.throwOnWrite = true;
+        hb.idleTick();
+        assertThat(hb.isCatchingUp()).isTrue();
+
+        store.throwOnWrite = false;
+        hb.idleTick();
+        assertThat(hb.isCatchingUp()).isFalse();
+        assertThat(store.calls).containsExactly("saveSeen+hb:pbrt");
+    }
+
+    // --- startup probe ---
+
+    @Test
+    void startupProbe_probesRegardlessOfIdleness() {
+        ref.set(new TokenSnapshot(SEED, NOW, TokenSnapshot.Source.SEED)); // fresh
+
+        heartbeat(r -> ProbeOutcome.empty(SEED)).startupProbe();
+
+        assertThat(probed).containsExactly(SEED);
         assertThat(store.calls).containsExactly("saveHeartbeat"); // re-certification
     }
 
     @Test
-    void startupValidation_incompatiblePipeline_surfacesFailure() {
-        ref.set(new TokenSnapshot(T10, NOW, TokenSnapshot.Source.SEED));
+    void startupProbe_incompatiblePipeline_surfacesFailure() {
+        ref.set(new TokenSnapshot(SEED, NOW, TokenSnapshot.Source.SEED));
         RuntimeException boom = new RuntimeException("unknown pipeline stage");
 
-        heartbeat(r -> ProbeOutcome.failed(boom)).startupValidation();
+        heartbeat(r -> ProbeOutcome.failed(boom)).startupProbe();
 
         assertThat(metrics.probeFailures).containsExactly(boom);
         assertThat(store.calls).isEmpty();
@@ -305,12 +412,12 @@ class CheckpointHeartbeatTest {
 
     @Test
     void cancelDuringInFlightProbe_preventsAnyWrite() {
-        ref.set(new TokenSnapshot(T10, IDLE_SINCE));
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
         CheckpointHeartbeat[] holder = new CheckpointHeartbeat[1];
         CheckpointHeartbeat hb = heartbeat(r -> {
             // Stream dies while the probe is in flight.
             holder[0].cancel();
-            return ProbeOutcome.empty(T20);
+            return ProbeOutcome.empty(PBRT);
         });
         holder[0] = hb;
 
@@ -320,25 +427,15 @@ class CheckpointHeartbeatTest {
                 .isEmpty();
 
         // Fully cancelled: neither tick runs anymore.
-        ref.set(new TokenSnapshot(T30, NOW));
+        ref.set(new TokenSnapshot(EVENT_B, NOW));
         hb.flushTick();
         hb.idleTick();
         assertThat(store.calls).isEmpty();
     }
 
-    // --- misc ---
-
-    @Test
-    void advancesComparator_ordersTokensByDataString() {
-        assertThat(CheckpointHeartbeat.advances(T20, T10)).isTrue();
-        assertThat(CheckpointHeartbeat.advances(T10, T20)).isFalse();
-        assertThat(CheckpointHeartbeat.advances(T10, T10)).isFalse();
-        assertThat(CheckpointHeartbeat.advances(T10, null)).isTrue();
-    }
-
     @Test
     void storeThrow_isContained_andReportedAsCheckpointFailure() {
-        ref.set(new TokenSnapshot(T10, NOW));
+        ref.set(new TokenSnapshot(EVENT_A, NOW));
         store.throwOnWrite = true;
 
         heartbeat(r -> ProbeOutcome.eventPending()).flushTick();

@@ -18,54 +18,56 @@ package io.flowwarden.stream.internal.checkpoint;
 import io.flowwarden.stream.FlowWardenMetrics;
 import io.flowwarden.stream.spi.CheckpointStore;
 import org.bson.BsonDocument;
-import org.bson.BsonValue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 /**
  * Checkpoint heartbeat shared by both stream managers, carrying two
- * independent periodic responsibilities:
+ * independent periodic responsibilities running on two separate threads:
  *
  * <ul>
- *   <li>{@link #flushTick()} — write-pressure coalescing, driven by
- *       {@code saveIntervalSeconds}: persists the latest <em>event</em> token
- *       only if it changed since the last flush. Never opens a cursor.</li>
- *   <li>{@link #idleTick()} — oplog-rollover protection, driven by
- *       {@code idleHeartbeatIntervalSeconds}: when the main cursor has not
- *       delivered anything for the idle threshold, runs a
- *       {@link HeartbeatProbe} chained from the last known position and — on
- *       a server-certified empty interval — advances the persisted position
- *       to the returned PBRT. Any main-cursor activity re-arms the delay;
- *       active streams never probe.</li>
+ *   <li>{@link #flushTick()} — write-pressure coalescing on the flush
+ *       scheduler ({@code saveIntervalSeconds}): persists the latest
+ *       <em>event</em> token only if it changed since the last flush. Never
+ *       opens a cursor, and never blocks: if this stream's probe is in
+ *       flight, the tick is skipped and the token stays dirty for the next
+ *       one.</li>
+ *   <li>{@link #idleTick()} — oplog-rollover protection on the dedicated
+ *       probe scheduler ({@code idleHeartbeatIntervalSeconds}): probes when
+ *       the main cursor has delivered nothing for the idle threshold, or
+ *       unconditionally while the stream is {@linkplain #isCatchingUp()
+ *       catching up} after a resume from a position behind the persisted
+ *       one.</li>
  * </ul>
  *
- * <p>{@link #startupValidation()} runs one probe at stream start regardless
- * of idleness, so an incompatible pipeline fails loudly at boot instead of an
- * idle-interval later.</p>
+ * <p><strong>Catch-up state.</strong> A {@code PROCESSED_FIRST} resume starts
+ * the stream behind the persisted {@code lastSeenToken}. Resume tokens carry
+ * no client-comparable order (the driver spec defines none), so instead of
+ * comparing tokens the heartbeat tracks an explicit {@code catchingUp} flag:
+ * while set, replayed events are neither persisted as seen nor allowed to
+ * refresh the heartbeat (nothing has been re-certified), and the probe runs
+ * without the idleness precondition. A probe returning {@code EMPTY} with a
+ * winning CAS certifies the backlog is consumed: its PBRT is persisted as
+ * the new safe position and normal semantics resume. Outside catch-up no
+ * ordering is needed at all — the stream resumed exactly at the persisted
+ * position, so every delivered event is past it by construction.</p>
  *
- * <p>Correctness properties enforced here:</p>
- * <ul>
- *   <li><strong>Seeds are not events.</strong> A resume position installed at
- *       startup ({@link TokenSnapshot.Source#SEED}) is a chaining point, never
- *       a "newly delivered" token — a {@code PROCESSED_FIRST} resume seeds the
- *       (older) processed token, and flushing it as seen would destroy the
- *       level-2 safety net.</li>
- *   <li><strong>Seen never regresses.</strong> Every seen write is guarded by
- *       a monotonicity check against the persisted high-water mark (resume
- *       token {@code _data} strings of one stream are lexicographically
- *       ordered). Replayed events after a {@code PROCESSED_FIRST} resume and
- *       bounded-scan intermediate PBRTs are downgraded to heartbeat-only
- *       writes.</li>
- *   <li><strong>No write after cancellation.</strong> Stream cleanup calls
- *       {@link #cancel()} before cancelling the scheduled tasks; both ticks
- *       re-check the flag immediately before every store write, so a slow
- *       in-flight probe cannot stamp a fresh heartbeat on a dead stream.</li>
- * </ul>
+ * <p><strong>Persist-then-publish.</strong> A probe PBRT is written to the
+ * store first and only installed into the shared in-memory snapshot on
+ * success (CAS — a concurrent event always wins). A store failure therefore
+ * never erases a dirty event token from memory: the next flush retries
+ * it.</p>
+ *
+ * <p><strong>No write after cancellation.</strong> Stream cleanup calls
+ * {@link #cancel()} before cancelling the scheduled tasks; both ticks
+ * re-check the flag immediately before every store write, so a slow
+ * in-flight probe cannot stamp a fresh heartbeat on a dead stream.</p>
  *
  * <p>This class is internal and not part of the public API.</p>
  */
@@ -88,31 +90,34 @@ public final class CheckpointHeartbeat {
 
     /**
      * Whether the probe may fall back to the persisted {@code lastSeenToken}
-     * when no in-memory position exists. True only for
-     * {@code StartPosition.RESUME} streams — a {@code LATEST} stream's
-     * semantics explicitly ignore persisted tokens, and chaining from one
-     * would strand the heartbeat on history the main stream will never
-     * consume.
+     * when no in-memory position exists. Derived from the resume cascade's
+     * actual outcome ({@code seed != null}), not from the annotation: a
+     * {@code LATEST} stream, a {@code RESUME_FROM_OPLOG_START} recovery or
+     * any start without an established position must never chain from a
+     * checkpoint that is ignored or known-invalid.
      */
     private final boolean allowPersistedFallback;
 
     private volatile boolean cancelled;
 
     /**
-     * Last {@code lastSeenToken} value this heartbeat persisted. Only
-     * read/written from the single-threaded interval scheduler.
+     * Serializes flush and probe work for THIS stream across the two
+     * scheduler threads. The flush side only ever {@code tryLock}s — the
+     * flush thread must never wait behind a probe, or one slow probe would
+     * re-couple every other stream's flush cadence.
+     */
+    private final ReentrantLock lock = new ReentrantLock();
+
+    /**
+     * Last {@code lastSeenToken} value this heartbeat persisted. Guarded by
+     * {@link #lock}.
      */
     private BsonDocument lastPersistedSeen;
 
-    /**
-     * Highest {@code lastSeenToken} known to be persisted (loaded from the
-     * checkpoint on first use, updated on every successful seen write).
-     * Guard against regressions. Scheduler-thread only.
-     */
-    private BsonDocument seenHighWaterMark;
-    private boolean highWaterMarkLoaded;
+    /** Catch-up state, see class Javadoc. Guarded by {@link #lock}. */
+    private boolean catchingUp;
 
-    /** Consecutive EVENT_PENDING outcomes. Scheduler-thread only. */
+    /** Consecutive EVENT_PENDING outcomes. Guarded by {@link #lock}. */
     private int consecutiveAbstentions;
 
     public CheckpointHeartbeat(String streamName,
@@ -120,13 +125,15 @@ public final class CheckpointHeartbeat {
                                HeartbeatProbe probe,
                                Supplier<AtomicReference<TokenSnapshot>> latestTokenRef,
                                boolean allowPersistedFallback,
-                               Duration idleThreshold) {
+                               Duration idleThreshold,
+                               boolean startInCatchUp) {
         this.streamName = streamName;
         this.checkpointStore = checkpointStore;
         this.probe = probe;
         this.latestTokenRef = latestTokenRef;
         this.allowPersistedFallback = allowPersistedFallback;
         this.idleThreshold = idleThreshold;
+        this.catchingUp = startInCatchUp;
     }
 
     /**
@@ -139,44 +146,66 @@ public final class CheckpointHeartbeat {
         cancelled = true;
     }
 
+    boolean isCatchingUp() {
+        lock.lock();
+        try {
+            return catchingUp;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /**
-     * Write-coalescing flush ({@code saveIntervalSeconds} cadence): persists
-     * the latest event token only if dirty. Clean tick → zero writes, zero
-     * cursors. Never throws.
+     * Write-coalescing flush ({@code saveIntervalSeconds} cadence, flush
+     * scheduler): persists the latest event token only if dirty. Clean tick,
+     * catch-up in progress, or this stream's probe in flight → zero writes,
+     * zero blocking. Never throws.
      */
     public void flushTick() {
         if (cancelled) {
             return;
         }
+        if (!lock.tryLock()) {
+            // This stream's probe is in flight: skip — the token stays dirty
+            // and the next flush retries. The flush thread never waits.
+            return;
+        }
         try {
+            if (cancelled || catchingUp) {
+                // During catch-up, delivered events are replays: neither a
+                // seen position nor a health confirmation.
+                return;
+            }
             TokenSnapshot snapshot = latestTokenRef.get().get();
             if (snapshot == null
                     || snapshot.source() != TokenSnapshot.Source.EVENT
                     || snapshot.token().equals(lastPersistedSeen)) {
                 return; // nothing dirty — SEED positions are never flushed
             }
-            loadHighWaterMarkIfNeeded();
-            persistSeen(snapshot.token(), snapshot.timestamp(), Instant.now(),
-                    "event token below persisted seen (replay) — heartbeat only");
+            writeSeen(snapshot.token(), snapshot.timestamp(), Instant.now());
         } catch (Exception e) {
             FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
             log.warn("Failed to flush periodic checkpoint for stream '{}': {}",
                     streamName, e.getMessage(), e);
+        } finally {
+            lock.unlock();
         }
     }
 
     /**
-     * Idle-protection tick ({@code idleHeartbeatIntervalSeconds} cadence):
-     * probes only when the main cursor has not delivered anything for the
-     * idle threshold. Never throws.
+     * Idle-protection tick ({@code idleHeartbeatIntervalSeconds} cadence,
+     * probe scheduler): probes when the main cursor has been idle past the
+     * threshold — or unconditionally while catching up. Never throws.
      */
     public void idleTick() {
         if (cancelled) {
             return;
         }
+        lock.lock();
         try {
             TokenSnapshot snapshot = latestTokenRef.get().get();
-            if (snapshot != null
+            if (!catchingUp
+                    && snapshot != null
                     && Duration.between(snapshot.timestamp(), Instant.now())
                             .compareTo(idleThreshold) < 0) {
                 return; // the main cursor progressed recently — not idle
@@ -185,30 +214,36 @@ public final class CheckpointHeartbeat {
         } catch (Exception e) {
             FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
             log.warn("Failed idle heartbeat for stream '{}': {}", streamName, e.getMessage(), e);
+        } finally {
+            lock.unlock();
         }
     }
 
     /**
-     * One-shot probe at stream start, bypassing the idleness precondition:
-     * validates the probe pipeline against the server so an incompatibility
-     * fails loudly at boot (WARN + {@code onHeartbeatProbeFailed}) instead of
-     * an idle-interval later. Never throws.
+     * One-shot diagnostic probe shortly after stream start (probe scheduler),
+     * bypassing the idleness precondition. An incompatible probe pipeline
+     * surfaces as WARN + {@code onHeartbeatProbeFailed} right away instead of
+     * an idle-interval later, and a catch-up resume gets its first chance to
+     * certify completion immediately. Asynchronous best-effort: this is a
+     * diagnostic, not a startup precondition. Never throws.
      */
-    public void startupValidation() {
+    public void startupProbe() {
         if (cancelled) {
             return;
         }
+        lock.lock();
         try {
             runProbe(latestTokenRef.get().get());
         } catch (Exception e) {
             FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
-            log.warn("Startup heartbeat validation failed for stream '{}': {}",
+            log.warn("Startup heartbeat probe failed for stream '{}': {}",
                     streamName, e.getMessage(), e);
+        } finally {
+            lock.unlock();
         }
     }
 
     private void runProbe(TokenSnapshot snapshot) {
-        loadHighWaterMarkIfNeeded();
         BsonDocument chainToken = snapshot != null ? snapshot.token()
                 : (allowPersistedFallback ? persistedSeenToken() : null);
         if (chainToken == null) {
@@ -254,84 +289,43 @@ public final class CheckpointHeartbeat {
                                           BsonDocument chainToken,
                                           BsonDocument pbrt,
                                           Instant now) {
-        if (pbrt.equals(chainToken)) {
+        if (!catchingUp && pbrt.equals(chainToken)) {
             // Position unchanged but re-certified valid: heartbeat-only write.
-            saveHeartbeatOnly(now, "re-certified position");
+            if (cancelled) {
+                return;
+            }
+            checkpointStore.saveHeartbeat(streamName, now);
+            log.debug("Heartbeat re-certified position for stream '{}'", streamName);
             return;
         }
-        // An event delivered while the probe was in flight always wins.
-        AtomicReference<TokenSnapshot> ref = latestTokenRef.get();
-        if (!ref.compareAndSet(snapshot, new TokenSnapshot(pbrt, now, TokenSnapshot.Source.SEED))) {
-            log.debug("Heartbeat probe result discarded for stream '{}': event token won the race",
-                    streamName);
-            return;
+        // Persist FIRST, publish to memory only on success: a store failure
+        // must never erase a dirty event token from the shared snapshot.
+        boolean wasCatchingUp = catchingUp;
+        writeSeen(pbrt, now, now);
+        if (wasCatchingUp) {
+            log.info("Stream '{}' caught up: server certified the backlog consumed, "
+                    + "resume position re-established", streamName);
         }
-        persistSeen(pbrt, now, now,
-                "probe PBRT below persisted seen (bounded scan) — heartbeat only");
+        // A concurrent event always wins the in-memory race; its (newer)
+        // position stays dirty and the next flush persists it.
+        latestTokenRef.get().compareAndSet(snapshot,
+                new TokenSnapshot(pbrt, now, TokenSnapshot.Source.SEED));
     }
 
     /**
-     * Persists a seen position guarded by the monotonicity check; downgrades
-     * to a heartbeat-only write when the candidate does not advance the
-     * persisted high-water mark. The position remains confirmed in both
-     * cases: below the high-water mark, the persisted seen token is still the
-     * better resume point and the stream is demonstrably progressing through
-     * its certified gap-free range.
+     * Persists a seen position (+ heartbeat) and clears the catch-up state.
+     * Caller holds {@link #lock}. Throws on store failure — state is only
+     * updated after a successful write.
      */
-    private void persistSeen(BsonDocument token, Instant positionTimestamp, Instant now,
-                             String downgradeReason) {
-        if (!advances(token, seenHighWaterMark)) {
-            lastPersistedSeen = token;
-            saveHeartbeatOnly(now, downgradeReason);
-            return;
-        }
+    private void writeSeen(BsonDocument token, Instant positionTimestamp, Instant now) {
         if (cancelled) {
             return;
         }
         checkpointStore.saveSeen(streamName, token, positionTimestamp, now);
         lastPersistedSeen = token;
-        seenHighWaterMark = token;
+        catchingUp = false;
         FlowWardenMetrics.get().onCheckpoint(streamName, token.toJson());
         log.debug("Periodic lastSeenToken update for stream '{}'", streamName);
-    }
-
-    private void saveHeartbeatOnly(Instant now, String reason) {
-        if (cancelled) {
-            return;
-        }
-        checkpointStore.saveHeartbeat(streamName, now);
-        log.debug("Heartbeat-only write for stream '{}': {}", streamName, reason);
-    }
-
-    private void loadHighWaterMarkIfNeeded() {
-        if (!highWaterMarkLoaded) {
-            seenHighWaterMark = persistedSeenToken();
-            highWaterMarkLoaded = true;
-        }
-    }
-
-    /**
-     * Whether {@code candidate} is strictly ahead of {@code current}. Resume
-     * token {@code _data} strings of a single stream are lexicographically
-     * ordered (KeyString encoding); when either token has no comparable
-     * {@code _data}, inequality is trusted (never observed with real MongoDB
-     * tokens).
-     */
-    static boolean advances(BsonDocument candidate, BsonDocument current) {
-        if (current == null) {
-            return true;
-        }
-        if (candidate.equals(current)) {
-            return false;
-        }
-        BsonValue candidateData = candidate.get("_data");
-        BsonValue currentData = current.get("_data");
-        if (candidateData != null && currentData != null
-                && candidateData.isString() && currentData.isString()) {
-            return candidateData.asString().getValue()
-                    .compareTo(currentData.asString().getValue()) > 0;
-        }
-        return true;
     }
 
     private BsonDocument persistedSeenToken() {
