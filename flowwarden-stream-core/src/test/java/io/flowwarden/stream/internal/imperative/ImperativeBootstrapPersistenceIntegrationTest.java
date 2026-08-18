@@ -104,9 +104,58 @@ class ImperativeBootstrapPersistenceIntegrationTest {
                 .orElseThrow().lastSeenToken()).isNotNull();
     }
 
+    @Test
+    void oplogStartRecovery_establishmentWriteFails_deadTokensSurvive_recoveryReenters() {
+        // PR-review blocker: the dead tokens are the durable "recovery due"
+        // marker. When the establishment write fails (crash-equivalent), they
+        // must survive so the restart re-enters the history-lost recovery —
+        // never the "no checkpoint" fresh bootstrap (which would silently
+        // skip the still-readable history).
+        var expired = BsonDocument.parse("{\"_data\": \"0000DEAD\"}");
+        Instant past = Instant.now().minusSeconds(86_400);
+        checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
+                CRASH_STREAM, null, expired, past, expired, past,
+                java.util.Collections.emptyMap()));
+
+        checkpointStore.failSeenWrites.set(true);
+        streamManager.startStream(CRASH_STREAM);
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning(CRASH_STREAM));
+
+        // Establishment attempts keep failing: the marker must stay intact.
+        await().atMost(Duration.ofSeconds(8)).pollDelay(Duration.ofSeconds(3))
+                .untilAsserted(() -> {
+                    var cp = checkpointStore.findByStreamName(CRASH_STREAM).orElseThrow();
+                    assertThat(cp.lastSeenToken())
+                            .as("the recovery marker must survive failed establishment writes")
+                            .isEqualTo(expired);
+                    assertThat(cp.lastProcessedToken()).isEqualTo(expired);
+                });
+
+        // "Crash" and restart with a healthy store: the recovery re-enters
+        // (the dead tokens force the history-lost path — a fresh bootstrap is
+        // structurally impossible while they exist) and completes durably.
+        streamManager.stopStream(CRASH_STREAM);
+        checkpointStore.failSeenWrites.set(false);
+        streamManager.startStream(CRASH_STREAM);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            var cp = checkpointStore.findByStreamName(CRASH_STREAM).orElseThrow();
+            assertThat(cp.lastSeenToken()).isNotNull().isNotEqualTo(expired);
+            assertThat(cp.lastProcessedToken())
+                    .as("the deferred cleanup removes the dead processed token")
+                    .isNull();
+        });
+
+        streamManager.stopStream(CRASH_STREAM);
+        checkpointStore.delete(CRASH_STREAM);
+    }
+
+    private static final String CRASH_STREAM = "bootstrap-crash-window";
+    private static final String CRASH_COLLECTION = "bootstrap_crash_window";
+
     @SpringBootApplication
     @EnableFlowWarden
-    @Import(BootstrapHandler.class)
+    @Import({BootstrapHandler.class, CrashWindowHandler.class})
     static class TestApp {
 
         @Bean
@@ -135,6 +184,15 @@ class ImperativeBootstrapPersistenceIntegrationTest {
                 throw new RuntimeException("checkpoint store down");
             }
             delegate.saveSeen(streamName, token, timestamp, heartbeatTimestamp);
+        }
+
+        @Override
+        public void resetAfterHistoryLost(String streamName, BsonDocument freshSeenToken,
+                                          BsonDocument expectedDeadProcessed, Instant timestamp) {
+            if (failSeenWrites.get()) {
+                throw new RuntimeException("checkpoint store down");
+            }
+            delegate.resetAfterHistoryLost(streamName, freshSeenToken, expectedDeadProcessed, timestamp);
         }
 
         @Override
@@ -178,6 +236,17 @@ class ImperativeBootstrapPersistenceIntegrationTest {
         }
 
         void clear() {
+        }
+    }
+
+    @ChangeStream(name = CRASH_STREAM, collection = CRASH_COLLECTION,
+            documentType = Document.class, autoStart = false)
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 0, idleHeartbeatIntervalSeconds = 0,
+            onHistoryLost = io.flowwarden.stream.OnHistoryLost.RESUME_FROM_OPLOG_START)
+    static class CrashWindowHandler {
+
+        @OnInsert
+        void handle(ChangeStreamContext<Document> ctx) {
         }
     }
 }

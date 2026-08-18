@@ -16,6 +16,7 @@
 package io.flowwarden.stream.internal.checkpoint;
 
 import org.bson.BsonDocument;
+import org.bson.BsonTimestamp;
 
 /**
  * Opens an ephemeral, bounded change stream cursor to obtain a post-batch
@@ -43,6 +44,21 @@ public interface HeartbeatProbe {
      * @return the probe outcome; never throws
      */
     ProbeOutcome probe(BsonDocument resumeAfter);
+
+    /**
+     * Probes the stream's change stream from an operation time instead of a
+     * resume token — the {@code RESUME_FROM_OPLOG_START} recovery, where the
+     * dead tokens have been cleared and the stream resumes at the oldest
+     * available oplog entry. An {@code EMPTY} outcome certifies nothing
+     * matching remains to replay from that time, so its PBRT is a safe
+     * initial position.
+     *
+     * @param operationTime the cluster time to start scanning at (never
+     *                      "now" — that would skip the very history this
+     *                      recovery promises to replay)
+     * @return the probe outcome; never throws
+     */
+    ProbeOutcome probeFromOperationTime(BsonTimestamp operationTime);
 
     /**
      * Captures the server's current position for a stream that has no prior

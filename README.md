@@ -225,6 +225,14 @@ All stream-level settings are configured via annotations on your `@ChangeStream`
 
 See the [Comprehensive Example](#comprehensive-example) above for usage, or the [documentation](https://docs.flowwarden.io) for the full reference.
 
+### When history is lost
+
+If a stream stays down (or its resume point cannot be maintained) longer than the MongoDB oplog window, its saved position expires and the `@Checkpoint(onHistoryLost = …)` strategy applies:
+
+- **`FAIL`** (default) — a terminal stop: the stream refuses to start until an operator either deletes the stream's document from the checkpoint collection (`_fw_checkpoints` with the built-in Mongo stores) to restart from a fresh position, or switches the strategy. Choose it when losing events must never go unnoticed.
+- **`RESUME_FROM_NOW`** — the recovery abandons the lost history explicitly: a fresh server-certified position is persisted (clearing the expired tokens) and the stream resumes from it. Recommended for rebuildable projections (search models, caches) — reindex the gap after recovery.
+- **`RESUME_FROM_OPLOG_START`** — replays whatever history is still readable from the oldest oplog entry. Inherently racy on a tight oplog; falls back to the `RESUME_FROM_NOW` behavior if the oplog boundary cannot be read.
+
 
 ## FlowWarden Ecosystem
 

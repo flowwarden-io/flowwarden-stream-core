@@ -50,9 +50,24 @@ public final class ChangeStreamProbeCommands {
     public static Document aggregateCommand(ChangeStreamDefinition def,
                                             List<Document> pipeline,
                                             BsonDocument resumeAfter) {
+        return aggregateCommand(def, pipeline, resumeAfter, null);
+    }
+
+    /**
+     * Variant with an optional {@code startAtOperationTime} (mutually
+     * exclusive with {@code resumeAfter}) for the
+     * {@code RESUME_FROM_OPLOG_START} recovery probe.
+     */
+    public static Document aggregateCommand(ChangeStreamDefinition def,
+                                            List<Document> pipeline,
+                                            BsonDocument resumeAfter,
+                                            org.bson.BsonTimestamp startAtOperationTime) {
         Document changeStreamStage = new Document();
         if (resumeAfter != null) {
             changeStreamStage.append("resumeAfter", Document.parse(resumeAfter.toJson()));
+        }
+        if (startAtOperationTime != null) {
+            changeStreamStage.append("startAtOperationTime", startAtOperationTime);
         }
         if (def.config().fullDocument() != FullDocumentMode.DEFAULT) {
             changeStreamStage.append("fullDocument",

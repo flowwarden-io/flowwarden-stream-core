@@ -28,9 +28,13 @@ public class HistoryLostException extends RuntimeException {
 
     public HistoryLostException(String streamName, Instant lastCheckpointTimestamp) {
         super("Change stream history lost for stream '" + streamName
-                + "'. Last checkpoint was at " + lastCheckpointTimestamp
-                + ". The resume token has expired from the oplog. "
-                + "Set @Checkpoint(onHistoryLost = RESUME_FROM_NOW) or RESUME_FROM_OPLOG_START to recover automatically.");
+                + "'. Last known checkpoint activity was at " + lastCheckpointTimestamp
+                + ". The resume token has expired from the oplog and FAIL is in effect — "
+                + "this stream will keep failing on every start until an operator intervenes. "
+                + "Either delete this stream's document from the checkpoint collection "
+                + "(_fw_checkpoints with the shipped Mongo stores) to restart from a fresh "
+                + "position, or set @Checkpoint(onHistoryLost = RESUME_FROM_NOW) / "
+                + "RESUME_FROM_OPLOG_START to recover automatically.");
         this.streamName = streamName;
         this.lastCheckpointTimestamp = lastCheckpointTimestamp;
     }

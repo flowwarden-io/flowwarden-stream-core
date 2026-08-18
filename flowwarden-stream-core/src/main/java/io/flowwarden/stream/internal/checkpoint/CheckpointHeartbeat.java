@@ -129,13 +129,34 @@ public final class CheckpointHeartbeat {
      */
     private Instant lastIdleProbeAt;
 
+    /**
+     * {@code RESUME_FROM_OPLOG_START} recovery: last-resort chain source
+     * while no token-based position exists (never "now"). Cleared after the
+     * first successful durable write. Guarded by {@link #lock}.
+     */
+    private org.bson.BsonTimestamp initialOperationTime;
+
+    /**
+     * {@code OPLOG_START} recovery only: the dead tokens are deliberately
+     * left in the checkpoint as the durable "recovery due" marker, and the
+     * establishment write performs the deferred cleanup through
+     * {@code resetAfterHistoryLost} — whose at-least-once guard (the dead
+     * processed token below, evaluated atomically by the store) preserves a
+     * processed token re-acquired during the replay. Guarded by
+     * {@link #lock}.
+     */
+    private boolean pendingHistoryLostReset;
+    private final BsonDocument deadProcessedToken;
+
     public CheckpointHeartbeat(String streamName,
                                CheckpointStore checkpointStore,
                                HeartbeatProbe probe,
                                Supplier<AtomicReference<TokenSnapshot>> latestTokenRef,
                                boolean allowPersistedFallback,
                                Duration idleThreshold,
-                               boolean startInCatchUp) {
+                               boolean startInCatchUp,
+                               org.bson.BsonTimestamp initialOperationTime,
+                               BsonDocument deadProcessedToken) {
         this.streamName = streamName;
         this.checkpointStore = checkpointStore;
         this.probe = probe;
@@ -143,6 +164,9 @@ public final class CheckpointHeartbeat {
         this.allowPersistedFallback = allowPersistedFallback;
         this.idleThreshold = idleThreshold;
         this.catchingUp = startInCatchUp;
+        this.initialOperationTime = initialOperationTime;
+        this.pendingHistoryLostReset = initialOperationTime != null;
+        this.deadProcessedToken = deadProcessedToken;
     }
 
     /**
@@ -166,12 +190,30 @@ public final class CheckpointHeartbeat {
 
     /**
      * Whether this heartbeat has not been {@linkplain #cancel() cancelled}.
-     * Used by the manager's transient catch-up retry chain to stop
-     * rescheduling once the stream is gone.
+     * Used by the manager's transient retry chain to stop rescheduling once
+     * the stream is gone.
      */
     public boolean isActive() {
         return !cancelled;
     }
+
+    /**
+     * Whether the transient probe chain still has work to do: an unfinished
+     * catch-up, or a {@code RESUME_FROM_OPLOG_START} recovery that has not
+     * yet produced a <em>durable</em> write. A delivered token is only a new
+     * chain source, not proof that a position was persisted — only a
+     * successful {@code writeSeen} clears {@code initialOperationTime} and
+     * releases the chain.
+     */
+    public boolean needsEstablishment() {
+        lock.lock();
+        try {
+            return catchingUp || initialOperationTime != null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
 
     /**
      * Write-coalescing flush ({@code saveIntervalSeconds} cadence, flush
@@ -278,15 +320,21 @@ public final class CheckpointHeartbeat {
     private void runProbe(TokenSnapshot snapshot) {
         BsonDocument chainToken = snapshot != null ? snapshot.token()
                 : (allowPersistedFallback ? persistedSeenToken() : null);
-        if (chainToken == null) {
+        ProbeOutcome outcome;
+        if (chainToken != null) {
+            outcome = probe.probe(chainToken);
+        } else if (initialOperationTime != null) {
+            // RESUME_FROM_OPLOG_START recovery with no position yet: chain
+            // from the recovery operation time — never from "now", which
+            // would skip the very history this recovery promises to replay.
+            outcome = probe.probeFromOperationTime(initialOperationTime);
+        } else {
             // No position exists to chain from (e.g. StartPosition.LATEST with
             // no event yet). Probing from "now" is unsafe — skip.
             log.debug("Heartbeat probe skipped for stream '{}': no position to chain from",
                     streamName);
             return;
         }
-
-        ProbeOutcome outcome = probe.probe(chainToken);
         switch (outcome.type()) {
             case EVENT_PENDING -> {
                 // Undelivered events sit between the chained token and the
@@ -321,7 +369,12 @@ public final class CheckpointHeartbeat {
                                           BsonDocument chainToken,
                                           BsonDocument pbrt,
                                           Instant now) {
-        if (!catchingUp && pbrt.equals(chainToken)) {
+        if (!catchingUp && !pendingHistoryLostReset
+                && chainToken != null && pbrt.equals(chainToken)) {
+            // Fast path only when no establishment/reset is owed: during a
+            // recovery, even an identical PBRT must go through writeSeen —
+            // an empty batch is not contractually required to return a
+            // different PBRT, and the chain must be able to terminate.
             // Position unchanged but re-certified valid: heartbeat-only write.
             if (cancelled) {
                 return;
@@ -353,9 +406,20 @@ public final class CheckpointHeartbeat {
         if (cancelled) {
             return;
         }
-        checkpointStore.saveSeen(streamName, token, positionTimestamp, now);
+        if (pendingHistoryLostReset) {
+            // OPLOG_START recovery, deferred cleanup: the dead tokens stayed
+            // in the checkpoint as the durable "recovery due" marker; this
+            // first durable write replaces them. The store evaluates the
+            // dead-processed guard atomically: a processed token re-acquired
+            // during the replay is preserved.
+            checkpointStore.resetAfterHistoryLost(streamName, token, deadProcessedToken, now);
+        } else {
+            checkpointStore.saveSeen(streamName, token, positionTimestamp, now);
+        }
         lastPersistedSeen = token;
         catchingUp = false;
+        initialOperationTime = null; // a durable position exists from here on
+        pendingHistoryLostReset = false;
         FlowWardenMetrics.get().onCheckpoint(streamName, token.toJson());
         log.debug("Periodic lastSeenToken update for stream '{}'", streamName);
     }

@@ -27,6 +27,7 @@ import io.flowwarden.stream.internal.checkpoint.HeartbeatProbe;
 import io.flowwarden.stream.internal.checkpoint.ProbeOutcome;
 import io.flowwarden.stream.internal.discovery.ChangeStreamDefinition;
 import org.bson.BsonDocument;
+import org.bson.BsonTimestamp;
 import org.bson.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -65,9 +66,19 @@ final class ImperativeHeartbeatProbe implements HeartbeatProbe {
     @Override
     public ProbeOutcome probe(BsonDocument resumeAfter) {
         Objects.requireNonNull(resumeAfter, "resumeAfter must not be null — use initialPosition()");
+        return boundedRead(buildIterable().resumeAfter(resumeAfter));
+    }
+
+    @Override
+    public ProbeOutcome probeFromOperationTime(BsonTimestamp operationTime) {
+        Objects.requireNonNull(operationTime, "operationTime must not be null");
+        return boundedRead(buildIterable().startAtOperationTime(operationTime));
+    }
+
+    private ProbeOutcome boundedRead(ChangeStreamIterable<Document> iterable) {
         try {
             try (MongoChangeStreamCursor<ChangeStreamDocument<Document>> cursor =
-                         buildIterable().resumeAfter(resumeAfter).cursor()) {
+                         iterable.cursor()) {
                 ChangeStreamDocument<Document> event = cursor.tryNext();
                 if (event != null) {
                     return ProbeOutcome.eventPending();

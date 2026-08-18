@@ -113,6 +113,48 @@ public class ReactiveMongoCheckpointStore implements CheckpointStore {
     }
 
     @Override
+    public void resetAfterHistoryLost(String streamName, BsonDocument freshSeenToken,
+                                      BsonDocument expectedDeadProcessed, Instant timestamp) {
+        // Single atomic reset with the at-least-once guard IN the update
+        // filter: the expired processed pair is removed only while it still
+        // matches the value read at history-loss detection. Everything else
+        // (instanceId, metadata, unknown fields) untouched.
+        Update reset = new Update()
+                .unset("lastProcessedToken")
+                .unset("lastProcessedTimestamp");
+        applySeen(reset, freshSeenToken, timestamp);
+        Long modified = reactiveMongoTemplate.updateFirst(
+                Query.query(Criteria.where("_id").is(streamName)
+                        .and("lastProcessedToken").is(bsonToDocument(expectedDeadProcessed))),
+                reset,
+                MongoCheckpointStore.COLLECTION
+        ).map(result -> result.getModifiedCount()).block();
+        if (modified == null || modified == 0) {
+            // A fresh processed token was acquired concurrently (or the
+            // document changed): preserve it, write only the seen position.
+            Update seenOnly = applySeen(new Update(), freshSeenToken, timestamp);
+            reactiveMongoTemplate.upsert(
+                    Query.query(Criteria.where("_id").is(streamName)),
+                    seenOnly,
+                    MongoCheckpointStore.COLLECTION
+            ).block();
+        }
+    }
+
+    private static Update applySeen(Update update, BsonDocument freshSeenToken, Instant timestamp) {
+        if (freshSeenToken != null) {
+            update.set("lastSeenToken", bsonToDocument(freshSeenToken))
+                    .set("lastSeenTimestamp", timestamp)
+                    .set("lastHeartbeatTimestamp", timestamp);
+        } else {
+            // No recoverable position left: a lingering heartbeat would lie.
+            update.unset("lastSeenToken").unset("lastSeenTimestamp")
+                    .unset("lastHeartbeatTimestamp");
+        }
+        return update;
+    }
+
+    @Override
     public void delete(String streamName) {
         reactiveMongoTemplate.remove(
                 Query.query(Criteria.where("_id").is(streamName)),
