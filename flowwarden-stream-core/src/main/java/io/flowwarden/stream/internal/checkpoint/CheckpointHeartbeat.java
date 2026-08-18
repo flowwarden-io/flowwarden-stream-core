@@ -212,10 +212,11 @@ public final class CheckpointHeartbeat {
 
     /**
      * Idle-protection tick (short check cadence on the probe scheduler):
-     * probes when the main cursor has been idle past the threshold — or
-     * unconditionally while catching up. During sustained idleness, probes
-     * stay spaced a full idle interval apart regardless of the check
-     * cadence. Never throws.
+     * probes when the main cursor has been idle past the threshold. During
+     * sustained idleness, probes stay spaced a full idle interval apart
+     * regardless of the check cadence. While catching up, this tick abstains
+     * entirely — the transient catch-up chain is the sole owner of probing
+     * during that transition. Never throws.
      */
     public void idleTick() {
         if (cancelled) {
@@ -223,21 +224,22 @@ public final class CheckpointHeartbeat {
         }
         lock.lock();
         try {
+            if (catchingUp) {
+                return; // the catch-up chain owns probing during catch-up
+            }
             Instant now = Instant.now();
             TokenSnapshot snapshot = latestTokenRef.get().get();
-            if (!catchingUp) {
-                if (snapshot != null
-                        && Duration.between(snapshot.timestamp(), now)
-                                .compareTo(idleThreshold) < 0) {
-                    return; // the main cursor progressed recently — not idle
-                }
-                if (lastIdleProbeAt != null
-                        && Duration.between(lastIdleProbeAt, now)
-                                .compareTo(idleThreshold) < 0) {
-                    return; // probes stay spaced a full interval apart
-                }
-                lastIdleProbeAt = now;
+            if (snapshot != null
+                    && Duration.between(snapshot.timestamp(), now)
+                            .compareTo(idleThreshold) < 0) {
+                return; // the main cursor progressed recently — not idle
             }
+            if (lastIdleProbeAt != null
+                    && Duration.between(lastIdleProbeAt, now)
+                            .compareTo(idleThreshold) < 0) {
+                return; // probes stay spaced a full interval apart
+            }
+            lastIdleProbeAt = now;
             runProbe(snapshot);
         } catch (Exception e) {
             FlowWardenMetrics.get().onCheckpointFailed(streamName, e);

@@ -67,12 +67,17 @@ class ReactiveIdleHeartbeatIntegrationTest {
     @Autowired ReactiveStreamManager streamManager;
     @Autowired CheckpointStore checkpointStore;
     @Autowired ReactiveIdleHandler handler;
+    @Autowired ReactiveCatchUpOptOutHandler catchUpOptOutHandler;
 
     @BeforeEach
     void setUp() {
         handler.clear();
+        catchUpOptOutHandler.clear();
         reactiveMongoTemplate.dropCollection(COLLECTION).onErrorResume(e -> Mono.empty()).block();
         reactiveMongoTemplate.dropCollection(OTHER_COLLECTION).onErrorResume(e -> Mono.empty()).block();
+        reactiveMongoTemplate.dropCollection(CATCHUP_OPTOUT_COLLECTION)
+                .onErrorResume(e -> Mono.empty()).block();
+        checkpointStore.delete(CATCHUP_OPTOUT_STREAM);
         checkpointStore.delete(STREAM_NAME);
         streamManager.startStream(STREAM_NAME);
         await().atMost(Duration.ofSeconds(5))
@@ -82,7 +87,9 @@ class ReactiveIdleHeartbeatIntegrationTest {
     @AfterEach
     void tearDown() {
         try { streamManager.stopStream(STREAM_NAME); } catch (Exception ignored) {}
+        try { streamManager.stopStream(CATCHUP_OPTOUT_STREAM); } catch (Exception ignored) {}
         checkpointStore.delete(STREAM_NAME);
+        checkpointStore.delete(CATCHUP_OPTOUT_STREAM);
     }
 
     @Test
@@ -150,10 +157,102 @@ class ReactiveIdleHeartbeatIntegrationTest {
                         .contains("missed-while-down"));
     }
 
+    @Test
+    void divergenceWithIdleProbingOptedOut_catchUpStillCompletes_flushKeepsWorking() {
+        // Reactive twin of the imperative catch-up/opt-out regression: the
+        // scheduling logic is duplicated per manager, so is the coverage.
+        BsonDocument processedPos = currentPosition(CATCHUP_OPTOUT_COLLECTION);
+        reactiveMongoTemplate.insert(new Document("tag", "replayed"), CATCHUP_OPTOUT_COLLECTION)
+                .block();
+        BsonDocument seenPos = currentPosition(CATCHUP_OPTOUT_COLLECTION);
+
+        Instant savedAt = Instant.now();
+        checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
+                CATCHUP_OPTOUT_STREAM, null, seenPos, savedAt, processedPos, savedAt, savedAt,
+                java.util.Collections.emptyMap()));
+
+        streamManager.startStream(CATCHUP_OPTOUT_STREAM);
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning(CATCHUP_OPTOUT_STREAM));
+
+        // Catch-up certification observable through the heartbeat timestamp
+        // (the certified PBRT may be byte-identical to seenPos on a quiet
+        // cluster — the token itself is not a reliable certification signal).
+        await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
+            assertThat(catchUpOptOutHandler.tags()).contains("replayed");
+            assertThat(checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM)
+                    .orElseThrow().lastHeartbeatTimestamp()).isAfter(savedAt);
+        });
+        BsonDocument certifiedToken = checkpointStore
+                .findByStreamName(CATCHUP_OPTOUT_STREAM).orElseThrow().lastSeenToken();
+
+        // With idle=0 and the chain finished, only the flush can move the
+        // position again.
+        reactiveMongoTemplate.insert(new Document("tag", "live"), CATCHUP_OPTOUT_COLLECTION)
+                .block();
+        await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
+            assertThat(catchUpOptOutHandler.tags()).contains("live");
+            assertThat(checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM)
+                    .orElseThrow().lastSeenToken())
+                    .as("the flush must persist events again once catch-up completed")
+                    .isNotEqualTo(certifiedToken);
+        });
+
+        streamManager.stopStream(CATCHUP_OPTOUT_STREAM);
+        checkpointStore.delete(CATCHUP_OPTOUT_STREAM);
+    }
+
+    /**
+     * Captures the server's current position from a change stream's initial
+     * aggregate reply — the exact mechanism the bootstrap uses.
+     */
+    private BsonDocument currentPosition(String collection) {
+        Document reply = reactiveMongoTemplate.executeCommand(
+                new Document("aggregate", collection)
+                        .append("pipeline", java.util.List.of(
+                                new Document("$changeStream", new Document())))
+                        .append("cursor", new Document("batchSize", 1)))
+                .block(Duration.ofSeconds(5));
+        assertThat(reply).isNotNull();
+        Document cursor = reply.get("cursor", Document.class);
+        long cursorId = ((Number) cursor.get("id")).longValue();
+        Document pbrt = cursor.get("postBatchResumeToken", Document.class);
+        if (cursorId != 0) {
+            reactiveMongoTemplate.executeCommand(new Document("killCursors", collection)
+                    .append("cursors", java.util.List.of(cursorId)))
+                    .block(Duration.ofSeconds(5));
+        }
+        assertThat(pbrt).isNotNull();
+        return BsonDocument.parse(pbrt.toJson());
+    }
+
+    private static final String CATCHUP_OPTOUT_STREAM = "idle-hb-reactive-catchup-optout";
+    private static final String CATCHUP_OPTOUT_COLLECTION = "idle_hb_reactive_catchup_optout";
+
     @SpringBootApplication
     @EnableFlowWarden
-    @Import(ReactiveIdleHandler.class)
+    @Import({ReactiveIdleHandler.class, ReactiveCatchUpOptOutHandler.class})
     static class TestApp {}
+
+    @ChangeStream(name = CATCHUP_OPTOUT_STREAM, collection = CATCHUP_OPTOUT_COLLECTION,
+            documentType = Document.class, autoStart = false)
+    @Checkpoint(saveEveryN = 100, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 0)
+    static class ReactiveCatchUpOptOutHandler {
+
+        private final List<Document> events = new CopyOnWriteArrayList<>();
+
+        @OnInsert
+        Mono<Void> handle(ChangeStreamContext<Document> ctx) {
+            ctx.getFullDocument(Document.class).ifPresent(events::add);
+            return Mono.empty();
+        }
+
+        List<String> tags() {
+            return events.stream().map(d -> d.getString("tag")).toList();
+        }
+
+        void clear() { events.clear(); }
+    }
 
     @ChangeStream(name = STREAM_NAME, collection = COLLECTION,
             documentType = Document.class, autoStart = false)

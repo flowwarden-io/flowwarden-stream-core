@@ -212,9 +212,9 @@ class ImperativeHeartbeatMonotonicityIntegrationTest {
         mongoTemplate.insert(new Document("tag", "replayed"), CATCHUP_OPTOUT_COLLECTION);
         BsonDocument seenPos = currentPosition(CATCHUP_OPTOUT_COLLECTION);
 
-        Instant now = Instant.now();
+        Instant savedAt = Instant.now();
         checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
-                CATCHUP_OPTOUT_STREAM, null, seenPos, now, processedPos, now, now,
+                CATCHUP_OPTOUT_STREAM, null, seenPos, savedAt, processedPos, savedAt, savedAt,
                 Collections.emptyMap()));
 
         streamManager.startStream(CATCHUP_OPTOUT_STREAM);
@@ -223,19 +223,28 @@ class ImperativeHeartbeatMonotonicityIntegrationTest {
 
         // The replay is delivered, and the transient catch-up chain (immediate
         // attempt + 5s retries) certifies completion despite idle probing
-        // being opted out.
-        await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
-                assertThat(catchUpOptOutHandler.tags()).contains("replayed"));
+        // being opted out — observable through the heartbeat timestamp (the
+        // certified PBRT may be byte-identical to seenPos on a quiet cluster,
+        // so the token itself is not a reliable certification signal).
+        await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
+            assertThat(catchUpOptOutHandler.tags()).contains("replayed");
+            assertThat(checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM)
+                    .orElseThrow().lastHeartbeatTimestamp()).isAfter(savedAt);
+        });
+        BsonDocument certifiedToken = checkpointStore
+                .findByStreamName(CATCHUP_OPTOUT_STREAM).orElseThrow().lastSeenToken();
 
-        // A live event must then be flushed — before the fix, the stream
-        // stayed in catch-up forever and the flush never wrote again.
+        // Only THEN insert the live event: with idle=0 and the catch-up chain
+        // finished, the flush is the only mechanism able to move the position
+        // again — this pins that the flush actually resumed (the previous
+        // assertion was satisfied by the certification PBRT alone).
         mongoTemplate.insert(new Document("tag", "live"), CATCHUP_OPTOUT_COLLECTION);
         await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
             assertThat(catchUpOptOutHandler.tags()).contains("live");
-            var cp = checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM).orElseThrow();
-            assertThat(dataOf(cp.lastSeenToken()))
+            assertThat(checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM)
+                    .orElseThrow().lastSeenToken())
                     .as("the flush must persist events again once catch-up completed")
-                    .isGreaterThan(dataOf(seenPos));
+                    .isNotEqualTo(certifiedToken);
         });
     }
 

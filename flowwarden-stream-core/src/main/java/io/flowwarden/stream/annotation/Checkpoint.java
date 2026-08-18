@@ -127,10 +127,13 @@ public @interface Checkpoint {
      * active streams never probe. This is the level-2 safety net of the
      * resume cascade for idle workloads.</p>
      *
-     * <p>Timing contract: idleness is checked on a short internal cadence, so
-     * the first probe fires at most a few seconds after the configured idle
-     * time elapses; during sustained idleness, subsequent probes stay spaced
-     * one full interval apart.</p>
+     * <p>Timing contract (nominal, not a hard bound): idleness is checked
+     * every few seconds and the probe runs as soon as the dedicated
+     * single-threaded probe executor is available. All streams of an
+     * instance share that executor — a queue of idle streams or a slow probe
+     * can delay another stream's probe beyond the check cadence. During
+     * sustained idleness, a stream's probes stay spaced one full interval
+     * apart.</p>
      *
      * <p>The checkpoint's {@code lastHeartbeatTimestamp} records the last time
      * a recoverable position was confirmed (fresh event flush or successful

@@ -343,6 +343,8 @@ class CheckpointHeartbeatTest {
     }
 
     // --- catch-up state: resume behind the persisted position ---
+    // The transient catch-up chain drives probing through probeNow();
+    // idleTick abstains entirely during catch-up (single owner).
 
     @Test
     void catchUp_replayedEvents_areNeitherPersistedNorHealthRefreshed() {
@@ -357,13 +359,27 @@ class CheckpointHeartbeatTest {
     }
 
     @Test
-    void catchUp_probeBypassesIdleness_andEmptyEndsCatchUp() {
+    void catchUp_idleTickNeverProbes_theChainIsTheSoleOwner() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE)); // even genuinely idle
+        CheckpointHeartbeat hb = catchUpHeartbeat(r -> ProbeOutcome.empty(PBRT));
+
+        hb.idleTick();
+
+        assertThat(probed)
+                .as("during catch-up, only the dedicated chain may probe")
+                .isEmpty();
+        assertThat(store.calls).isEmpty();
+        assertThat(hb.isCatchingUp()).isTrue();
+    }
+
+    @Test
+    void catchUp_chainProbe_bypassesIdleness_andEmptyEndsCatchUp() {
         // Continuous replay: the snapshot is FRESH, yet the catch-up probe
         // must still run.
         ref.set(new TokenSnapshot(EVENT_A, NOW));
         CheckpointHeartbeat hb = catchUpHeartbeat(r -> ProbeOutcome.empty(PBRT));
 
-        hb.idleTick();
+        hb.probeNow();
 
         assertThat(probed).containsExactly(EVENT_A);
         assertThat(store.calls).containsExactly("saveSeen+hb:pbrt");
@@ -376,24 +392,24 @@ class CheckpointHeartbeatTest {
     }
 
     @Test
-    void catchUp_probeEventPending_staysCatchingUp() {
+    void catchUp_chainProbeEventPending_staysCatchingUp() {
         ref.set(new TokenSnapshot(EVENT_A, NOW));
         CheckpointHeartbeat hb = catchUpHeartbeat(r -> ProbeOutcome.eventPending());
 
-        hb.idleTick();
+        hb.probeNow();
 
         assertThat(hb.isCatchingUp()).isTrue();
         assertThat(store.calls).isEmpty();
     }
 
     @Test
-    void catchUp_probeReturnsChainPosition_persistsItAndEndsCatchUp() {
+    void catchUp_chainProbeReturnsChainPosition_persistsItAndEndsCatchUp() {
         // Backlog consumed and the cluster position did not move: the
         // delivered position itself is the certified safe position.
         ref.set(new TokenSnapshot(EVENT_A, NOW));
         CheckpointHeartbeat hb = catchUpHeartbeat(r -> ProbeOutcome.empty(EVENT_A));
 
-        hb.idleTick();
+        hb.probeNow();
 
         assertThat(store.calls).containsExactly("saveSeen+hb:event-a");
         assertThat(hb.isCatchingUp()).isFalse();
@@ -405,11 +421,11 @@ class CheckpointHeartbeatTest {
         CheckpointHeartbeat hb = catchUpHeartbeat(r -> ProbeOutcome.empty(PBRT));
 
         store.throwOnWrite = true;
-        hb.idleTick();
+        hb.probeNow();
         assertThat(hb.isCatchingUp()).isTrue();
 
         store.throwOnWrite = false;
-        hb.idleTick();
+        hb.probeNow();
         assertThat(hb.isCatchingUp()).isFalse();
         assertThat(store.calls).containsExactly("saveSeen+hb:pbrt");
     }
