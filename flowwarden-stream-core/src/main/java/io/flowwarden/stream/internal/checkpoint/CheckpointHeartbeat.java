@@ -120,6 +120,15 @@ public final class CheckpointHeartbeat {
     /** Consecutive EVENT_PENDING outcomes. Guarded by {@link #lock}. */
     private int consecutiveAbstentions;
 
+    /**
+     * Last time {@link #idleTick()} actually ran a probe. The idle check
+     * fires on a short cadence to keep the configured threshold an actual
+     * bound, so this throttle keeps probes spaced a full idle interval apart
+     * during sustained idleness (abstentions and failures must not retry at
+     * the check cadence). Guarded by {@link #lock}.
+     */
+    private Instant lastIdleProbeAt;
+
     public CheckpointHeartbeat(String streamName,
                                CheckpointStore checkpointStore,
                                HeartbeatProbe probe,
@@ -146,13 +155,22 @@ public final class CheckpointHeartbeat {
         cancelled = true;
     }
 
-    boolean isCatchingUp() {
+    public boolean isCatchingUp() {
         lock.lock();
         try {
             return catchingUp;
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Whether this heartbeat has not been {@linkplain #cancel() cancelled}.
+     * Used by the manager's transient catch-up retry chain to stop
+     * rescheduling once the stream is gone.
+     */
+    public boolean isActive() {
+        return !cancelled;
     }
 
     /**
@@ -193,9 +211,11 @@ public final class CheckpointHeartbeat {
     }
 
     /**
-     * Idle-protection tick ({@code idleHeartbeatIntervalSeconds} cadence,
-     * probe scheduler): probes when the main cursor has been idle past the
-     * threshold — or unconditionally while catching up. Never throws.
+     * Idle-protection tick (short check cadence on the probe scheduler):
+     * probes when the main cursor has been idle past the threshold — or
+     * unconditionally while catching up. During sustained idleness, probes
+     * stay spaced a full idle interval apart regardless of the check
+     * cadence. Never throws.
      */
     public void idleTick() {
         if (cancelled) {
@@ -203,12 +223,20 @@ public final class CheckpointHeartbeat {
         }
         lock.lock();
         try {
+            Instant now = Instant.now();
             TokenSnapshot snapshot = latestTokenRef.get().get();
-            if (!catchingUp
-                    && snapshot != null
-                    && Duration.between(snapshot.timestamp(), Instant.now())
-                            .compareTo(idleThreshold) < 0) {
-                return; // the main cursor progressed recently — not idle
+            if (!catchingUp) {
+                if (snapshot != null
+                        && Duration.between(snapshot.timestamp(), now)
+                                .compareTo(idleThreshold) < 0) {
+                    return; // the main cursor progressed recently — not idle
+                }
+                if (lastIdleProbeAt != null
+                        && Duration.between(lastIdleProbeAt, now)
+                                .compareTo(idleThreshold) < 0) {
+                    return; // probes stay spaced a full interval apart
+                }
+                lastIdleProbeAt = now;
             }
             runProbe(snapshot);
         } catch (Exception e) {
@@ -220,14 +248,16 @@ public final class CheckpointHeartbeat {
     }
 
     /**
-     * One-shot diagnostic probe shortly after stream start (probe scheduler),
-     * bypassing the idleness precondition. An incompatible probe pipeline
-     * surfaces as WARN + {@code onHeartbeatProbeFailed} right away instead of
-     * an idle-interval later, and a catch-up resume gets its first chance to
-     * certify completion immediately. Asynchronous best-effort: this is a
-     * diagnostic, not a startup precondition. Never throws.
+     * Unconditional probe on the probe scheduler, bypassing the idleness
+     * precondition. Two uses: the asynchronous startup diagnostic (an
+     * incompatible probe pipeline surfaces as WARN +
+     * {@code onHeartbeatProbeFailed} right away instead of an idle-interval
+     * later — best-effort, not a startup precondition), and the transient
+     * catch-up retry chain (which needs a certification attempt regardless of
+     * the idle policy, including when idle probing is opted out). Never
+     * throws.
      */
-    public void startupProbe() {
+    public void probeNow() {
         if (cancelled) {
             return;
         }
@@ -236,7 +266,7 @@ public final class CheckpointHeartbeat {
             runProbe(latestTokenRef.get().get());
         } catch (Exception e) {
             FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
-            log.warn("Startup heartbeat probe failed for stream '{}': {}",
+            log.warn("Heartbeat probe failed for stream '{}': {}",
                     streamName, e.getMessage(), e);
         } finally {
             lock.unlock();

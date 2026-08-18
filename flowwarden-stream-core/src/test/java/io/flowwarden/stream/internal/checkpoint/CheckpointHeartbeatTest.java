@@ -221,6 +221,35 @@ class CheckpointHeartbeatTest {
     }
 
     @Test
+    void idle_sustainedIdleness_probesStaySpacedAFullInterval() {
+        // The idle check fires on a short cadence (to keep the threshold a
+        // bound), but abstentions/failures must not retry at check cadence.
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        CheckpointHeartbeat hb = heartbeat(r -> ProbeOutcome.eventPending());
+
+        hb.idleTick(); // idle → probe (abstains)
+        hb.idleTick(); // immediately after: throttled, no second probe
+        hb.idleTick();
+
+        assertThat(probed).hasSize(1);
+    }
+
+    @Test
+    void resumeContext_catchUpRequiresARealDivergence() {
+        BsonDocument seed = EVENT_A;
+        BsonDocument seen = EVENT_B;
+
+        assertThat(new ResumeContext(seed, seen).startInCatchUp()).isTrue();
+        assertThat(new ResumeContext(seed, seed).startInCatchUp()).isFalse();
+        assertThat(new ResumeContext(seed, null).startInCatchUp())
+                .as("without a persisted seen there is nothing to protect")
+                .isFalse();
+        assertThat(new ResumeContext(null, seen).startInCatchUp()).isFalse();
+        assertThat(ResumeContext.NONE.allowPersistedFallback()).isFalse();
+        assertThat(new ResumeContext(seed, null).allowPersistedFallback()).isTrue();
+    }
+
+    @Test
     void idle_probeEventPending_abstains_noWrites() {
         ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
 
@@ -388,21 +417,21 @@ class CheckpointHeartbeatTest {
     // --- startup probe ---
 
     @Test
-    void startupProbe_probesRegardlessOfIdleness() {
+    void probeNow_probesRegardlessOfIdleness() {
         ref.set(new TokenSnapshot(SEED, NOW, TokenSnapshot.Source.SEED)); // fresh
 
-        heartbeat(r -> ProbeOutcome.empty(SEED)).startupProbe();
+        heartbeat(r -> ProbeOutcome.empty(SEED)).probeNow();
 
         assertThat(probed).containsExactly(SEED);
         assertThat(store.calls).containsExactly("saveHeartbeat"); // re-certification
     }
 
     @Test
-    void startupProbe_incompatiblePipeline_surfacesFailure() {
+    void probeNow_incompatiblePipeline_surfacesFailure() {
         ref.set(new TokenSnapshot(SEED, NOW, TokenSnapshot.Source.SEED));
         RuntimeException boom = new RuntimeException("unknown pipeline stage");
 
-        heartbeat(r -> ProbeOutcome.failed(boom)).startupProbe();
+        heartbeat(r -> ProbeOutcome.failed(boom)).probeNow();
 
         assertThat(metrics.probeFailures).containsExactly(boom);
         assertThat(store.calls).isEmpty();

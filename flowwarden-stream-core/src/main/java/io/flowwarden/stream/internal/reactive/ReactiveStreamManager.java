@@ -44,6 +44,7 @@ import io.flowwarden.stream.internal.discovery.PipelineMethod;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
 import io.flowwarden.stream.spi.ChangeEventMetadata;
 import io.flowwarden.stream.internal.checkpoint.CheckpointHeartbeat;
+import io.flowwarden.stream.internal.checkpoint.ResumeContext;
 import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqPolicy;
@@ -190,11 +191,12 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         ReactiveHeartbeatProbe probe =
                 new ReactiveHeartbeatProbe(streamTemplate, def, resolvedPipeline);
 
-        BsonDocument seedToken = null;
+        ResumeContext resumeContext = ResumeContext.NONE;
         if (def.checkpointAnnotation() != null
                 && def.checkpointAnnotation().startPosition() == StartPosition.RESUME) {
-            seedToken = applyResumeCascade(streamName, def, optionsBuilder, probe);
+            resumeContext = applyResumeCascade(streamName, def, optionsBuilder, probe);
         }
+        BsonDocument seedToken = resumeContext.seedToken();
 
         if (def.config().fullDocument() != FullDocumentMode.DEFAULT) {
             optionsBuilder.fullDocumentLookup(FullDocument.valueOf(def.config().fullDocument().name()));
@@ -237,7 +239,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
         streams.put(streamName,
                 new ReactiveStreamState(disposableHolder, def, gracefulStop, lastError));
-        scheduleIntervalCheckpoint(def, probe, seedToken);
+        scheduleIntervalCheckpoint(def, probe, resumeContext);
 
         Disposable disposable = streamTemplate
                 .changeStream(def.collection(), options, Document.class)
@@ -657,7 +659,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
     private void scheduleIntervalCheckpoint(ChangeStreamDefinition def,
                                             ReactiveHeartbeatProbe probe,
-                                            BsonDocument seedToken) {
+                                            ResumeContext resumeContext) {
         if (def.checkpointAnnotation() == null) {
             return;
         }
@@ -671,42 +673,61 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         // - flush (saveIntervalSeconds, flush scheduler): dirty-only write
         //   coalescing, no cursor, never blocking;
         // - idle heartbeat (idleHeartbeatIntervalSeconds, probe scheduler):
-        //   probe-based oplog rollover protection, active when the main
-        //   cursor stalls or while catching up after a behind resume.
+        //   probe-based oplog rollover protection when the main cursor stalls.
         // Both advance ONLY lastSeenToken (+ lastHeartbeatTimestamp);
         // lastProcessedToken is managed by saveCheckpointIfNeeded after
-        // confirmed handler success.
-        // The persisted-token fallback follows the cascade's actual outcome:
-        // no established position (LATEST, OPLOG_START recovery) → never
-        // chain from an ignored or known-invalid checkpoint. Catch-up state:
-        // the stream resumed behind the persisted seen position
-        // (PROCESSED_FIRST or a level-2 fallback).
-        boolean startInCatchUp = seedToken != null
-                && !seedToken.equals(checkpointStore.findByStreamName(streamName)
-                        .map(io.flowwarden.stream.spi.Checkpoint::lastSeenToken)
-                        .orElse(null));
+        // confirmed handler success. Everything derives from the cascade's
+        // ResumeContext — no store re-read, so scheduling cannot fail after
+        // the state is installed.
         CheckpointHeartbeat heartbeat = new CheckpointHeartbeat(
                 streamName, checkpointStore, probe,
                 () -> latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>()),
-                seedToken != null,
+                resumeContext.allowPersistedFallback(),
                 Duration.ofSeconds(idleSeconds),
-                startInCatchUp);
+                resumeContext.startInCatchUp());
         heartbeats.put(streamName, heartbeat);
         if (flushSeconds > 0) {
             intervalTasks.put(streamName, intervalScheduler.scheduleAtFixedRate(
                     heartbeat::flushTick, flushSeconds, flushSeconds, TimeUnit.SECONDS));
         }
         if (idleSeconds > 0) {
-            // Jitter desynchronizes streams started together so their probes
-            // don't all land on the same second.
-            long initialDelay = idleSeconds
-                    + ThreadLocalRandom.current().nextLong(0, Math.max(1, idleSeconds / 2));
+            // Short check cadence keeps the configured threshold an actual
+            // bound (the probe fires at most a few seconds after idleness
+            // elapses); the heartbeat itself spaces probes a full interval
+            // apart. Jittered initial delay (within one check period, never
+            // beyond the bound) desynchronizes streams started together.
+            long checkSeconds = Math.min(idleSeconds, IDLE_CHECK_PERIOD_SECONDS);
+            long initialDelay = 1 + ThreadLocalRandom.current().nextLong(0, checkSeconds);
             idleProbeTasks.put(streamName, probeScheduler.scheduleAtFixedRate(
-                    heartbeat::idleTick, initialDelay, idleSeconds, TimeUnit.SECONDS));
+                    heartbeat::idleTick, initialDelay, checkSeconds, TimeUnit.SECONDS));
+        }
+        if (resumeContext.startInCatchUp()) {
+            // Transient catch-up chain: immediate certification attempt, then
+            // bounded retries until the server certifies the backlog consumed.
+            // Independent of the idle policy — opting out of idle probing must
+            // never disable the correction the flush depends on.
+            scheduleCatchUpAttempt(heartbeat, 0);
+        } else if (idleSeconds > 0) {
             // Async diagnostic probe: an incompatible probe pipeline surfaces
-            // shortly after start (WARN + onHeartbeatProbeFailed), and a
-            // catch-up resume gets its first certification chance right away.
-            probeScheduler.execute(heartbeat::startupProbe);
+            // shortly after start (WARN + onHeartbeatProbeFailed) instead of
+            // an idle-interval later.
+            probeScheduler.execute(heartbeat::probeNow);
+        }
+    }
+
+    private static final long IDLE_CHECK_PERIOD_SECONDS = 5;
+    private static final long CATCH_UP_RETRY_SECONDS = 5;
+
+    private void scheduleCatchUpAttempt(CheckpointHeartbeat heartbeat, long delaySeconds) {
+        try {
+            probeScheduler.schedule(() -> {
+                heartbeat.probeNow();
+                if (heartbeat.isActive() && heartbeat.isCatchingUp()) {
+                    scheduleCatchUpAttempt(heartbeat, CATCH_UP_RETRY_SECONDS);
+                }
+            }, delaySeconds, TimeUnit.SECONDS);
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Scheduler shut down — the stream is going away with it.
         }
     }
 
@@ -762,10 +783,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
      * (level 1), fall back to the secondary if the primary has aged out
      * (level 2), apply onHistoryLost strategy if both have aged out (level 3).
      *
-     * @return the resume position the stream starts from ({@code null} when
-     *         the stream starts from "now"), used to seed the heartbeat chain
+     * @return the immutable resume outcome (seed + persisted seen position),
+     *         built from this single checkpoint read — heartbeat setup
+     *         derives everything from it without re-reading the store
      */
-    private BsonDocument applyResumeCascade(String streamName,
+    private ResumeContext applyResumeCascade(String streamName,
                                     ChangeStreamDefinition def,
                                     ChangeStreamOptions.ChangeStreamOptionsBuilder optionsBuilder,
                                     ReactiveHeartbeatProbe probe) {
@@ -810,7 +832,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         if (primary != null && isTokenValid(def.collection(), primary, streamTemplate)) {
             optionsBuilder.resumeAfter(primary);
             log.info("Resuming stream '{}' from {}", streamName, primaryLabel);
-            return primary;
+            return new ResumeContext(primary, seenToken);
         }
 
         // Level 2: fallback to the secondary if it's distinct and still valid
@@ -820,7 +842,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             optionsBuilder.resumeAfter(secondary);
             log.warn("Resuming stream '{}' from {}: {} aged out of oplog", streamName, secondaryLabel, primaryLabel);
             onFallback.run();
-            return secondary;
+            return new ResumeContext(secondary, seenToken);
         }
 
         // Level 3: both tokens unusable → apply onHistoryLost strategy
@@ -842,7 +864,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
      * the persistence are startup preconditions: a failure propagates instead
      * of silently starting an unprotected, non-durable stream.
      */
-    private BsonDocument bootstrapInitialPosition(String streamName,
+    private ResumeContext bootstrapInitialPosition(String streamName,
                                                   ChangeStreamOptions.ChangeStreamOptionsBuilder optionsBuilder,
                                                   ReactiveHeartbeatProbe probe) {
         BsonDocument pbrt = probe.initialPosition();
@@ -859,10 +881,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         FlowWardenMetrics.get().onCheckpoint(streamName, pbrt.toJson());
         optionsBuilder.resumeAfter(pbrt);
         log.info("Bootstrapped stream '{}' from an initial server-certified position", streamName);
-        return pbrt;
+        // seed == freshly persisted seen: never a phantom catch-up.
+        return new ResumeContext(pbrt, pbrt);
     }
 
-    private BsonDocument handleHistoryLost(String streamName,
+    private ResumeContext handleHistoryLost(String streamName,
                                    ChangeStreamDefinition def,
                                    ChangeStreamOptions.ChangeStreamOptionsBuilder optionsBuilder,
                                    java.time.Instant lastCheckpointTimestamp,
@@ -888,15 +911,21 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     optionsBuilder.resumeAt(oldestTs);
                     log.info("Stream '{}' will resume from oldest oplog entry at {}", streamName, oldestTs);
                 } catch (Exception e) {
+                    // Same self-repair as RESUME_FROM_NOW (matching the logged
+                    // fallback): a fresh certified position instead of an
+                    // implicit non-durable "from now" with expired tokens
+                    // lingering. A bootstrap failure propagates — no path
+                    // starts on a non-durable position.
                     log.warn("Failed to read oplog for stream '{}': {}. Falling back to RESUME_FROM_NOW.",
                             streamName, e.getMessage());
-                    // No resumeAt set → starts from now. Checkpoint preserved for next retry.
+                    return bootstrapInitialPosition(streamName, optionsBuilder, probe);
                 }
             }
         }
-        // No established position (OPLOG_START catch-up): the heartbeat must
-        // abstain rather than fall back to the invalid checkpoint.
-        return null;
+        // OPLOG_START catch-up from the oldest oplog entry: no established
+        // position — the heartbeat must abstain rather than fall back to the
+        // invalid checkpoint.
+        return ResumeContext.NONE;
     }
 
     private BsonTimestamp getOldestOplogTimestamp() {

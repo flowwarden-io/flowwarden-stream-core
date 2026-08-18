@@ -73,6 +73,8 @@ class ImperativeHeartbeatMonotonicityIntegrationTest {
     private static final String RESUME_COLLECTION = "hb_monotonic";
     private static final String LATEST_STREAM = "hb-latest";
     private static final String LATEST_COLLECTION = "hb_latest";
+    private static final String CATCHUP_OPTOUT_STREAM = "hb-catchup-optout";
+    private static final String CATCHUP_OPTOUT_COLLECTION = "hb_catchup_optout";
 
     @DynamicPropertySource
     static void mongoProperties(DynamicPropertyRegistry registry) {
@@ -84,23 +86,29 @@ class ImperativeHeartbeatMonotonicityIntegrationTest {
     @Autowired CheckpointStore checkpointStore;
     @Autowired MonotonicHandler monotonicHandler;
     @Autowired LatestHandler latestHandler;
+    @Autowired CatchUpOptOutHandler catchUpOptOutHandler;
 
     @BeforeEach
     void setUp() {
         monotonicHandler.clear();
         latestHandler.clear();
+        catchUpOptOutHandler.clear();
         mongoTemplate.dropCollection(RESUME_COLLECTION);
         mongoTemplate.dropCollection(LATEST_COLLECTION);
+        mongoTemplate.dropCollection(CATCHUP_OPTOUT_COLLECTION);
         checkpointStore.delete(RESUME_STREAM);
         checkpointStore.delete(LATEST_STREAM);
+        checkpointStore.delete(CATCHUP_OPTOUT_STREAM);
     }
 
     @AfterEach
     void tearDown() {
         try { streamManager.stopStream(RESUME_STREAM); } catch (Exception ignored) {}
         try { streamManager.stopStream(LATEST_STREAM); } catch (Exception ignored) {}
+        try { streamManager.stopStream(CATCHUP_OPTOUT_STREAM); } catch (Exception ignored) {}
         checkpointStore.delete(RESUME_STREAM);
         checkpointStore.delete(LATEST_STREAM);
+        checkpointStore.delete(CATCHUP_OPTOUT_STREAM);
     }
 
     @Test
@@ -195,6 +203,42 @@ class ImperativeHeartbeatMonotonicityIntegrationTest {
         }
     }
 
+    @Test
+    void divergenceWithIdleProbingOptedOut_catchUpStillCompletes_flushKeepsWorking() {
+        // The catch-up correction must run even with idleHeartbeatIntervalSeconds=0:
+        // opting out of idle probing must never permanently disable the flush
+        // (PR-review blocking point on the catch-up/idle coupling).
+        BsonDocument processedPos = currentPosition(CATCHUP_OPTOUT_COLLECTION);
+        mongoTemplate.insert(new Document("tag", "replayed"), CATCHUP_OPTOUT_COLLECTION);
+        BsonDocument seenPos = currentPosition(CATCHUP_OPTOUT_COLLECTION);
+
+        Instant now = Instant.now();
+        checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
+                CATCHUP_OPTOUT_STREAM, null, seenPos, now, processedPos, now, now,
+                Collections.emptyMap()));
+
+        streamManager.startStream(CATCHUP_OPTOUT_STREAM);
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning(CATCHUP_OPTOUT_STREAM));
+
+        // The replay is delivered, and the transient catch-up chain (immediate
+        // attempt + 5s retries) certifies completion despite idle probing
+        // being opted out.
+        await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
+                assertThat(catchUpOptOutHandler.tags()).contains("replayed"));
+
+        // A live event must then be flushed — before the fix, the stream
+        // stayed in catch-up forever and the flush never wrote again.
+        mongoTemplate.insert(new Document("tag", "live"), CATCHUP_OPTOUT_COLLECTION);
+        await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
+            assertThat(catchUpOptOutHandler.tags()).contains("live");
+            var cp = checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM).orElseThrow();
+            assertThat(dataOf(cp.lastSeenToken()))
+                    .as("the flush must persist events again once catch-up completed")
+                    .isGreaterThan(dataOf(seenPos));
+        });
+    }
+
     /**
      * Captures the server's current position for a collection from a change
      * stream's <em>initial</em> aggregate reply — the exact mechanism the
@@ -222,8 +266,27 @@ class ImperativeHeartbeatMonotonicityIntegrationTest {
 
     @SpringBootApplication
     @EnableFlowWarden
-    @Import({MonotonicHandler.class, LatestHandler.class})
+    @Import({MonotonicHandler.class, LatestHandler.class, CatchUpOptOutHandler.class})
     static class TestApp {}
+
+    @ChangeStream(name = CATCHUP_OPTOUT_STREAM, collection = CATCHUP_OPTOUT_COLLECTION,
+            documentType = Document.class, autoStart = false)
+    @Checkpoint(saveEveryN = 100, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 0)
+    static class CatchUpOptOutHandler {
+
+        private final List<Document> events = new CopyOnWriteArrayList<>();
+
+        @OnInsert
+        void handle(ChangeStreamContext<Document> ctx) {
+            ctx.getFullDocument(Document.class).ifPresent(events::add);
+        }
+
+        List<String> tags() {
+            return events.stream().map(d -> d.getString("tag")).toList();
+        }
+
+        void clear() { events.clear(); }
+    }
 
     @ChangeStream(name = RESUME_STREAM, collection = RESUME_COLLECTION,
             documentType = Document.class, autoStart = false)
