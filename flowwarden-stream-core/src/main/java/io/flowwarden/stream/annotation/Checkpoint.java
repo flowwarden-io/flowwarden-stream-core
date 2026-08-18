@@ -93,29 +93,50 @@ public @interface Checkpoint {
     int saveEveryN() default 1;
 
     /**
-     * Heartbeat interval in seconds for persisting {@code lastSeenToken}.
+     * Write-coalescing flush interval in seconds for {@code lastSeenToken}.
      *
-     * <p>Each tick persists the most recent event received (including filtered
-     * or no-handler events). When no event arrived since the previous tick,
-     * the heartbeat instead opens an ephemeral, bounded change stream cursor
-     * chained from the last delivered position (same pipeline and
-     * {@code fullDocument} options as the stream, stamped with a
-     * {@code flowwarden:heartbeat:&lt;stream&gt;} comment) and — when the
-     * server certifies the interval empty — advances {@code lastSeenToken} to
-     * the returned post-batch resume token. Idle streams therefore stay
-     * recoverable indefinitely: the persisted position tracks the oplog head
-     * instead of freezing until it ages out. This is the level-2 safety net of
-     * the resume cascade.</p>
-     *
-     * <p>The checkpoint's {@code lastHeartbeatTimestamp} records the last time
-     * a recoverable position was confirmed; its age is the operational signal
-     * for resume-point health.</p>
+     * <p>Each tick persists the most recent event token received (including
+     * filtered or no-handler events) — <em>only if it changed</em> since the
+     * last flush. This is purely a write-pressure control on active streams:
+     * a clean tick writes nothing and never opens any cursor. Keeping a
+     * stream's resume point alive while it is <em>idle</em> is the separate
+     * responsibility of {@link #idleHeartbeatIntervalSeconds()}.</p>
      *
      * <p>{@code 5} (default) is a balanced value; set to {@code 0} to disable
-     * the heartbeat (disables cascade level 2 — the stream is then nude against
-     * oplog rollover on idle / massively-filtered workloads).</p>
+     * the periodic flush ({@code lastSeenToken} then only advances through
+     * the idle heartbeat).</p>
      */
     int saveIntervalSeconds() default 5;
+
+    /**
+     * Idle heartbeat interval in seconds — the oplog-rollover protection
+     * policy for streams that stop receiving events.
+     *
+     * <p>When the main cursor has not delivered any token for this long, the
+     * heartbeat opens an ephemeral, bounded change stream probe chained from
+     * the last delivered position (same collection, same resolved
+     * {@code @Pipeline} stages and {@code fullDocument} options as the
+     * stream, stamped with a {@code flowwarden:heartbeat:&lt;stream&gt;}
+     * comment). When the server certifies the interval empty, the returned
+     * post-batch resume token is persisted as {@code lastSeenToken}: the
+     * resume point keeps tracking the oplog head with zero traffic, and the
+     * stream stays recoverable indefinitely. Any activity of the main cursor
+     * re-arms the idle delay; active streams never probe. This is the level-2
+     * safety net of the resume cascade for idle workloads.</p>
+     *
+     * <p>The checkpoint's {@code lastHeartbeatTimestamp} records the last time
+     * a recoverable position was confirmed (fresh event flush or successful
+     * empty probe); its age is the operational signal for resume-point
+     * health.</p>
+     *
+     * <p>The interval must stay well below the expected oplog window, with
+     * enough margin to absorb transient probe failures — there is no
+     * universally safe value, but {@code 300} (default) sits orders of
+     * magnitude under any realistic window at a negligible probe cost. Set to
+     * {@code 0} to disable idle probing entirely: the stream is then exposed
+     * to oplog rollover whenever it stays idle longer than the window.</p>
+     */
+    int idleHeartbeatIntervalSeconds() default 300;
 
     /**
      * Where to start consuming on (re)start.

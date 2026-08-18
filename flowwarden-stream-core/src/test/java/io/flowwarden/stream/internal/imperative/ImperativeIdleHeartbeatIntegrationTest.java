@@ -174,14 +174,55 @@ class ImperativeIdleHeartbeatIntegrationTest {
                         .contains("missed-while-down"));
     }
 
+    @Test
+    void idleProbingDisabled_checkpointStaysFrozenAfterBootstrap() throws Exception {
+        streamManager.startStream(OPT_OUT_STREAM);
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning(OPT_OUT_STREAM));
+
+        // Bootstrap persisted an initial position; with idle probing opted
+        // out, nothing may touch the checkpoint afterwards on an idle stream.
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertThat(checkpointStore.findByStreamName(OPT_OUT_STREAM)
+                        .orElseThrow().lastSeenToken()).isNotNull());
+        var bootstrapped = checkpointStore.findByStreamName(OPT_OUT_STREAM).orElseThrow();
+
+        // Advance the oplog elsewhere: without probes the token cannot follow.
+        for (int i = 0; i < 10; i++) {
+            mongoTemplate.insert(new Document("filler", i), OTHER_COLLECTION);
+        }
+        Thread.sleep(3_000); // several flush ticks — all clean, zero writes
+
+        var after = checkpointStore.findByStreamName(OPT_OUT_STREAM).orElseThrow();
+        assertThat(after.lastSeenToken()).isEqualTo(bootstrapped.lastSeenToken());
+        assertThat(after.lastHeartbeatTimestamp())
+                .isEqualTo(bootstrapped.lastHeartbeatTimestamp());
+
+        streamManager.stopStream(OPT_OUT_STREAM);
+        checkpointStore.delete(OPT_OUT_STREAM);
+    }
+
+    private static final String OPT_OUT_STREAM = "idle-heartbeat-opt-out";
+    private static final String OPT_OUT_COLLECTION = "idle_heartbeat_opt_out";
+
     @SpringBootApplication
     @EnableFlowWarden
-    @Import(IdleHandler.class)
+    @Import({IdleHandler.class, OptOutHandler.class})
     static class TestApp {}
+
+    @ChangeStream(name = OPT_OUT_STREAM, collection = OPT_OUT_COLLECTION,
+            documentType = Document.class, autoStart = false)
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 0)
+    static class OptOutHandler {
+
+        @OnInsert
+        void handle(ChangeStreamContext<Document> ctx) {
+        }
+    }
 
     @ChangeStream(name = STREAM_NAME, collection = COLLECTION,
             documentType = Document.class, autoStart = false)
-    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1)
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 1)
     static class IdleHandler {
 
         private final List<Document> docs = new CopyOnWriteArrayList<>();

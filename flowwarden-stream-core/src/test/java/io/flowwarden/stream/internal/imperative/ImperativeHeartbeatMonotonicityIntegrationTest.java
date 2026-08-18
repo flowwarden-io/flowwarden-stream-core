@@ -227,7 +227,7 @@ class ImperativeHeartbeatMonotonicityIntegrationTest {
 
     @ChangeStream(name = RESUME_STREAM, collection = RESUME_COLLECTION,
             documentType = Document.class, autoStart = false)
-    @Checkpoint(saveEveryN = 100, saveIntervalSeconds = 1)
+    @Checkpoint(saveEveryN = 100, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 1)
     static class MonotonicHandler {
 
         private final List<Document> events = new CopyOnWriteArrayList<>();
@@ -246,7 +246,7 @@ class ImperativeHeartbeatMonotonicityIntegrationTest {
 
     @ChangeStream(name = LATEST_STREAM, collection = LATEST_COLLECTION,
             documentType = Document.class, autoStart = false)
-    @Checkpoint(saveEveryN = 100, saveIntervalSeconds = 1,
+    @Checkpoint(saveEveryN = 100, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 1,
             startPosition = StartPosition.LATEST)
     static class LatestHandler {
 

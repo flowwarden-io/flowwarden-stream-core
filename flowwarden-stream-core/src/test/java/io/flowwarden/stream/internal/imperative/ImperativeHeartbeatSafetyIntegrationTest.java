@@ -204,7 +204,7 @@ class ImperativeHeartbeatSafetyIntegrationTest {
 
     @ChangeStream(name = LAG_STREAM, collection = LAG_COLLECTION,
             documentType = Document.class, autoStart = false)
-    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1)
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 1)
     static class LaggingHandler {
 
         private volatile CountDownLatch blockGate = new CountDownLatch(1);
@@ -237,7 +237,7 @@ class ImperativeHeartbeatSafetyIntegrationTest {
 
     @ChangeStream(name = EXPIRED_STREAM, collection = EXPIRED_COLLECTION,
             documentType = Document.class, autoStart = false)
-    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1,
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 1,
             onHistoryLost = OnHistoryLost.RESUME_FROM_NOW)
     static class ExpiredTokenHandler {
 

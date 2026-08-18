@@ -68,6 +68,7 @@ import reactor.core.Disposable;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.reflect.InvocationTargetException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
@@ -102,6 +103,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     private final Map<String, AtomicReference<TokenSnapshot>> latestTokens = new ConcurrentHashMap<>();
     private final Map<String, Instant> lastActivityTimes = new ConcurrentHashMap<>();
     private final Map<String, ScheduledFuture<?>> intervalTasks = new ConcurrentHashMap<>();
+    private final Map<String, ScheduledFuture<?>> idleProbeTasks = new ConcurrentHashMap<>();
     private final Map<String, CheckpointHeartbeat> heartbeats = new ConcurrentHashMap<>();
     private final ScheduledExecutorService intervalScheduler =
             Executors.newSingleThreadScheduledExecutor(r -> {
@@ -268,6 +270,10 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     if (task != null) {
                         task.cancel(false);
                     }
+                    ScheduledFuture<?> idleTask = idleProbeTasks.remove(streamName);
+                    if (idleTask != null) {
+                        idleTask.cancel(false);
+                    }
                 })
                 .subscribe();
         disposableHolder.set(disposable);
@@ -298,6 +304,10 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         ScheduledFuture<?> task = intervalTasks.remove(streamName);
         if (task != null) {
             task.cancel(false);
+        }
+        ScheduledFuture<?> idleTask = idleProbeTasks.remove(streamName);
+        if (idleTask != null) {
+            idleTask.cancel(false);
         }
         latestTokens.remove(streamName);
 
@@ -635,24 +645,36 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             return;
         }
         int intervalSeconds = def.checkpointAnnotation().saveIntervalSeconds();
-        if (intervalSeconds <= 0) {
+        if (intervalSeconds <= 0 && def.checkpointAnnotation().idleHeartbeatIntervalSeconds() <= 0) {
             return;
         }
         String streamName = def.streamName();
-        // The heartbeat advances ONLY lastSeenToken (+ lastHeartbeatTimestamp).
+        // Two independent cadences on the shared scheduler thread:
+        // - flush (saveIntervalSeconds): dirty-only write coalescing, no cursor;
+        // - idle heartbeat (idleHeartbeatIntervalSeconds): probe-based oplog
+        //   rollover protection, active only when the main cursor stalls.
+        // Both advance ONLY lastSeenToken (+ lastHeartbeatTimestamp);
         // lastProcessedToken is managed by saveCheckpointIfNeeded after
         // confirmed handler success. The persisted-token fallback is limited
         // to RESUME streams: LATEST semantics ignore persisted tokens.
+        int idleSeconds = def.checkpointAnnotation().idleHeartbeatIntervalSeconds();
         CheckpointHeartbeat heartbeat = new CheckpointHeartbeat(
                 streamName, checkpointStore, probe,
                 () -> latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>()),
-                def.checkpointAnnotation().startPosition() == StartPosition.RESUME);
+                def.checkpointAnnotation().startPosition() == StartPosition.RESUME,
+                Duration.ofSeconds(idleSeconds));
         heartbeats.put(streamName, heartbeat);
-        // initialDelay 0: the first tick runs the probe right away so an
-        // incompatible pipeline fails loudly at startup, not weeks later.
-        ScheduledFuture<?> future = intervalScheduler.scheduleAtFixedRate(
-                heartbeat::tick, 0, intervalSeconds, TimeUnit.SECONDS);
-        intervalTasks.put(streamName, future);
+        if (intervalSeconds > 0) {
+            intervalTasks.put(streamName, intervalScheduler.scheduleAtFixedRate(
+                    heartbeat::flushTick, intervalSeconds, intervalSeconds, TimeUnit.SECONDS));
+        }
+        if (idleSeconds > 0) {
+            idleProbeTasks.put(streamName, intervalScheduler.scheduleAtFixedRate(
+                    heartbeat::idleTick, idleSeconds, idleSeconds, TimeUnit.SECONDS));
+            // Explicit one-shot validation: an incompatible probe pipeline
+            // fails loudly at startup, not an idle-interval later.
+            intervalScheduler.execute(heartbeat::startupValidation);
+        }
     }
 
     private void saveCheckpointIfNeeded(ChangeStreamDefinition def, BsonDocument token, Instant timestamp) {

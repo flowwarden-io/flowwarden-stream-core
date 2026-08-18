@@ -127,11 +127,26 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                                 + " has saveEveryN=" + cpAnnotation.saveEveryN()
                                 + " (must be >= 1; saveEveryN controls how often lastProcessedToken is persisted)");
             }
-            if (cpAnnotation.saveIntervalSeconds() == 0 && cpAnnotation.saveEveryN() > 1) {
-                log.warn("@Checkpoint on {} has saveIntervalSeconds=0 and saveEveryN={} — "
-                                + "the heartbeat timer is disabled, so the resume cascade level-2 safety net "
-                                + "(fallback to lastSeenToken when lastProcessedToken ages out) will not work. "
-                                + "Consider setting saveIntervalSeconds > 0 or saveEveryN = 1.",
+            if (cpAnnotation.idleHeartbeatIntervalSeconds() < 0) {
+                throw new BeanCreationException(beanName,
+                        "@Checkpoint on " + targetClass.getName()
+                                + " has negative idleHeartbeatIntervalSeconds: "
+                                + cpAnnotation.idleHeartbeatIntervalSeconds());
+            }
+            if (cpAnnotation.idleHeartbeatIntervalSeconds() == 0) {
+                log.warn("@Checkpoint on {} has idleHeartbeatIntervalSeconds=0 — idle probing is "
+                                + "disabled, so a stream that stays idle longer than the oplog window "
+                                + "loses its resume point (ChangeStreamHistoryLost on restart). "
+                                + "Only disable this if the collection is guaranteed to receive "
+                                + "regular traffic.",
+                        targetClass.getName());
+            }
+            if (cpAnnotation.saveIntervalSeconds() == 0 && cpAnnotation.saveEveryN() > 1
+                    && cpAnnotation.idleHeartbeatIntervalSeconds() == 0) {
+                log.warn("@Checkpoint on {} has saveIntervalSeconds=0, idleHeartbeatIntervalSeconds=0 "
+                                + "and saveEveryN={} — lastSeenToken never advances, so the resume "
+                                + "cascade level-2 safety net (fallback to lastSeenToken when "
+                                + "lastProcessedToken ages out) will not work.",
                         targetClass.getName(), cpAnnotation.saveEveryN());
             }
         }

@@ -22,27 +22,38 @@ import org.bson.BsonValue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /**
- * Tick logic of the {@code saveIntervalSeconds} checkpoint heartbeat, shared
- * by both stream managers.
+ * Checkpoint heartbeat shared by both stream managers, carrying two
+ * independent periodic responsibilities:
  *
- * <p>Each tick either persists a fresh event token, or — when no event
- * arrived since the last persisted position — runs a {@link HeartbeatProbe}
- * chained from the last known position. The probe may only advance
- * {@code lastSeenToken} across an interval the server certified empty; a
- * concurrent event token always wins via compare-and-set on the shared
- * in-memory snapshot.</p>
+ * <ul>
+ *   <li>{@link #flushTick()} — write-pressure coalescing, driven by
+ *       {@code saveIntervalSeconds}: persists the latest <em>event</em> token
+ *       only if it changed since the last flush. Never opens a cursor.</li>
+ *   <li>{@link #idleTick()} — oplog-rollover protection, driven by
+ *       {@code idleHeartbeatIntervalSeconds}: when the main cursor has not
+ *       delivered anything for the idle threshold, runs a
+ *       {@link HeartbeatProbe} chained from the last known position and — on
+ *       a server-certified empty interval — advances the persisted position
+ *       to the returned PBRT. Any main-cursor activity re-arms the delay;
+ *       active streams never probe.</li>
+ * </ul>
+ *
+ * <p>{@link #startupValidation()} runs one probe at stream start regardless
+ * of idleness, so an incompatible pipeline fails loudly at boot instead of an
+ * idle-interval later.</p>
  *
  * <p>Correctness properties enforced here:</p>
  * <ul>
  *   <li><strong>Seeds are not events.</strong> A resume position installed at
  *       startup ({@link TokenSnapshot.Source#SEED}) is a chaining point, never
  *       a "newly delivered" token — a {@code PROCESSED_FIRST} resume seeds the
- *       (older) processed token, and persisting it as seen would destroy the
+ *       (older) processed token, and flushing it as seen would destroy the
  *       level-2 safety net.</li>
  *   <li><strong>Seen never regresses.</strong> Every seen write is guarded by
  *       a monotonicity check against the persisted high-water mark (resume
@@ -51,8 +62,8 @@ import java.util.function.Supplier;
  *       bounded-scan intermediate PBRTs are downgraded to heartbeat-only
  *       writes.</li>
  *   <li><strong>No write after cancellation.</strong> Stream cleanup calls
- *       {@link #cancel()} before cancelling the scheduled task; the tick
- *       re-checks the flag immediately before every store write, so a slow
+ *       {@link #cancel()} before cancelling the scheduled tasks; both ticks
+ *       re-check the flag immediately before every store write, so a slow
  *       in-flight probe cannot stamp a fresh heartbeat on a dead stream.</li>
  * </ul>
  *
@@ -62,10 +73,18 @@ public final class CheckpointHeartbeat {
 
     private static final Logger log = LoggerFactory.getLogger(CheckpointHeartbeat.class);
 
+    /**
+     * Consecutive probe abstentions before warning: a probe abstaining in a
+     * loop means matching events keep sitting undelivered — the stream is
+     * lagging or stuck. Not a probe error, but worth surfacing.
+     */
+    static final int ABSTENTION_WARN_THRESHOLD = 3;
+
     private final String streamName;
     private final CheckpointStore checkpointStore;
     private final HeartbeatProbe probe;
     private final Supplier<AtomicReference<TokenSnapshot>> latestTokenRef;
+    private final Duration idleThreshold;
 
     /**
      * Whether the probe may fall back to the persisted {@code lastSeenToken}
@@ -87,100 +106,151 @@ public final class CheckpointHeartbeat {
 
     /**
      * Highest {@code lastSeenToken} known to be persisted (loaded from the
-     * checkpoint on the first tick, updated on every successful seen write).
+     * checkpoint on first use, updated on every successful seen write).
      * Guard against regressions. Scheduler-thread only.
      */
     private BsonDocument seenHighWaterMark;
     private boolean highWaterMarkLoaded;
 
+    /** Consecutive EVENT_PENDING outcomes. Scheduler-thread only. */
+    private int consecutiveAbstentions;
+
     public CheckpointHeartbeat(String streamName,
                                CheckpointStore checkpointStore,
                                HeartbeatProbe probe,
                                Supplier<AtomicReference<TokenSnapshot>> latestTokenRef,
-                               boolean allowPersistedFallback) {
+                               boolean allowPersistedFallback,
+                               Duration idleThreshold) {
         this.streamName = streamName;
         this.checkpointStore = checkpointStore;
         this.probe = probe;
         this.latestTokenRef = latestTokenRef;
         this.allowPersistedFallback = allowPersistedFallback;
+        this.idleThreshold = idleThreshold;
     }
 
     /**
      * Invalidates this heartbeat: no store write will happen after this call
      * returns (a write already in flight on the wire is the only residual
      * window). Must be called by stream cleanup BEFORE cancelling the
-     * scheduled task, so an in-flight tick cannot stamp a dead stream.
+     * scheduled tasks, so an in-flight tick cannot stamp a dead stream.
      */
     public void cancel() {
         cancelled = true;
     }
 
     /**
-     * Runs one heartbeat tick. Never throws.
+     * Write-coalescing flush ({@code saveIntervalSeconds} cadence): persists
+     * the latest event token only if dirty. Clean tick → zero writes, zero
+     * cursors. Never throws.
      */
-    public void tick() {
+    public void flushTick() {
         if (cancelled) {
             return;
         }
         try {
-            doTick();
+            TokenSnapshot snapshot = latestTokenRef.get().get();
+            if (snapshot == null
+                    || snapshot.source() != TokenSnapshot.Source.EVENT
+                    || snapshot.token().equals(lastPersistedSeen)) {
+                return; // nothing dirty — SEED positions are never flushed
+            }
+            loadHighWaterMarkIfNeeded();
+            persistSeen(snapshot.token(), snapshot.timestamp(), Instant.now(),
+                    "event token below persisted seen (replay) — heartbeat only");
         } catch (Exception e) {
             FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
-            log.warn("Failed to save periodic checkpoint for stream '{}': {}",
+            log.warn("Failed to flush periodic checkpoint for stream '{}': {}",
                     streamName, e.getMessage(), e);
         }
     }
 
-    private void doTick() {
-        Instant now = Instant.now();
-        AtomicReference<TokenSnapshot> ref = latestTokenRef.get();
-        TokenSnapshot snapshot = ref.get();
-
-        if (!highWaterMarkLoaded) {
-            seenHighWaterMark = persistedSeenToken();
-            highWaterMarkLoaded = true;
-        }
-
-        // Case 1: a fresh EVENT token arrived since the last persisted
-        // position. SEED snapshots are chaining positions, not deliveries.
-        if (snapshot != null
-                && snapshot.source() == TokenSnapshot.Source.EVENT
-                && !snapshot.token().equals(lastPersistedSeen)) {
-            persistSeen(snapshot.token(), snapshot.timestamp(), now,
-                    "event token below persisted seen (replay) — heartbeat only");
+    /**
+     * Idle-protection tick ({@code idleHeartbeatIntervalSeconds} cadence):
+     * probes only when the main cursor has not delivered anything for the
+     * idle threshold. Never throws.
+     */
+    public void idleTick() {
+        if (cancelled) {
             return;
         }
+        try {
+            TokenSnapshot snapshot = latestTokenRef.get().get();
+            if (snapshot != null
+                    && Duration.between(snapshot.timestamp(), Instant.now())
+                            .compareTo(idleThreshold) < 0) {
+                return; // the main cursor progressed recently — not idle
+            }
+            runProbe(snapshot);
+        } catch (Exception e) {
+            FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
+            log.warn("Failed idle heartbeat for stream '{}': {}", streamName, e.getMessage(), e);
+        }
+    }
 
-        // Case 2: no fresh event — probe, chained from the last known
-        // position (in-memory snapshot first; persisted lastSeenToken only
-        // for RESUME streams).
+    /**
+     * One-shot probe at stream start, bypassing the idleness precondition:
+     * validates the probe pipeline against the server so an incompatibility
+     * fails loudly at boot (WARN + {@code onHeartbeatProbeFailed}) instead of
+     * an idle-interval later. Never throws.
+     */
+    public void startupValidation() {
+        if (cancelled) {
+            return;
+        }
+        try {
+            runProbe(latestTokenRef.get().get());
+        } catch (Exception e) {
+            FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
+            log.warn("Startup heartbeat validation failed for stream '{}': {}",
+                    streamName, e.getMessage(), e);
+        }
+    }
+
+    private void runProbe(TokenSnapshot snapshot) {
+        loadHighWaterMarkIfNeeded();
         BsonDocument chainToken = snapshot != null ? snapshot.token()
                 : (allowPersistedFallback ? persistedSeenToken() : null);
         if (chainToken == null) {
             // No position exists to chain from (e.g. StartPosition.LATEST with
             // no event yet). Probing from "now" is unsafe — skip.
-            log.debug("Heartbeat skipped for stream '{}': no position to chain from", streamName);
+            log.debug("Heartbeat probe skipped for stream '{}': no position to chain from",
+                    streamName);
             return;
         }
 
         ProbeOutcome outcome = probe.probe(chainToken);
         switch (outcome.type()) {
-            case EVENT_PENDING ->
+            case EVENT_PENDING -> {
                 // Undelivered events sit between the chained token and the
-                // head — the main stream must deliver them first.
-                log.debug("Heartbeat abstained for stream '{}': events pending delivery", streamName);
+                // head — the main stream must deliver them first. Repeated
+                // abstentions mean the stream is lagging or stuck.
+                consecutiveAbstentions++;
+                if (consecutiveAbstentions == ABSTENTION_WARN_THRESHOLD) {
+                    log.warn("Heartbeat probe abstained {} consecutive times for stream '{}': "
+                                    + "matching events keep sitting undelivered — the main stream "
+                                    + "appears to be lagging or stuck",
+                            consecutiveAbstentions, streamName);
+                } else {
+                    log.debug("Heartbeat abstained for stream '{}': events pending delivery",
+                            streamName);
+                }
+            }
             case FAILED -> {
+                consecutiveAbstentions = 0;
                 FlowWardenMetrics.get().onHeartbeatProbeFailed(streamName, outcome.cause());
                 log.warn("Heartbeat probe failed for stream '{}': {}", streamName,
                         outcome.cause() != null ? outcome.cause().getMessage() : "unknown",
                         outcome.cause());
             }
-            case EMPTY -> persistCertifiedPosition(ref, snapshot, chainToken, outcome.pbrt(), now);
+            case EMPTY -> {
+                consecutiveAbstentions = 0;
+                persistCertifiedPosition(snapshot, chainToken, outcome.pbrt(), Instant.now());
+            }
         }
     }
 
-    private void persistCertifiedPosition(AtomicReference<TokenSnapshot> ref,
-                                          TokenSnapshot snapshot,
+    private void persistCertifiedPosition(TokenSnapshot snapshot,
                                           BsonDocument chainToken,
                                           BsonDocument pbrt,
                                           Instant now) {
@@ -190,6 +260,7 @@ public final class CheckpointHeartbeat {
             return;
         }
         // An event delivered while the probe was in flight always wins.
+        AtomicReference<TokenSnapshot> ref = latestTokenRef.get();
         if (!ref.compareAndSet(snapshot, new TokenSnapshot(pbrt, now, TokenSnapshot.Source.SEED))) {
             log.debug("Heartbeat probe result discarded for stream '{}': event token won the race",
                     streamName);
@@ -230,6 +301,13 @@ public final class CheckpointHeartbeat {
         }
         checkpointStore.saveHeartbeat(streamName, now);
         log.debug("Heartbeat-only write for stream '{}': {}", streamName, reason);
+    }
+
+    private void loadHighWaterMarkIfNeeded() {
+        if (!highWaterMarkLoaded) {
+            seenHighWaterMark = persistedSeenToken();
+            highWaterMarkLoaded = true;
+        }
     }
 
     /**

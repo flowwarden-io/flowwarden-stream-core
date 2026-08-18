@@ -153,7 +153,7 @@ class ImperativeHeartbeatPipelineParityIntegrationTest {
     @ChangeStream(name = STREAM_NAME, collection = COLLECTION,
             documentType = Document.class, autoStart = false,
             fullDocument = FullDocumentMode.UPDATE_LOOKUP)
-    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1)
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 1)
     static class FilteredHandler {
 
         private final List<Document> events = new CopyOnWriteArrayList<>();

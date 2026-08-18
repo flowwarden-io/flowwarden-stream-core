@@ -157,7 +157,7 @@ class ReactiveIdleHeartbeatIntegrationTest {
 
     @ChangeStream(name = STREAM_NAME, collection = COLLECTION,
             documentType = Document.class, autoStart = false)
-    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1)
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 1)
     static class ReactiveIdleHandler {
 
         private final List<Document> docs = new CopyOnWriteArrayList<>();
