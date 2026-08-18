@@ -69,6 +69,33 @@ public class MongoCheckpointStore implements CheckpointStore {
     }
 
     @Override
+    public void saveSeen(String streamName, BsonDocument token, Instant timestamp,
+                         Instant heartbeatTimestamp) {
+        // Single atomic update: position and its confirmation are never
+        // observable in an intermediate state.
+        Update update = new Update()
+                .set("lastSeenToken", bsonToDocument(token))
+                .set("lastSeenTimestamp", timestamp)
+                .set("lastHeartbeatTimestamp", heartbeatTimestamp);
+        mongoTemplate.upsert(
+                Query.query(Criteria.where("_id").is(streamName)),
+                update,
+                COLLECTION
+        );
+    }
+
+    @Override
+    public void saveHeartbeat(String streamName, Instant heartbeatTimestamp) {
+        Update update = new Update()
+                .set("lastHeartbeatTimestamp", heartbeatTimestamp);
+        mongoTemplate.upsert(
+                Query.query(Criteria.where("_id").is(streamName)),
+                update,
+                COLLECTION
+        );
+    }
+
+    @Override
     public void saveProcessed(String streamName, BsonDocument token, Instant timestamp) {
         Update update = new Update()
                 .set("lastProcessedToken", bsonToDocument(token))
@@ -96,6 +123,7 @@ public class MongoCheckpointStore implements CheckpointStore {
         doc.put("lastSeenTimestamp", cp.lastSeenTimestamp());
         doc.put("lastProcessedToken", bsonToDocument(cp.lastProcessedToken()));
         doc.put("lastProcessedTimestamp", cp.lastProcessedTimestamp());
+        doc.put("lastHeartbeatTimestamp", cp.lastHeartbeatTimestamp());
         doc.put("metadata", cp.metadata() != null ? new Document(cp.metadata()) : null);
         return doc;
     }
@@ -108,6 +136,7 @@ public class MongoCheckpointStore implements CheckpointStore {
                 dateToInstant(doc.get("lastSeenTimestamp", Date.class)),
                 documentToBson(doc.get("lastProcessedToken", Document.class)),
                 dateToInstant(doc.get("lastProcessedTimestamp", Date.class)),
+                dateToInstant(doc.get("lastHeartbeatTimestamp", Date.class)),
                 toMetadataMap(doc.get("metadata", Document.class))
         );
     }

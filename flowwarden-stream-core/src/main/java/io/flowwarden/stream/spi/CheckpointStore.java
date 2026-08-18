@@ -74,6 +74,65 @@ public interface CheckpointStore {
                 timestamp,
                 current.lastProcessedToken(),
                 current.lastProcessedTimestamp(),
+                current.lastHeartbeatTimestamp(),
+                current.metadata()
+        ));
+    }
+
+    /**
+     * Updates the {@code lastSeenToken} pair together with
+     * {@code lastHeartbeatTimestamp} for the given stream, leaving
+     * {@code lastProcessedToken} and {@code lastProcessedTimestamp} untouched.
+     *
+     * <p>Used by the heartbeat when a new gap-free position is confirmed
+     * (fresh event token, or empty probe returning a new PBRT). The default
+     * implementation delegates to
+     * {@link #saveSeen(String, BsonDocument, Instant)} followed by
+     * {@link #saveHeartbeat(String, Instant)} — <strong>two writes, not
+     * atomic</strong>: a crash between them can leave the position advanced
+     * without its confirmation, or third parties may observe the intermediate
+     * state. Implementations backed by a store supporting multi-field updates
+     * (the shipped Mongo stores do) should override with a single atomic
+     * write.</p>
+     *
+     * @param streamName         the stream identifier (must not be null)
+     * @param token              the new {@code lastSeenToken} value (must not be null)
+     * @param timestamp          the new {@code lastSeenTimestamp} value (must not be null)
+     * @param heartbeatTimestamp the new {@code lastHeartbeatTimestamp} value (must not be null)
+     */
+    default void saveSeen(String streamName, BsonDocument token, Instant timestamp,
+                          Instant heartbeatTimestamp) {
+        saveSeen(streamName, token, timestamp);
+        saveHeartbeat(streamName, heartbeatTimestamp);
+    }
+
+    /**
+     * Updates only {@code lastHeartbeatTimestamp} for the given stream, leaving
+     * every token and timestamp untouched.
+     *
+     * <p>Used by the heartbeat when a probe re-certifies the current position
+     * without advancing it (empty probe returning the same PBRT): the position
+     * is unchanged but its validity has just been confirmed. Never called on
+     * probe abstentions or failures.</p>
+     *
+     * <p>The default implementation falls back to
+     * {@link #findByStreamName(String)} followed by {@link #save(Checkpoint)}
+     * so external implementations continue to work unchanged.</p>
+     *
+     * @param streamName         the stream identifier (must not be null)
+     * @param heartbeatTimestamp the new {@code lastHeartbeatTimestamp} value (must not be null)
+     */
+    default void saveHeartbeat(String streamName, Instant heartbeatTimestamp) {
+        Checkpoint current = findByStreamName(streamName).orElseGet(() ->
+                new Checkpoint(streamName, null, null, null, null, null, Map.of()));
+        save(new Checkpoint(
+                current.streamName(),
+                current.instanceId(),
+                current.lastSeenToken(),
+                current.lastSeenTimestamp(),
+                current.lastProcessedToken(),
+                current.lastProcessedTimestamp(),
+                heartbeatTimestamp,
                 current.metadata()
         ));
     }
@@ -106,6 +165,7 @@ public interface CheckpointStore {
                 current.lastSeenTimestamp(),
                 token,
                 timestamp,
+                current.lastHeartbeatTimestamp(),
                 current.metadata()
         ));
     }

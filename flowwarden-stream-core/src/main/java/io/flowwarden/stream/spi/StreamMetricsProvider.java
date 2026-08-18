@@ -157,6 +157,27 @@ public interface StreamMetricsProvider {
     default void onResumeHistoryLost(String streamName) {}
 
     /**
+     * Called when a checkpoint heartbeat probe fails while the stream itself
+     * keeps running: transient backend error, bounded-read timeout, a reply
+     * carrying a null post-batch resume token, or a chained resume token that
+     * has already aged out of the oplog ({@code ChangeStreamHistoryLost}).
+     *
+     * <p>A probe failure never stops the stream and never writes to the
+     * checkpoint — {@code lastHeartbeatTimestamp} does not move. Repeated
+     * failures therefore surface as an aging heartbeat; this callback carries
+     * the cause so monitoring can distinguish a transient outage from a
+     * resume point that is no longer recoverable.</p>
+     *
+     * <p>Distinct from {@link #onResumeHistoryLost(String)}, which describes
+     * the startup resume cascade: a heartbeat failure happens while a live
+     * cursor keeps delivering events.</p>
+     *
+     * @param streamName stream identifier
+     * @param cause      the failure cause
+     */
+    default void onHeartbeatProbeFailed(String streamName, Throwable cause) {}
+
+    /**
      * Called periodically with the current lag between {@code lastSeenToken}
      * and {@code lastProcessedToken}. Useful for monitoring streams whose
      * handlers fall behind or get stuck.

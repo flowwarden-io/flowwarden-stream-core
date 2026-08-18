@@ -181,4 +181,85 @@ public abstract class CheckpointStoreContractTest {
         assertNull(found.lastSeenToken());
         assertNull(found.lastSeenTimestamp());
     }
+
+    @Test
+    void saveAndFind_roundTripsHeartbeatTimestamp() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var token = BsonDocument.parse("{\"_data\": \"hb-roundtrip\"}");
+
+        store.save(new Checkpoint("s", null, token, now, token, now, now,
+                Collections.emptyMap()));
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertEquals(now, found.lastHeartbeatTimestamp());
+    }
+
+    @Test
+    void saveSeenWithHeartbeat_writesPositionAndConfirmationTogether() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var processed = BsonDocument.parse("{\"_data\": \"processed-1\"}");
+        var seen = BsonDocument.parse("{\"_data\": \"seen-2\"}");
+        var later = now.plusSeconds(10);
+        var heartbeat = now.plusSeconds(11);
+
+        store.save(new Checkpoint("s", null, null, null, processed, now,
+                Collections.emptyMap()));
+
+        store.saveSeen("s", seen, later, heartbeat);
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertEquals(seen, found.lastSeenToken());
+        assertEquals(later, found.lastSeenTimestamp());
+        assertEquals(heartbeat, found.lastHeartbeatTimestamp());
+        assertEquals(processed, found.lastProcessedToken());
+        assertEquals(now, found.lastProcessedTimestamp());
+    }
+
+    @Test
+    void saveHeartbeat_touchesOnlyTheHeartbeatTimestamp() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var seen = BsonDocument.parse("{\"_data\": \"seen-1\"}");
+        var processed = BsonDocument.parse("{\"_data\": \"processed-1\"}");
+        var heartbeat = now.plusSeconds(30);
+
+        store.save(new Checkpoint("s", null, seen, now, processed, now,
+                Collections.emptyMap()));
+
+        store.saveHeartbeat("s", heartbeat);
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertEquals(heartbeat, found.lastHeartbeatTimestamp());
+        assertEquals(seen, found.lastSeenToken());
+        assertEquals(now, found.lastSeenTimestamp());
+        assertEquals(processed, found.lastProcessedToken());
+        assertEquals(now, found.lastProcessedTimestamp());
+    }
+
+    @Test
+    void saveHeartbeat_createsDocumentIfMissing() {
+        var heartbeat = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+
+        store.saveHeartbeat("new-stream", heartbeat);
+
+        var found = store.findByStreamName("new-stream").orElseThrow();
+        assertEquals(heartbeat, found.lastHeartbeatTimestamp());
+        assertNull(found.lastSeenToken());
+        assertNull(found.lastProcessedToken());
+    }
+
+    @Test
+    void saveProcessed_preservesHeartbeatTimestamp() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var seen = BsonDocument.parse("{\"_data\": \"seen-1\"}");
+        var processed = BsonDocument.parse("{\"_data\": \"processed-2\"}");
+
+        store.save(new Checkpoint("s", null, seen, now, null, null, now,
+                Collections.emptyMap()));
+
+        store.saveProcessed("s", processed, now.plusSeconds(5));
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertEquals(now, found.lastHeartbeatTimestamp());
+        assertEquals(processed, found.lastProcessedToken());
+    }
 }
