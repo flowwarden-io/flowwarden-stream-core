@@ -36,11 +36,13 @@ import java.lang.annotation.Target;
  *
  * <ul>
  *   <li><strong>{@code lastSeenToken}</strong> — advances on <em>every</em> event
- *       received from MongoDB, including events rejected by {@code @Filter}, events
- *       with no matching handler, and events being retried. The
- *       {@link #saveIntervalSeconds() periodic timer} persists this token even when
- *       the handler never runs, keeping the stream recoverable on idle or
- *       massively-filtered workloads.</li>
+ *       received from MongoDB (including events rejected by {@code @Filter}, events
+ *       with no matching handler, and events being retried), and — when no event
+ *       arrives — through the {@link #saveIntervalSeconds() heartbeat}: a bounded,
+ *       ephemeral change stream probe chained from the last delivered position
+ *       fetches a server-certified post-batch resume token, so the persisted
+ *       position keeps tracking the oplog head with zero traffic. This keeps the
+ *       stream recoverable on idle or massively-filtered workloads.</li>
  *   <li><strong>{@code lastProcessedToken}</strong> — advances only when a handler
  *       method returns successfully (or the event is acknowledged by the DLQ
  *       pipeline). The {@link #saveEveryN() counter} persists this token at the
@@ -91,15 +93,26 @@ public @interface Checkpoint {
     int saveEveryN() default 1;
 
     /**
-     * Periodic timer interval in seconds for persisting {@code lastSeenToken}.
+     * Heartbeat interval in seconds for persisting {@code lastSeenToken}.
      *
-     * <p>The timer advances {@code lastSeenToken} based on the most recent event
-     * received (including filtered or no-handler events), which keeps the stream
-     * recoverable even when the handler doesn't run. This is the level-2 safety
-     * net of the resume cascade.</p>
+     * <p>Each tick persists the most recent event received (including filtered
+     * or no-handler events). When no event arrived since the previous tick,
+     * the heartbeat instead opens an ephemeral, bounded change stream cursor
+     * chained from the last delivered position (same pipeline and
+     * {@code fullDocument} options as the stream, stamped with a
+     * {@code flowwarden:heartbeat:&lt;stream&gt;} comment) and — when the
+     * server certifies the interval empty — advances {@code lastSeenToken} to
+     * the returned post-batch resume token. Idle streams therefore stay
+     * recoverable indefinitely: the persisted position tracks the oplog head
+     * instead of freezing until it ages out. This is the level-2 safety net of
+     * the resume cascade.</p>
+     *
+     * <p>The checkpoint's {@code lastHeartbeatTimestamp} records the last time
+     * a recoverable position was confirmed; its age is the operational signal
+     * for resume-point health.</p>
      *
      * <p>{@code 5} (default) is a balanced value; set to {@code 0} to disable
-     * the timer (disables cascade level 2 — the stream is then nude against
+     * the heartbeat (disables cascade level 2 — the stream is then nude against
      * oplog rollover on idle / massively-filtered workloads).</p>
      */
     int saveIntervalSeconds() default 5;

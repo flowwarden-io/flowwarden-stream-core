@@ -74,8 +74,11 @@ class ImperativeHeartbeatSafetyIntegrationTest {
     private static final String LAG_COLLECTION = "hb_lagging";
     private static final String EXPIRED_STREAM = "hb-expired";
     private static final String EXPIRED_COLLECTION = "hb_expired";
+    // Invalid as a resume point, but lexicographically BELOW any real token
+    // ("82…"-prefixed) so the monotonicity guard doesn't pin the checkpoint to
+    // it after recovery.
     private static final BsonDocument EXPIRED_TOKEN =
-            BsonDocument.parse("{\"_data\": \"DEADBEEF\"}");
+            BsonDocument.parse("{\"_data\": \"0000DEAD\"}");
 
     @DynamicPropertySource
     static void mongoProperties(DynamicPropertyRegistry registry) {

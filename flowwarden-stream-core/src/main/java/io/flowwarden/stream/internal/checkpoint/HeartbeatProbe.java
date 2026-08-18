@@ -36,10 +36,27 @@ public interface HeartbeatProbe {
     /**
      * Probes the stream's change stream from the given position.
      *
-     * @param resumeAfter the token to chain from, or {@code null} to open the
-     *                    cursor at the current position (bootstrap only —
-     *                    never used while a prior position exists)
+     * @param resumeAfter the token to chain from (never null — probing from
+     *                    "now" cannot certify anything about a lagging main
+     *                    cursor; the only now-anchored read is
+     *                    {@link #initialPosition()})
      * @return the probe outcome; never throws
      */
     ProbeOutcome probe(BsonDocument resumeAfter);
+
+    /**
+     * Captures the server's current position for a stream that has no prior
+     * one, from the change stream aggregate's <em>initial</em> reply — before
+     * any {@code getMore}, and therefore before any event can be returned and
+     * lost in a cursor hand-off. The main stream must be opened with
+     * {@code resumeAfter(returned PBRT)}: every event committed after this
+     * capture, including during the hand-off window, falls inside the main
+     * stream's resume range.
+     *
+     * @return the initial PBRT; never null
+     * @throws RuntimeException if the aggregate fails or the reply carries no
+     *                          post-batch resume token — bootstrap is a
+     *                          startup precondition, not a best effort
+     */
+    BsonDocument initialPosition();
 }

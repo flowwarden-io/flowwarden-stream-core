@@ -46,7 +46,6 @@ import io.flowwarden.stream.spi.ChangeEventMetadata;
 import io.flowwarden.stream.spi.StopReason;
 import io.flowwarden.stream.spi.StreamConfiguration;
 import io.flowwarden.stream.internal.checkpoint.CheckpointHeartbeat;
-import io.flowwarden.stream.internal.checkpoint.ProbeOutcome;
 import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqPolicy;
@@ -104,6 +103,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
     private final Map<String, AtomicReference<TokenSnapshot>> latestTokens = new ConcurrentHashMap<>();
     private final Map<String, Instant> lastActivityTimes = new ConcurrentHashMap<>();
     private final Map<String, ScheduledFuture<?>> intervalTasks = new ConcurrentHashMap<>();
+    private final Map<String, CheckpointHeartbeat> heartbeats = new ConcurrentHashMap<>();
     private final ScheduledExecutorService intervalScheduler =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "fw-checkpoint-interval");
@@ -210,9 +210,12 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
 
         // Seed the in-memory snapshot with the resume position so the first
         // heartbeat probe chains from it instead of waiting for an event.
+        // SEED, not EVENT: a resume position (possibly the older processed
+        // token under PROCESSED_FIRST) must never be persisted as a newly
+        // delivered seen token.
         if (seedToken != null) {
             latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>())
-                    .set(new TokenSnapshot(seedToken, Instant.now()));
+                    .set(new TokenSnapshot(seedToken, Instant.now(), TokenSnapshot.Source.SEED));
         }
 
         streams.put(streamName, new StreamState(container, subscription, def));
@@ -224,6 +227,13 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
 
     @Override
     public void stopStream(String streamName) {
+        // Invalidate the heartbeat BEFORE cancelling its task: cancel(false)
+        // lets an in-flight tick finish, and it must not write for a stream
+        // being stopped.
+        CheckpointHeartbeat heartbeat = heartbeats.remove(streamName);
+        if (heartbeat != null) {
+            heartbeat.cancel();
+        }
         ScheduledFuture<?> task = intervalTasks.remove(streamName);
         if (task != null) {
             task.cancel(false);
@@ -261,6 +271,10 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         lastActivityTimes.remove(streamName);
         eventCounters.remove(streamName);
         latestTokens.remove(streamName);
+        CheckpointHeartbeat heartbeat = heartbeats.remove(streamName);
+        if (heartbeat != null) {
+            heartbeat.cancel();
+        }
         ScheduledFuture<?> task = intervalTasks.remove(streamName);
         if (task != null) {
             task.cancel(false);
@@ -557,10 +571,13 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         String streamName = def.streamName();
         // The heartbeat advances ONLY lastSeenToken (+ lastHeartbeatTimestamp).
         // lastProcessedToken is managed by saveCheckpointIfNeeded after
-        // confirmed handler success.
+        // confirmed handler success. The persisted-token fallback is limited
+        // to RESUME streams: LATEST semantics ignore persisted tokens.
         CheckpointHeartbeat heartbeat = new CheckpointHeartbeat(
                 streamName, checkpointStore, probe,
-                () -> latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>()));
+                () -> latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>()),
+                def.checkpointAnnotation().startPosition() == StartPosition.RESUME);
+        heartbeats.put(streamName, heartbeat);
         // initialDelay 0: the first tick runs the probe right away so an
         // incompatible pipeline fails loudly at startup, not weeks later.
         ScheduledFuture<?> future = intervalScheduler.scheduleAtFixedRate(
@@ -685,36 +702,29 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
     }
 
     /**
-     * Bootstrap for a stream with no usable prior position: capture an initial
-     * PBRT via the heartbeat probe, resume the main stream after it, and
-     * persist it immediately. Falls back to starting from "now" (current
-     * behavior) when the probe sees traffic or fails — incoming events then
-     * seed the checkpoint on delivery.
+     * Bootstrap for a stream with no usable prior position: capture the
+     * server's current position from the change stream's <em>initial</em>
+     * reply (before any event can be returned — no cursor hand-off window),
+     * persist it, and resume the main stream after it. Both the capture and
+     * the persistence are startup preconditions: a failure propagates instead
+     * of silently starting an unprotected, non-durable stream.
      */
     private BsonDocument bootstrapInitialPosition(String streamName,
                                                   ChangeStreamRequest.ChangeStreamRequestBuilder<Document> builder,
                                                   ImperativeHeartbeatProbe probe) {
-        ProbeOutcome outcome = probe.probe(null);
-        if (outcome.type() != ProbeOutcome.Type.EMPTY) {
-            if (outcome.type() == ProbeOutcome.Type.FAILED) {
-                FlowWardenMetrics.get().onHeartbeatProbeFailed(streamName, outcome.cause());
-                log.warn("Bootstrap probe failed for stream '{}' — starting from now: {}",
-                        streamName,
-                        outcome.cause() != null ? outcome.cause().getMessage() : "unknown");
-            }
-            return null; // traffic or failure → start from now, events will seed
-        }
-        BsonDocument pbrt = outcome.pbrt();
-        builder.resumeAfter(pbrt);
+        BsonDocument pbrt = probe.initialPosition();
         Instant now = Instant.now();
         try {
             checkpointStore.saveSeen(streamName, pbrt, now, now);
-            FlowWardenMetrics.get().onCheckpoint(streamName, pbrt.toJson());
         } catch (RuntimeException e) {
+            // A non-durable position cannot guarantee at-least-once: a crash
+            // before the next checkpoint would silently restart from a newer
+            // position. Fail the startup.
             FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
-            log.warn("Failed to persist bootstrap position for stream '{}': {}",
-                    streamName, e.getMessage(), e);
+            throw e;
         }
+        FlowWardenMetrics.get().onCheckpoint(streamName, pbrt.toJson());
+        builder.resumeAfter(pbrt);
         log.info("Bootstrapped stream '{}' from an initial server-certified position", streamName);
         return pbrt;
     }

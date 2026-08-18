@@ -15,11 +15,8 @@
  */
 package io.flowwarden.stream.internal.reactive;
 
-import com.mongodb.client.model.changestream.FullDocument;
-import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
 import com.mongodb.reactivestreams.client.MongoDatabase;
-import io.flowwarden.stream.FullDocumentBeforeChangeMode;
-import io.flowwarden.stream.FullDocumentMode;
+import io.flowwarden.stream.internal.checkpoint.ChangeStreamProbeCommands;
 import io.flowwarden.stream.internal.checkpoint.HeartbeatProbe;
 import io.flowwarden.stream.internal.checkpoint.ProbeOutcome;
 import io.flowwarden.stream.internal.discovery.ChangeStreamDefinition;
@@ -31,8 +28,8 @@ import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Raw-command {@link HeartbeatProbe} for REACTIVE mode.
@@ -72,19 +69,18 @@ final class ReactiveHeartbeatProbe implements HeartbeatProbe {
 
     @Override
     public ProbeOutcome probe(BsonDocument resumeAfter) {
+        Objects.requireNonNull(resumeAfter, "resumeAfter must not be null — use initialPosition()");
         MongoDatabase db;
         try {
-            db = template.getMongoDatabaseFactory().getMongoDatabase().block(COMMAND_TIMEOUT);
-            if (db == null) {
-                return ProbeOutcome.failed(new IllegalStateException("MongoDatabase unavailable"));
-            }
+            db = database();
         } catch (Exception e) {
             return ProbeOutcome.failed(e);
         }
 
         long cursorId = 0;
         try {
-            Document reply = runCommand(db, aggregateCommand(resumeAfter));
+            Document reply = runCommand(db,
+                    ChangeStreamProbeCommands.aggregateCommand(def, pipeline, resumeAfter));
             Document cursor = reply.get("cursor", Document.class);
             cursorId = ((Number) cursor.get("id")).longValue();
             List<Document> firstBatch = cursor.getList("firstBatch", Document.class);
@@ -117,27 +113,30 @@ final class ReactiveHeartbeatProbe implements HeartbeatProbe {
         }
     }
 
-    private Document aggregateCommand(BsonDocument resumeAfter) {
-        Document changeStreamStage = new Document();
-        if (resumeAfter != null) {
-            changeStreamStage.append("resumeAfter", Document.parse(resumeAfter.toJson()));
+    @Override
+    public BsonDocument initialPosition() {
+        // No getMore: the initial aggregate reply already carries a PBRT at
+        // cursor-open time, before any event can be returned — so there is no
+        // probe result to discard and no unprotected hand-off window.
+        MongoDatabase db = database();
+        long cursorId = 0;
+        try {
+            Document reply = runCommand(db,
+                    ChangeStreamProbeCommands.aggregateCommand(def, pipeline, null));
+            cursorId = ChangeStreamProbeCommands.cursorId(reply);
+            return ChangeStreamProbeCommands.initialPbrt(reply, def);
+        } finally {
+            killCursor(db, cursorId);
         }
-        if (def.config().fullDocument() != FullDocumentMode.DEFAULT) {
-            changeStreamStage.append("fullDocument",
-                    FullDocument.valueOf(def.config().fullDocument().name()).getValue());
+    }
+
+    private MongoDatabase database() {
+        MongoDatabase db = template.getMongoDatabaseFactory().getMongoDatabase()
+                .block(COMMAND_TIMEOUT);
+        if (db == null) {
+            throw new IllegalStateException("MongoDatabase unavailable");
         }
-        if (def.config().fullDocumentBeforeChange() != FullDocumentBeforeChangeMode.OFF) {
-            changeStreamStage.append("fullDocumentBeforeChange",
-                    FullDocumentBeforeChange.valueOf(def.config().fullDocumentBeforeChange().name())
-                            .getValue());
-        }
-        List<Document> stages = new ArrayList<>();
-        stages.add(new Document("$changeStream", changeStreamStage));
-        stages.addAll(pipeline);
-        return new Document("aggregate", def.collection())
-                .append("pipeline", stages)
-                .append("cursor", new Document("batchSize", 1))
-                .append("comment", "flowwarden:heartbeat:" + def.streamName());
+        return db;
     }
 
     private static Document runCommand(MongoDatabase db, Document command) {
@@ -153,8 +152,9 @@ final class ReactiveHeartbeatProbe implements HeartbeatProbe {
             return;
         }
         try {
-            Mono.from(db.runCommand(new Document("killCursors", def.collection())
-                    .append("cursors", List.of(cursorId)))).block(COMMAND_TIMEOUT);
+            Mono.from(db.runCommand(
+                    ChangeStreamProbeCommands.killCursorsCommand(def, cursorId)))
+                    .block(COMMAND_TIMEOUT);
         } catch (Exception e) {
             log.debug("Failed to kill heartbeat probe cursor for stream '{}': {}",
                     def.streamName(), e.getMessage());

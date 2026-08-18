@@ -18,6 +18,7 @@ package io.flowwarden.stream.internal.checkpoint;
 import io.flowwarden.stream.FlowWardenMetrics;
 import io.flowwarden.stream.spi.CheckpointStore;
 import org.bson.BsonDocument;
+import org.bson.BsonValue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,17 +32,28 @@ import java.util.function.Supplier;
  *
  * <p>Each tick either persists a fresh event token, or — when no event
  * arrived since the last persisted position — runs a {@link HeartbeatProbe}
- * chained from the last delivered position. The probe may only advance
+ * chained from the last known position. The probe may only advance
  * {@code lastSeenToken} across an interval the server certified empty; a
  * concurrent event token always wins via compare-and-set on the shared
  * in-memory snapshot.</p>
  *
- * <p>Write contract (three probe outcomes, three write behaviors):</p>
+ * <p>Correctness properties enforced here:</p>
  * <ul>
- *   <li>PBRT different from the chained token → atomic write of position +
- *       heartbeat ({@code saveSeen(name, pbrt, now, now)});</li>
- *   <li>PBRT identical → heartbeat-only write, position untouched;</li>
- *   <li>event pending, timeout, error or null PBRT → no checkpoint write.</li>
+ *   <li><strong>Seeds are not events.</strong> A resume position installed at
+ *       startup ({@link TokenSnapshot.Source#SEED}) is a chaining point, never
+ *       a "newly delivered" token — a {@code PROCESSED_FIRST} resume seeds the
+ *       (older) processed token, and persisting it as seen would destroy the
+ *       level-2 safety net.</li>
+ *   <li><strong>Seen never regresses.</strong> Every seen write is guarded by
+ *       a monotonicity check against the persisted high-water mark (resume
+ *       token {@code _data} strings of one stream are lexicographically
+ *       ordered). Replayed events after a {@code PROCESSED_FIRST} resume and
+ *       bounded-scan intermediate PBRTs are downgraded to heartbeat-only
+ *       writes.</li>
+ *   <li><strong>No write after cancellation.</strong> Stream cleanup calls
+ *       {@link #cancel()} before cancelling the scheduled task; the tick
+ *       re-checks the flag immediately before every store write, so a slow
+ *       in-flight probe cannot stamp a fresh heartbeat on a dead stream.</li>
  * </ul>
  *
  * <p>This class is internal and not part of the public API.</p>
@@ -56,26 +68,60 @@ public final class CheckpointHeartbeat {
     private final Supplier<AtomicReference<TokenSnapshot>> latestTokenRef;
 
     /**
-     * Last {@code lastSeenToken} value this heartbeat persisted (event token
-     * or probe PBRT). Only read/written from the single-threaded interval
-     * scheduler.
+     * Whether the probe may fall back to the persisted {@code lastSeenToken}
+     * when no in-memory position exists. True only for
+     * {@code StartPosition.RESUME} streams — a {@code LATEST} stream's
+     * semantics explicitly ignore persisted tokens, and chaining from one
+     * would strand the heartbeat on history the main stream will never
+     * consume.
+     */
+    private final boolean allowPersistedFallback;
+
+    private volatile boolean cancelled;
+
+    /**
+     * Last {@code lastSeenToken} value this heartbeat persisted. Only
+     * read/written from the single-threaded interval scheduler.
      */
     private BsonDocument lastPersistedSeen;
+
+    /**
+     * Highest {@code lastSeenToken} known to be persisted (loaded from the
+     * checkpoint on the first tick, updated on every successful seen write).
+     * Guard against regressions. Scheduler-thread only.
+     */
+    private BsonDocument seenHighWaterMark;
+    private boolean highWaterMarkLoaded;
 
     public CheckpointHeartbeat(String streamName,
                                CheckpointStore checkpointStore,
                                HeartbeatProbe probe,
-                               Supplier<AtomicReference<TokenSnapshot>> latestTokenRef) {
+                               Supplier<AtomicReference<TokenSnapshot>> latestTokenRef,
+                               boolean allowPersistedFallback) {
         this.streamName = streamName;
         this.checkpointStore = checkpointStore;
         this.probe = probe;
         this.latestTokenRef = latestTokenRef;
+        this.allowPersistedFallback = allowPersistedFallback;
+    }
+
+    /**
+     * Invalidates this heartbeat: no store write will happen after this call
+     * returns (a write already in flight on the wire is the only residual
+     * window). Must be called by stream cleanup BEFORE cancelling the
+     * scheduled task, so an in-flight tick cannot stamp a dead stream.
+     */
+    public void cancel() {
+        cancelled = true;
     }
 
     /**
      * Runs one heartbeat tick. Never throws.
      */
     public void tick() {
+        if (cancelled) {
+            return;
+        }
         try {
             doTick();
         } catch (Exception e) {
@@ -90,18 +136,26 @@ public final class CheckpointHeartbeat {
         AtomicReference<TokenSnapshot> ref = latestTokenRef.get();
         TokenSnapshot snapshot = ref.get();
 
-        // Case 1: a fresh event token arrived since the last persisted position.
-        if (snapshot != null && !snapshot.token().equals(lastPersistedSeen)) {
-            checkpointStore.saveSeen(streamName, snapshot.token(), snapshot.timestamp(), now);
-            lastPersistedSeen = snapshot.token();
-            FlowWardenMetrics.get().onCheckpoint(streamName, snapshot.token().toJson());
-            log.debug("Periodic lastSeenToken update for stream '{}'", streamName);
+        if (!highWaterMarkLoaded) {
+            seenHighWaterMark = persistedSeenToken();
+            highWaterMarkLoaded = true;
+        }
+
+        // Case 1: a fresh EVENT token arrived since the last persisted
+        // position. SEED snapshots are chaining positions, not deliveries.
+        if (snapshot != null
+                && snapshot.source() == TokenSnapshot.Source.EVENT
+                && !snapshot.token().equals(lastPersistedSeen)) {
+            persistSeen(snapshot.token(), snapshot.timestamp(), now,
+                    "event token below persisted seen (replay) — heartbeat only");
             return;
         }
 
-        // Case 2: no fresh event — probe, chained from the last delivered
-        // position (in-memory snapshot first, persisted lastSeenToken next).
-        BsonDocument chainToken = snapshot != null ? snapshot.token() : persistedSeenToken();
+        // Case 2: no fresh event — probe, chained from the last known
+        // position (in-memory snapshot first; persisted lastSeenToken only
+        // for RESUME streams).
+        BsonDocument chainToken = snapshot != null ? snapshot.token()
+                : (allowPersistedFallback ? persistedSeenToken() : null);
         if (chainToken == null) {
             // No position exists to chain from (e.g. StartPosition.LATEST with
             // no event yet). Probing from "now" is unsafe — skip.
@@ -132,20 +186,74 @@ public final class CheckpointHeartbeat {
                                           Instant now) {
         if (pbrt.equals(chainToken)) {
             // Position unchanged but re-certified valid: heartbeat-only write.
-            checkpointStore.saveHeartbeat(streamName, now);
-            log.debug("Heartbeat re-certified position for stream '{}'", streamName);
+            saveHeartbeatOnly(now, "re-certified position");
             return;
         }
         // An event delivered while the probe was in flight always wins.
-        if (!ref.compareAndSet(snapshot, new TokenSnapshot(pbrt, now))) {
+        if (!ref.compareAndSet(snapshot, new TokenSnapshot(pbrt, now, TokenSnapshot.Source.SEED))) {
             log.debug("Heartbeat probe result discarded for stream '{}': event token won the race",
                     streamName);
             return;
         }
-        checkpointStore.saveSeen(streamName, pbrt, now, now);
-        lastPersistedSeen = pbrt;
-        FlowWardenMetrics.get().onCheckpoint(streamName, pbrt.toJson());
+        persistSeen(pbrt, now, now,
+                "probe PBRT below persisted seen (bounded scan) — heartbeat only");
+    }
+
+    /**
+     * Persists a seen position guarded by the monotonicity check; downgrades
+     * to a heartbeat-only write when the candidate does not advance the
+     * persisted high-water mark. The position remains confirmed in both
+     * cases: below the high-water mark, the persisted seen token is still the
+     * better resume point and the stream is demonstrably progressing through
+     * its certified gap-free range.
+     */
+    private void persistSeen(BsonDocument token, Instant positionTimestamp, Instant now,
+                             String downgradeReason) {
+        if (!advances(token, seenHighWaterMark)) {
+            lastPersistedSeen = token;
+            saveHeartbeatOnly(now, downgradeReason);
+            return;
+        }
+        if (cancelled) {
+            return;
+        }
+        checkpointStore.saveSeen(streamName, token, positionTimestamp, now);
+        lastPersistedSeen = token;
+        seenHighWaterMark = token;
+        FlowWardenMetrics.get().onCheckpoint(streamName, token.toJson());
         log.debug("Periodic lastSeenToken update for stream '{}'", streamName);
+    }
+
+    private void saveHeartbeatOnly(Instant now, String reason) {
+        if (cancelled) {
+            return;
+        }
+        checkpointStore.saveHeartbeat(streamName, now);
+        log.debug("Heartbeat-only write for stream '{}': {}", streamName, reason);
+    }
+
+    /**
+     * Whether {@code candidate} is strictly ahead of {@code current}. Resume
+     * token {@code _data} strings of a single stream are lexicographically
+     * ordered (KeyString encoding); when either token has no comparable
+     * {@code _data}, inequality is trusted (never observed with real MongoDB
+     * tokens).
+     */
+    static boolean advances(BsonDocument candidate, BsonDocument current) {
+        if (current == null) {
+            return true;
+        }
+        if (candidate.equals(current)) {
+            return false;
+        }
+        BsonValue candidateData = candidate.get("_data");
+        BsonValue currentData = current.get("_data");
+        if (candidateData != null && currentData != null
+                && candidateData.isString() && currentData.isString()) {
+            return candidateData.asString().getValue()
+                    .compareTo(currentData.asString().getValue()) > 0;
+        }
+        return true;
     }
 
     private BsonDocument persistedSeenToken() {
