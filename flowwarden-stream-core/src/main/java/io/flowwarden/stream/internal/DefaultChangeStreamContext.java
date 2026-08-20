@@ -310,6 +310,8 @@ public class DefaultChangeStreamContext<T> implements ChangeStreamContext<T> {
             case "replace" -> OperationType.REPLACE;
             case "delete" -> OperationType.DELETE;
             case "drop" -> OperationType.DROP;
+            case "dropDatabase" -> OperationType.DROP_DATABASE;
+            case "rename" -> OperationType.RENAME;
             case "invalidate" -> OperationType.INVALIDATE;
             default -> throw new IllegalArgumentException(
                     "Unsupported MongoDB operation type: " + value);

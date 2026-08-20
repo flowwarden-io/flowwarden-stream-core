@@ -53,8 +53,18 @@ public record StreamConfiguration(
     public record CheckpointConfig(
             int saveEveryN,
             int saveIntervalSeconds,
+            int idleHeartbeatIntervalSeconds,
             String startPosition,
             String onHistoryLost) {
+
+        /**
+         * Convenience constructor without {@code idleHeartbeatIntervalSeconds},
+         * preserved for callers predating the idle heartbeat.
+         */
+        public CheckpointConfig(int saveEveryN, int saveIntervalSeconds,
+                                String startPosition, String onHistoryLost) {
+            this(saveEveryN, saveIntervalSeconds, 0, startPosition, onHistoryLost);
+        }
     }
 
     /**

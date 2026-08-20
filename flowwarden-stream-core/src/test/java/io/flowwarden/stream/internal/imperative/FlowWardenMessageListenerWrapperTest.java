@@ -54,8 +54,12 @@ class FlowWardenMessageListenerWrapperTest {
         FlowWardenMessageListenerWrapper wrapper =
                 new FlowWardenMessageListenerWrapper(delegate, "test-stream", onCrash);
 
+        // The rethrow is wrapped in the provenance marker: the container's
+        // ErrorHandler tells listener crashes (fail-stop) apart from cursor
+        // deaths (managed restart) by this type.
         assertThatThrownBy(() -> wrapper.onMessage(fakeMessage()))
-                .isSameAs(cause);
+                .isInstanceOf(FlowWardenMessageListenerWrapper.ListenerCrashedException.class)
+                .hasCause(cause);
 
         verify(metrics).onStreamStopped("test-stream", StopReason.CRASHED, cause);
     }
@@ -73,14 +77,18 @@ class FlowWardenMessageListenerWrapperTest {
         FlowWardenMessageListenerWrapper wrapper =
                 new FlowWardenMessageListenerWrapper(delegate, "test-stream", onCrash);
 
+        // Even an Error travels inside the (RuntimeException) marker: it now
+        // reaches the ErrorHandler's fail-stop path instead of silently
+        // killing the executor thread.
         assertThatThrownBy(() -> wrapper.onMessage(fakeMessage()))
-                .isSameAs(cause);
+                .isInstanceOf(FlowWardenMessageListenerWrapper.ListenerCrashedException.class)
+                .hasCause(cause);
 
         verify(metrics).onStreamStopped("test-stream", StopReason.CRASHED, cause);
     }
 
     @Test
-    void onMessage_crash_invokesOnCrashAfterEmittingStreamStopped() {
+    void onMessage_crash_invokesOnCrashBeforeEmittingStreamStopped() {
         StreamMetricsProvider metrics = mock(StreamMetricsProvider.class);
         FlowWardenMetrics.setProvider(metrics);
 
@@ -93,11 +101,14 @@ class FlowWardenMessageListenerWrapperTest {
                 new FlowWardenMessageListenerWrapper(delegate, "test-stream", onCrash);
 
         assertThatThrownBy(() -> wrapper.onMessage(fakeMessage()))
-                .isSameAs(cause);
+                .isInstanceOf(FlowWardenMessageListenerWrapper.ListenerCrashedException.class)
+                .hasCause(cause);
 
-        InOrder order = inOrder(metrics, onCrash);
-        order.verify(metrics).onStreamStopped("test-stream", StopReason.CRASHED, cause);
+        // Cleanup first: onCrash publishes the lock-free termination signal;
+        // a slow metrics provider must not delay it.
+        InOrder order = inOrder(onCrash, metrics);
         order.verify(onCrash).run();
+        order.verify(metrics).onStreamStopped("test-stream", StopReason.CRASHED, cause);
     }
 
     @Test
@@ -134,9 +145,37 @@ class FlowWardenMessageListenerWrapperTest {
                 new FlowWardenMessageListenerWrapper(delegate, "test-stream", onCrash);
 
         assertThatThrownBy(() -> wrapper.onMessage(fakeMessage()))
-                .isSameAs(originalCause);
+                .isInstanceOf(FlowWardenMessageListenerWrapper.ListenerCrashedException.class)
+                .hasCause(originalCause);
 
         assertThat(originalCause.getSuppressed()).containsExactly(cleanupError);
+    }
+
+    @Test
+    void onMessage_throwingMetricsProvider_markerAndCleanupStillGuaranteed() {
+        // Round 3: an unmarked listener crash would be misclassified as a
+        // cursor death (evict + restart over a still-active reader). The
+        // provider emission is best-effort — marker and cleanup always win.
+        StreamMetricsProvider metrics = mock(StreamMetricsProvider.class);
+        org.mockito.Mockito.doThrow(new RuntimeException("provider boom"))
+                .when(metrics).onStreamStopped(any(), any(), any());
+        FlowWardenMetrics.setProvider(metrics);
+
+        RuntimeException cause = new RuntimeException("delegate boom");
+        MessageListener<ChangeStreamDocument<Document>, Document> delegate = msg -> {
+            throw cause;
+        };
+        Runnable onCrash = mock(Runnable.class);
+        FlowWardenMessageListenerWrapper wrapper =
+                new FlowWardenMessageListenerWrapper(delegate, "test-stream", onCrash);
+
+        assertThatThrownBy(() -> wrapper.onMessage(fakeMessage()))
+                .isInstanceOf(FlowWardenMessageListenerWrapper.ListenerCrashedException.class)
+                .hasCause(cause);
+
+        verify(onCrash).run();
+        assertThat(cause.getSuppressed())
+                .anyMatch(s -> "provider boom".equals(s.getMessage()));
     }
 
     @Test

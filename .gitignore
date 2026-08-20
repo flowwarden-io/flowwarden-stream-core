@@ -36,6 +36,7 @@ Thumbs.db
 hs_err_pid*
 .aider*
 /CLAUDE.md
+/recommendations/
 /codeql-results-fixed.sarif
 /codeql-results-fixed.sarif.csv
 /codeql-results-fixed.sarif.html

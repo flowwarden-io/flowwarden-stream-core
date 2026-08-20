@@ -62,6 +62,50 @@ public interface StreamMetricsProvider {
     default void onStreamStopped(String streamName, StopReason reason, Throwable cause) {}
 
     /**
+     * Called when a stream that died at runtime (cursor death — network
+     * outage, primary stepdown, non-resumable server error) has been
+     * successfully resubscribed by the managed restart loop.
+     *
+     * <p>Always follows an {@code onStreamStopped(streamName, CRASHED, cause)}
+     * for the same incident, and an {@link #onStreamStarted} fires for the
+     * new subscription as usual — this signal adds the restart-specific
+     * context: how many attempts the recovery took and what killed the
+     * previous subscription. A recurring stream of these is an operational
+     * signal (flaky network, undersized oplog) even though each individual
+     * incident healed itself.</p>
+     *
+     * @param streamName stream identifier
+     * @param attempt    the attempt number that succeeded (1 = first try)
+     * @param cause      the error that killed the previous subscription, or
+     *                   {@code null} if it could not be captured
+     */
+    default void onStreamRestarted(String streamName, int attempt, Throwable cause) {}
+
+    /**
+     * Called when the watched collection was invalidated (dropped, its
+     * database dropped, or renamed) — MongoDB closed the underlying change
+     * stream cursor. Always followed by an
+     * {@code onStreamStopped(streamName, CRASHED, cause)} for the cursor
+     * death itself.
+     *
+     * <p>What happens next depends on the cause and the stream's
+     * {@code onHistoryLost} strategy: a drop under a self-repairing strategy
+     * heals automatically (fresh certified position, managed resubscription —
+     * an {@link #onStreamRestarted} follows); a rename, or any invalidation
+     * under {@code FAIL}, stops the stream terminally (the declared
+     * collection identity is gone, or the stream refuses to skip history) —
+     * an operator action is required.</p>
+     *
+     * @param streamName stream identifier
+     * @param cause      the operation that invalidated the stream:
+     *                   {@code DROP}, {@code DROP_DATABASE} or {@code RENAME}
+     *                   ({@code DROP} when the pre-invalidate event was not
+     *                   observed)
+     */
+    default void onStreamInvalidated(String streamName,
+                                     io.flowwarden.stream.OperationType cause) {}
+
+    /**
      * Called when an event is received from MongoDB, before handler execution.
      *
      * @param streamName stream identifier
@@ -155,6 +199,27 @@ public interface StreamMetricsProvider {
      * @param streamName stream identifier
      */
     default void onResumeHistoryLost(String streamName) {}
+
+    /**
+     * Called when a checkpoint heartbeat probe fails while the stream itself
+     * keeps running: transient backend error, bounded-read timeout, a reply
+     * carrying a null post-batch resume token, or a chained resume token that
+     * has already aged out of the oplog ({@code ChangeStreamHistoryLost}).
+     *
+     * <p>A probe failure never stops the stream and never writes to the
+     * checkpoint — {@code lastHeartbeatTimestamp} does not move. Repeated
+     * failures therefore surface as an aging heartbeat; this callback carries
+     * the cause so monitoring can distinguish a transient outage from a
+     * resume point that is no longer recoverable.</p>
+     *
+     * <p>Distinct from {@link #onResumeHistoryLost(String)}, which describes
+     * the startup resume cascade: a heartbeat failure happens while a live
+     * cursor keeps delivering events.</p>
+     *
+     * @param streamName stream identifier
+     * @param cause      the failure cause
+     */
+    default void onHeartbeatProbeFailed(String streamName, Throwable cause) {}
 
     /**
      * Called periodically with the current lag between {@code lastSeenToken}

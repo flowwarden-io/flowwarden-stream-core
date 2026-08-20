@@ -45,7 +45,21 @@ final class NoOpCheckpointStore implements CheckpointStore {
     }
 
     @Override
+    public void saveSeen(String streamName, BsonDocument token, Instant timestamp,
+                         Instant heartbeatTimestamp) {
+    }
+
+    @Override
+    public void saveHeartbeat(String streamName, Instant heartbeatTimestamp) {
+    }
+
+    @Override
     public void saveProcessed(String streamName, BsonDocument token, Instant timestamp) {
+    }
+
+    @Override
+    public void resetAfterHistoryLost(String streamName, BsonDocument freshSeenToken,
+                                      BsonDocument expectedDeadProcessed, Instant timestamp) {
     }
 
     @Override
