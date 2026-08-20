@@ -21,6 +21,10 @@ public final class SharedMongoContainer {
     public static final MongoDBContainer MONGO = new MongoDBContainer("mongo:6.0");
 
     static {
+        // enableTestCommands allows failCommand failpoints (deterministic
+        // cursor-death injection). The --replSet argument must be repeated:
+        // withCommand replaces the container's default command entirely.
+        MONGO.withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
         MONGO.start();
         Runtime.getRuntime().addShutdownHook(new Thread(MONGO::stop));
     }

@@ -24,9 +24,6 @@ import io.flowwarden.stream.ErrorAction;
 import io.flowwarden.stream.FlowWardenMetrics;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.FullDocumentMode;
-import io.flowwarden.stream.HistoryLostException;
-import io.flowwarden.stream.OnHistoryLost;
-import io.flowwarden.stream.ResumeStrategy;
 import io.flowwarden.stream.StartPosition;
 import io.flowwarden.stream.core.FlowWardenStreamManager;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
@@ -41,9 +38,11 @@ import reactor.util.retry.Retry;
 import io.flowwarden.stream.internal.discovery.StreamRegistry;
 import io.flowwarden.stream.internal.discovery.HandlerMethod;
 import io.flowwarden.stream.internal.discovery.PipelineMethod;
+import io.flowwarden.stream.internal.StreamRestarter;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
 import io.flowwarden.stream.spi.ChangeEventMetadata;
 import io.flowwarden.stream.internal.checkpoint.CheckpointHeartbeat;
+import io.flowwarden.stream.internal.checkpoint.ResumeCascade;
 import io.flowwarden.stream.internal.checkpoint.ResumeContext;
 import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
@@ -134,6 +133,37 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             AtomicReference<Throwable> lastError) {
     }
 
+    /**
+     * Managed resubscription after a runtime termination (cursor error or
+     * unexpected completion — e.g. an invalidate): full startup path (resume
+     * cascade included) with capped exponential backoff. Terminal failures
+     * stop the loop and, under SINGLE_LEADER, release the lock.
+     */
+    private final StreamRestarter restarter =
+            new StreamRestarter("fw-stream-restart-reactive", new StreamRestarter.Callbacks() {
+                @Override
+                public void startStream(String streamName) {
+                    ReactiveStreamManager.this.startStream(streamName);
+                }
+
+                @Override
+                public boolean isInstalled(String streamName) {
+                    return streams.containsKey(streamName);
+                }
+
+                @Override
+                public void onTerminalGiveUp(String streamName) {
+                    ChangeStreamDefinition def = registry.findByName(streamName).orElse(null);
+                    if (def != null && def.config().deploymentMode() == DeploymentMode.SINGLE_LEADER
+                            && leaderElection != null) {
+                        // The lease must not be renewed for a stream the loop
+                        // gave up on — release it so a standby's operator at
+                        // least sees the same terminal failure honestly.
+                        leaderElection.stop(streamName);
+                    }
+                }
+            });
+
     public ReactiveStreamManager(MongoTemplateRegistry templateRegistry,
                                   StreamRegistry registry,
                                   CheckpointStore checkpointStore,
@@ -171,8 +201,25 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         scheduleOplogStatsRefresh();
     }
 
+    /**
+     * Per-stream lifecycle serialization: manual starts, operator stops and
+     * managed restart attempts are mutually exclusive for a given stream —
+     * see the imperative manager's twin field for the full rationale.
+     */
+    private final Map<String, Object> lifecycleLocks = new ConcurrentHashMap<>();
+
+    private Object lifecycleLock(String streamName) {
+        return lifecycleLocks.computeIfAbsent(streamName, k -> new Object());
+    }
+
     @Override
     public void startStream(String streamName) {
+        synchronized (lifecycleLock(streamName)) {
+            doStartStream(streamName);
+        }
+    }
+
+    private void doStartStream(String streamName) {
         if (streams.containsKey(streamName)) {
             log.warn("Stream '{}' is already running", streamName);
             return;
@@ -194,7 +241,15 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         ResumeContext resumeContext = ResumeContext.NONE;
         if (def.checkpointAnnotation() != null
                 && def.checkpointAnnotation().startPosition() == StartPosition.RESUME) {
-            resumeContext = applyResumeCascade(streamName, def, optionsBuilder, probe);
+            resumeContext = ResumeCascade.resolve(streamName, def.checkpointAnnotation(),
+                    checkpointStore, probe,
+                    token -> isTokenValid(def.collection(), token, streamTemplate),
+                    () -> getOldestOplogTimestamp(streamTemplate));
+            if (resumeContext.seedToken() != null) {
+                optionsBuilder.resumeAfter(resumeContext.seedToken());
+            } else if (resumeContext.initialOperationTime() != null) {
+                optionsBuilder.resumeAt(resumeContext.initialOperationTime());
+            }
         }
         BsonDocument seedToken = resumeContext.seedToken();
 
@@ -237,8 +292,9 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     .set(new TokenSnapshot(seedToken, Instant.now(), TokenSnapshot.Source.SEED));
         }
 
-        streams.put(streamName,
-                new ReactiveStreamState(disposableHolder, def, gracefulStop, lastError));
+        ReactiveStreamState state =
+                new ReactiveStreamState(disposableHolder, def, gracefulStop, lastError);
+        streams.put(streamName, state);
         scheduleIntervalCheckpoint(def, probe, resumeContext);
 
         Disposable disposable = streamTemplate
@@ -256,42 +312,89 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                             streamName, e.getMessage(), e);
                 })
                 .onErrorResume(e -> {
-                    FlowWardenMetrics.get().onEventError(streamName, e, true, 0, null);
+                    try {
+                        // Observational only — a throwing provider must not
+                        // replace the original cause nor break termination.
+                        FlowWardenMetrics.get().onEventError(streamName, e, true, 0, null);
+                    } catch (Exception metricsError) {
+                        log.warn("Metrics provider failed on event error for stream '{}': {}",
+                                streamName, metricsError.getMessage());
+                    }
                     return Mono.empty();
                 })
                 .doFinally(signal -> {
-                    if (gracefulStop.get()) {
-                        FlowWardenMetrics.get().onStreamStopped(
-                                streamName, StopReason.GRACEFUL, null);
-                    } else {
-                        FlowWardenMetrics.get().onStreamStopped(
-                                streamName, StopReason.CRASHED, lastError.get());
-                    }
-                    // Evict ALL per-stream state so isRunning / getLastEventTime
-                    // stop lying and no heartbeat write ever follows a dead
-                    // stream — the heartbeat reflects stream health, not
-                    // scheduler-thread health. The heartbeat is invalidated
-                    // BEFORE its task is cancelled: cancel(false) lets an
-                    // in-flight tick finish, and it must not write.
+                    // Lock-free termination signal FIRST: a startStream
+                    // holding the lifecycle lock through subscribe() must be
+                    // able to observe an asynchronous termination of its own
+                    // subscription before reporting it as started.
                     terminated.set(true);
-                    streams.remove(streamName);
-                    lastActivityTimes.remove(streamName);
-                    eventCounters.remove(streamName);
-                    latestTokens.remove(streamName);
-                    CheckpointHeartbeat heartbeat = heartbeats.remove(streamName);
-                    if (heartbeat != null) {
-                        heartbeat.cancel();
-                    }
-                    ScheduledFuture<?> task = intervalTasks.remove(streamName);
-                    if (task != null) {
-                        task.cancel(false);
-                    }
-                    ScheduledFuture<?> idleTask = idleProbeTasks.remove(streamName);
-                    if (idleTask != null) {
-                        idleTask.cancel(false);
+                    // The lifecycle COMMIT — ownership claim, eviction,
+                    // hand-off — runs inside the lock: a concurrent
+                    // stopStream is either fully before it (this termination
+                    // loses ownership, or sees gracefulStop) or fully after
+                    // it (its cancel() finds and kills the restart the
+                    // hand-off just armed). Reentrant with the synchronous
+                    // doFinally of a dispose() inside doStopStream (same
+                    // thread). Lifecycle first, observables after: eviction
+                    // and hand-off are guaranteed regardless of any metrics
+                    // provider failure.
+                    synchronized (lifecycleLock(streamName)) {
+                        // Generation-safe eviction: this termination only
+                        // owns the shared per-name resources if ITS state is
+                        // still the registered one. A late doFinally of an
+                        // old subscription must never dismantle the newer
+                        // generation's tokens, heartbeat or tasks — nor arm
+                        // a restart over a living stream. The heartbeat is
+                        // invalidated BEFORE its task is cancelled.
+                        boolean owner = streams.remove(streamName, state);
+                        if (owner) {
+                            lastActivityTimes.remove(streamName);
+                            eventCounters.remove(streamName);
+                            latestTokens.remove(streamName);
+                            CheckpointHeartbeat heartbeat = heartbeats.remove(streamName);
+                            if (heartbeat != null) {
+                                heartbeat.cancel();
+                            }
+                            ScheduledFuture<?> task = intervalTasks.remove(streamName);
+                            if (task != null) {
+                                task.cancel(false);
+                            }
+                            ScheduledFuture<?> idleTask = idleProbeTasks.remove(streamName);
+                            if (idleTask != null) {
+                                idleTask.cancel(false);
+                            }
+                        }
+                        boolean graceful = gracefulStop.get();
+                        try {
+                            FlowWardenMetrics.get().onStreamStopped(streamName,
+                                    graceful ? StopReason.GRACEFUL : StopReason.CRASHED,
+                                    graceful ? null : lastError.get());
+                        } catch (Exception metricsError) {
+                            log.warn("Metrics provider failed on stop signal for stream '{}': {}",
+                                    streamName, metricsError.getMessage());
+                        }
+                        if (!graceful && owner) {
+                            if (deathHandoffTestHook != null) {
+                                deathHandoffTestHook.run();
+                            }
+                            // Runtime death (cursor error or unexpected
+                            // completion): hand the stream to the managed
+                            // resubscription loop — it re-enters the full
+                            // startup path, resume cascade included, with
+                            // capped exponential backoff.
+                            restarter.onRuntimeDeath(streamName, lastError.get());
+                        }
                     }
                 })
-                .subscribe();
+                .subscribe(v -> { }, lateError ->
+                        // The in-band path terminates through onErrorResume /
+                        // doFinally; only a LATE driver signal (an async
+                        // getMore callback completing after the pipeline
+                        // already terminated) can reach this consumer — absorb
+                        // it instead of throwing ErrorCallbackNotImplemented
+                        // into Reactor's global onErrorDropped hook.
+                        log.debug("Late change stream signal for '{}' after termination: {}",
+                                streamName, lateError.toString()));
         disposableHolder.set(disposable);
 
         if (terminated.get()) {
@@ -308,8 +411,28 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         FlowWardenMetrics.get().onStreamStarted(streamName, buildStreamConfiguration(def, "REACTIVE"));
     }
 
+    /**
+     * Test hook: runs inside the lifecycle-locked death section, between the
+     * ownership claim and the restarter hand-off.
+     */
+    volatile Runnable deathHandoffTestHook;
+
     @Override
     public void stopStream(String streamName) {
+        // The cancel runs INSIDE the lifecycle lock: the death hand-off is
+        // itself lifecycle-locked, so either a death published its restart
+        // before this section (the cancel finds and kills it) or the death
+        // section runs after the stop and loses its ownership claim. An
+        // in-flight restart attempt holding the lock via startStream is
+        // waited out, then its installed generation is torn down here — the
+        // operator stop is always the last lifecycle owner.
+        synchronized (lifecycleLock(streamName)) {
+            restarter.cancel(streamName);
+            doStopStream(streamName);
+        }
+    }
+
+    private void doStopStream(String streamName) {
         // Invalidate the heartbeat BEFORE cancelling its task: cancel(false)
         // lets an in-flight tick finish, and it must not write for a stream
         // being stopped.
@@ -367,9 +490,28 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         return lastActivityTimes.get(streamName);
     }
 
+    // --- package-private diagnostic hooks (down-window observability in tests) ---
+
+    boolean hasLatestToken(String streamName) {
+        return latestTokens.containsKey(streamName);
+    }
+
+    boolean hasIntervalTask(String streamName) {
+        return intervalTasks.containsKey(streamName);
+    }
+
+    boolean hasHeartbeat(String streamName) {
+        return heartbeats.containsKey(streamName);
+    }
+
+    boolean isRestartPending(String streamName) {
+        return restarter.isRestartPending(streamName);
+    }
+
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down FlowWarden ReactiveStreamManager ({} streams)", streams.size());
+        restarter.shutdown();
         if (leaderElection != null) {
             leaderElection.shutdown();
         }
@@ -765,16 +907,6 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         }
     }
 
-    private static Instant mostRecent(Instant... candidates) {
-        Instant best = null;
-        for (Instant candidate : candidates) {
-            if (candidate != null && (best == null || candidate.isAfter(best))) {
-                best = candidate;
-            }
-        }
-        return best;
-    }
-
     private void saveCheckpointIfNeeded(ChangeStreamDefinition def, BsonDocument token, Instant timestamp) {
         if (def.checkpointAnnotation() == null || token == null) {
             return;
@@ -820,185 +952,6 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             // Not a MongoCommandException — re-throw (transient network error, timeout, etc.)
             throw e instanceof RuntimeException re ? re : new RuntimeException(e);
         }
-    }
-
-    /**
-     * Resume cascade: try the primary token chosen by {@link ResumeStrategy}
-     * (level 1), fall back to the secondary if the primary has aged out
-     * (level 2), apply onHistoryLost strategy if both have aged out (level 3).
-     *
-     * @return the immutable resume outcome (seed + persisted seen position),
-     *         built from this single checkpoint read — heartbeat setup
-     *         derives everything from it without re-reading the store
-     */
-    private ResumeContext applyResumeCascade(String streamName,
-                                    ChangeStreamDefinition def,
-                                    ChangeStreamOptions.ChangeStreamOptionsBuilder optionsBuilder,
-                                    ReactiveHeartbeatProbe probe) {
-        java.util.Optional<io.flowwarden.stream.spi.Checkpoint> cpOpt =
-                checkpointStore.findByStreamName(streamName);
-        if (cpOpt.isEmpty()) {
-            // No prior checkpoint → bootstrap: capture an initial PBRT and
-            // start the main stream from it, so no window is ever unprotected
-            // and the heartbeat always has a position to chain from.
-            return bootstrapInitialPosition(streamName, optionsBuilder, probe, null);
-        }
-        io.flowwarden.stream.spi.Checkpoint cp = cpOpt.get();
-        BsonDocument processedToken = cp.lastProcessedToken();
-        BsonDocument seenToken = cp.lastSeenToken();
-        ReactiveMongoTemplate streamTemplate = templateFor(def);
-        ResumeStrategy strategy = def.checkpointAnnotation().resumeStrategy();
-
-        BsonDocument primary;
-        BsonDocument secondary;
-        String primaryLabel;
-        String secondaryLabel;
-        Runnable onFallback;
-        switch (strategy) {
-            case SEEN_FIRST -> {
-                primary = seenToken;
-                secondary = processedToken;
-                primaryLabel = "lastSeenToken";
-                secondaryLabel = "lastProcessedToken";
-                onFallback = () -> FlowWardenMetrics.get().onResumeFallbackToProcessed(streamName);
-            }
-            case PROCESSED_FIRST -> {
-                primary = processedToken;
-                secondary = seenToken;
-                primaryLabel = "lastProcessedToken";
-                secondaryLabel = "lastSeenToken";
-                onFallback = () -> FlowWardenMetrics.get().onResumeFallbackToSeen(streamName);
-            }
-            default -> throw new IllegalStateException("Unknown ResumeStrategy: " + strategy);
-        }
-
-        // Level 1: try the primary token
-        if (primary != null && isTokenValid(def.collection(), primary, streamTemplate)) {
-            optionsBuilder.resumeAfter(primary);
-            log.info("Resuming stream '{}' from {}", streamName, primaryLabel);
-            return new ResumeContext(primary, seenToken);
-        }
-
-        // Level 2: the secondary, validated exactly once. With a null primary
-        // (never recorded — typical after a history-lost self-repair) this is
-        // not a degradation: INFO, no "aged out" warning, no fallback metric.
-        if (secondary != null
-                && (primary == null || !secondary.equals(primary))
-                && isTokenValid(def.collection(), secondary, streamTemplate)) {
-            optionsBuilder.resumeAfter(secondary);
-            if (primary == null) {
-                log.info("Resuming stream '{}' from {} ({} not recorded)",
-                        streamName, secondaryLabel, primaryLabel);
-            } else {
-                log.warn("Resuming stream '{}' from {}: {} aged out of oplog",
-                        streamName, secondaryLabel, primaryLabel);
-                onFallback.run();
-            }
-            return new ResumeContext(secondary, seenToken);
-        }
-
-        // Level 3: both tokens unusable → apply onHistoryLost strategy
-        if (processedToken != null || seenToken != null) {
-            FlowWardenMetrics.get().onResumeHistoryLost(streamName);
-            return handleHistoryLost(streamName, def, optionsBuilder,
-                    mostRecent(cp.lastProcessedTimestamp(), cp.lastSeenTimestamp(),
-                            cp.lastHeartbeatTimestamp()),
-                    processedToken, probe);
-        }
-        // Checkpoint document exists but both tokens are null → bootstrap,
-        // same as a stream with no prior checkpoint.
-        return bootstrapInitialPosition(streamName, optionsBuilder, probe, null);
-    }
-
-    /**
-     * Bootstrap for a stream with no usable prior position: capture the
-     * server's current position from the change stream's <em>initial</em>
-     * reply (before any event can be returned — no cursor hand-off window),
-     * persist it, and resume the main stream after it. Both the capture and
-     * the persistence are startup preconditions: a failure propagates instead
-     * of silently starting an unprotected, non-durable stream.
-     */
-    private ResumeContext bootstrapInitialPosition(String streamName,
-                                                  ChangeStreamOptions.ChangeStreamOptionsBuilder optionsBuilder,
-                                                  ReactiveHeartbeatProbe probe,
-                                                  BsonDocument deadProcessedToken) {
-        BsonDocument pbrt = probe.initialPosition();
-        Instant now = Instant.now();
-        try {
-            if (deadProcessedToken != null) {
-                // History-lost recovery: the history is explicitly abandoned,
-                // so the dead processed pair is removed along with installing
-                // the fresh position — atomically, guarded on the value read
-                // at detection, preserving instanceId, metadata and any
-                // fields unknown to the SPI.
-                checkpointStore.resetAfterHistoryLost(streamName, pbrt, deadProcessedToken, now);
-            } else {
-                checkpointStore.saveSeen(streamName, pbrt, now, now);
-            }
-        } catch (RuntimeException e) {
-            // A non-durable position cannot guarantee at-least-once: a crash
-            // before the next checkpoint would silently restart from a newer
-            // position. Fail the startup.
-            FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
-            throw e;
-        }
-        FlowWardenMetrics.get().onCheckpoint(streamName, pbrt.toJson());
-        optionsBuilder.resumeAfter(pbrt);
-        log.info("Bootstrapped stream '{}' from an initial server-certified position", streamName);
-        // seed == freshly persisted seen: never a phantom catch-up.
-        return new ResumeContext(pbrt, pbrt);
-    }
-
-    private ResumeContext handleHistoryLost(String streamName,
-                                   ChangeStreamDefinition def,
-                                   ChangeStreamOptions.ChangeStreamOptionsBuilder optionsBuilder,
-                                   java.time.Instant lastCheckpointTimestamp,
-                                   BsonDocument deadProcessedToken,
-                                   ReactiveHeartbeatProbe probe) {
-        OnHistoryLost strategy = def.checkpointAnnotation().onHistoryLost();
-        log.warn("Resume token expired for stream '{}' (last checkpoint: {}). Applying strategy: {}",
-                streamName, lastCheckpointTimestamp, strategy);
-
-        switch (strategy) {
-            case FAIL -> throw new HistoryLostException(streamName, lastCheckpointTimestamp);
-            case RESUME_FROM_NOW -> {
-                // This strategy explicitly accepts abandoning history, so a
-                // fresh server-certified position is strictly better than an
-                // implicit non-durable "from now": the checkpoint self-repairs
-                // immediately and the heartbeat never consults the expired
-                // token again.
-                log.info("Stream '{}' will start from a fresh certified position", streamName);
-                return bootstrapInitialPosition(streamName, optionsBuilder, probe, deadProcessedToken);
-            }
-            case RESUME_FROM_OPLOG_START -> {
-                BsonTimestamp oldestTs;
-                try {
-                    // The stream's own template: on multi-cluster setups the
-                    // default template's oplog may be a different cluster's.
-                    oldestTs = getOldestOplogTimestamp(templateFor(def));
-                } catch (Exception e) {
-                    // Same self-repair as RESUME_FROM_NOW (matching the logged
-                    // fallback): a fresh certified position instead of an
-                    // implicit non-durable "from now" with expired tokens
-                    // lingering. A bootstrap failure propagates — no path
-                    // starts on a non-durable position.
-                    log.warn("Failed to read oplog for stream '{}': {}. Falling back to RESUME_FROM_NOW.",
-                            streamName, e.getMessage());
-                    return bootstrapInitialPosition(streamName, optionsBuilder, probe, deadProcessedToken);
-                }
-                // The dead tokens deliberately STAY in the checkpoint: they
-                // are the only durable marker that a recovery is due. A crash
-                // before the establishment write re-enters this recovery on
-                // restart (re-replaying is at-least-once safe) instead of
-                // silently bootstrapping "from now". The establishment write
-                // performs the deferred cleanup, guarded by the dead
-                // processed token carried in the context.
-                optionsBuilder.resumeAt(oldestTs);
-                log.info("Stream '{}' will resume from oldest oplog entry at {}", streamName, oldestTs);
-                return new ResumeContext(null, null, oldestTs, deadProcessedToken);
-            }
-        }
-        throw new IllegalStateException("Unknown OnHistoryLost strategy: " + strategy);
     }
 
     private BsonTimestamp getOldestOplogTimestamp(ReactiveMongoTemplate template) {

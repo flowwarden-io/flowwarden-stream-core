@@ -347,14 +347,17 @@ class ImperativeHeartbeatSafetyIntegrationTest {
     }
 
     @Test
-    void retryBackoffInterrupted_eventNotSettled_redeliveredOnRestart() throws Exception {
+    void retryBackoffInterrupted_eventNotSettled_redeliveredAutomatically() throws Exception {
         // An interrupted retry backoff exits the processing loop with the
         // outcome undecided: it must NOT settle the event. If it published
         // its token, a probe chained from it could certify past a delivery
         // that was never handled — this locks the at-least-once contract of
-        // that exit path (the interruption branch itself is guarded by the
-        // settled flag; its in-process race is masked by the crash eviction
-        // and not directly observable end-to-end).
+        // that exit path. Since the managed-restart work, the crash is
+        // followed by an automatic resubscription: the cascade resumes from
+        // the persisted position (which, the event being unsettled, never
+        // certified past it) and REdelivers the event without any operator
+        // action — a strictly stronger version of the old manual-restart
+        // assertion.
         streamManager.startStream(INTERRUPT_STREAM);
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning(INTERRUPT_STREAM));
@@ -363,34 +366,20 @@ class ImperativeHeartbeatSafetyIntegrationTest {
 
         // First delivery fails with the listener thread self-interrupted:
         // the backoff sleep aborts immediately, the listener then dies on
-        // the restored interrupt flag (crash eviction).
+        // the restored interrupt flag — a runtime cursor death.
         await().atMost(Duration.ofSeconds(10))
                 .until(() -> interruptedRetryHandler.invocationCount() >= 1);
-        await().atMost(Duration.ofSeconds(10))
-                .until(() -> !streamManager.isRunning(INTERRUPT_STREAM));
         assertThat(interruptedRetryHandler.completedCount()).isZero();
 
-        // The dead stream's checkpoint is inert (heartbeat cancelled on
-        // eviction, nothing settled).
-        BsonDocument frozenAt = checkpointStore.findByStreamName(INTERRUPT_STREAM)
-                .orElseThrow().lastSeenToken();
-        Thread.sleep(2_000);
-        assertThat(checkpointStore.findByStreamName(INTERRUPT_STREAM)
-                .orElseThrow().lastSeenToken()).isEqualTo(frozenAt);
-
-        // Restart: the undecided outcome never settled, so the persisted
-        // position (which the idle heartbeat kept advancing BEFORE the event
-        // arrived) never certified past it — the resume MUST redeliver the
-        // event. This locks the at-least-once contract of the interruption
-        // exit; the exit's own publish decision is guarded by the settled
-        // flag (its in-process race is masked by the crash eviction and not
-        // deterministically observable end-to-end).
-        try { streamManager.stopStream(INTERRUPT_STREAM); } catch (Exception ignored) { }
-        streamManager.startStream(INTERRUPT_STREAM);
+        // The managed restart resubscribes and the unsettled event is
+        // redelivered; the second invocation completes normally.
+        await().atMost(Duration.ofSeconds(15))
+                .untilAsserted(() -> assertThat(interruptedRetryHandler.completedCount()).isEqualTo(1));
+        assertThat(interruptedRetryHandler.invocationCount())
+                .as("the same event was delivered twice: aborted, then settled")
+                .isEqualTo(2);
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning(INTERRUPT_STREAM));
-        await().atMost(Duration.ofSeconds(10))
-                .untilAsserted(() -> assertThat(interruptedRetryHandler.completedCount()).isEqualTo(1));
     }
 
     @Test
