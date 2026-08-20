@@ -129,7 +129,13 @@ class ReactiveCheckpointFailureIntegrationTest {
                     assertThat(failures).allMatch(t -> t instanceof MongoWriteConcernException);
                 });
 
-        assertThat(metrics.checkpointSuccesses("rea-cp-fail-post-handler")).isEqualTo(1);
+        // Await: the handler records the event BEFORE the post-handler
+        // checkpoint write, so the previous awaits can be satisfied while the
+        // 3rd save is still in flight. A regression to optimistic emission
+        // still fails here — the count would be 3, never 1.
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(
+                        metrics.checkpointSuccesses("rea-cp-fail-post-handler")).isEqualTo(1));
     }
 
     @Test
