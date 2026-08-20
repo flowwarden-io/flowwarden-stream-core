@@ -689,7 +689,10 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         if (leaderElection != null) {
             leaderElection.shutdown();
         }
-        for (String streamName : streams.keySet()) {
+        // Snapshot before iterating: a crash eviction in doFinally mutates
+        // the map concurrently, and the weakly-consistent iterator could
+        // then skip a live stream (leaking its subscription).
+        for (String streamName : new java.util.ArrayList<>(streams.keySet())) {
             stopStream(streamName);
         }
         intervalScheduler.shutdownNow();
