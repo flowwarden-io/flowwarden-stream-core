@@ -37,6 +37,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>Subclass for each backend (Mongo, Redis, JDBC, …) and provide a fresh
  * {@link CheckpointStore} via {@link #createCheckpointStore()} plus a
  * {@link #cleanState()} hook that resets the backing storage between tests.</p>
+ *
+ * <p><strong>Scope note:</strong> the
+ * {@code resetAfterHistoryLost} cases validate the <em>sequential</em>
+ * semantics of the conditional processed cleanup (still-dead → cleared,
+ * replaced → preserved), not its atomicity. The race-free at-least-once
+ * guarantee additionally requires the implementation to evaluate the
+ * {@code expectedDeadProcessed} guard atomically with the removal — see the
+ * {@link CheckpointStore#resetAfterHistoryLost} contract.</p>
  */
 public abstract class CheckpointStoreContractTest {
 
@@ -180,5 +188,171 @@ public abstract class CheckpointStoreContractTest {
         assertEquals(now, found.lastProcessedTimestamp());
         assertNull(found.lastSeenToken());
         assertNull(found.lastSeenTimestamp());
+    }
+
+    @Test
+    void saveAndFind_roundTripsHeartbeatTimestamp() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var token = BsonDocument.parse("{\"_data\": \"hb-roundtrip\"}");
+
+        store.save(new Checkpoint("s", null, token, now, token, now, now,
+                Collections.emptyMap()));
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertEquals(now, found.lastHeartbeatTimestamp());
+    }
+
+    @Test
+    void saveSeenWithHeartbeat_writesPositionAndConfirmationTogether() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var processed = BsonDocument.parse("{\"_data\": \"processed-1\"}");
+        var seen = BsonDocument.parse("{\"_data\": \"seen-2\"}");
+        var later = now.plusSeconds(10);
+        var heartbeat = now.plusSeconds(11);
+
+        store.save(new Checkpoint("s", null, null, null, processed, now,
+                Collections.emptyMap()));
+
+        store.saveSeen("s", seen, later, heartbeat);
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertEquals(seen, found.lastSeenToken());
+        assertEquals(later, found.lastSeenTimestamp());
+        assertEquals(heartbeat, found.lastHeartbeatTimestamp());
+        assertEquals(processed, found.lastProcessedToken());
+        assertEquals(now, found.lastProcessedTimestamp());
+    }
+
+    @Test
+    void saveHeartbeat_touchesOnlyTheHeartbeatTimestamp() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var seen = BsonDocument.parse("{\"_data\": \"seen-1\"}");
+        var processed = BsonDocument.parse("{\"_data\": \"processed-1\"}");
+        var heartbeat = now.plusSeconds(30);
+
+        store.save(new Checkpoint("s", null, seen, now, processed, now,
+                Collections.emptyMap()));
+
+        store.saveHeartbeat("s", heartbeat);
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertEquals(heartbeat, found.lastHeartbeatTimestamp());
+        assertEquals(seen, found.lastSeenToken());
+        assertEquals(now, found.lastSeenTimestamp());
+        assertEquals(processed, found.lastProcessedToken());
+        assertEquals(now, found.lastProcessedTimestamp());
+    }
+
+    @Test
+    void saveHeartbeat_createsDocumentIfMissing() {
+        var heartbeat = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+
+        store.saveHeartbeat("new-stream", heartbeat);
+
+        var found = store.findByStreamName("new-stream").orElseThrow();
+        assertEquals(heartbeat, found.lastHeartbeatTimestamp());
+        assertNull(found.lastSeenToken());
+        assertNull(found.lastProcessedToken());
+    }
+
+    @Test
+    void resetAfterHistoryLost_installsFreshSeen_clearsProcessed_preservesTheRest() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var deadSeen = BsonDocument.parse("{\"_data\": \"dead-seen\"}");
+        var deadProcessed = BsonDocument.parse("{\"_data\": \"dead-processed\"}");
+        var fresh = BsonDocument.parse("{\"_data\": \"fresh\"}");
+        var recovery = now.plusSeconds(60);
+
+        store.save(new Checkpoint("s", "pod-a", deadSeen, now, deadProcessed, now, now,
+                Map.of("env", "test")));
+
+        store.resetAfterHistoryLost("s", fresh, deadProcessed, recovery);
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertEquals(fresh, found.lastSeenToken());
+        assertEquals(recovery, found.lastSeenTimestamp());
+        assertEquals(recovery, found.lastHeartbeatTimestamp());
+        assertNull(found.lastProcessedToken());
+        assertNull(found.lastProcessedTimestamp());
+        assertEquals("pod-a", found.instanceId());
+        assertEquals("test", found.metadata().get("env"));
+    }
+
+    @Test
+    void resetAfterHistoryLost_processedReplacedConcurrently_preservesIt_stillWritesSeen() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var deadSeen = BsonDocument.parse("{\"_data\": \"dead-seen\"}");
+        var deadProcessed = BsonDocument.parse("{\"_data\": \"dead-processed\"}");
+        var freshProcessed = BsonDocument.parse("{\"_data\": \"fresh-processed\"}");
+        var fresh = BsonDocument.parse("{\"_data\": \"fresh\"}");
+        var recovery = now.plusSeconds(60);
+
+        // Between history-loss detection (which read deadProcessed) and the
+        // reset, a replayed event's handler succeeded and wrote a fresh
+        // processed anchor: the guard must preserve it.
+        store.save(new Checkpoint("s", "pod-a", deadSeen, now, freshProcessed, now, now,
+                Map.of("env", "test")));
+
+        store.resetAfterHistoryLost("s", fresh, deadProcessed, recovery);
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertEquals(fresh, found.lastSeenToken());
+        assertEquals(recovery, found.lastSeenTimestamp());
+        assertEquals(recovery, found.lastHeartbeatTimestamp());
+        assertEquals(freshProcessed, found.lastProcessedToken());
+        assertEquals(now, found.lastProcessedTimestamp());
+        assertEquals("pod-a", found.instanceId());
+        assertEquals("test", found.metadata().get("env"));
+    }
+
+    @Test
+    void resetAfterHistoryLost_nullToken_clearsBothPairs_preservesTheRest() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var deadSeen = BsonDocument.parse("{\"_data\": \"dead-seen\"}");
+        var deadProcessed = BsonDocument.parse("{\"_data\": \"dead-processed\"}");
+
+        store.save(new Checkpoint("s", "pod-a", deadSeen, now, deadProcessed, now, now,
+                Map.of("env", "test")));
+
+        store.resetAfterHistoryLost("s", null, deadProcessed, now.plusSeconds(60));
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertNull(found.lastSeenToken());
+        assertNull(found.lastSeenTimestamp());
+        assertNull(found.lastProcessedToken());
+        assertNull(found.lastProcessedTimestamp());
+        assertNull(found.lastHeartbeatTimestamp(),
+                "a heartbeat without any recoverable position would be a lie");
+        assertEquals("pod-a", found.instanceId());
+        assertEquals("test", found.metadata().get("env"));
+    }
+
+    @Test
+    void resetAfterHistoryLost_createsDocumentIfMissing() {
+        var recovery = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var fresh = BsonDocument.parse("{\"_data\": \"fresh\"}");
+
+        store.resetAfterHistoryLost("new-stream", fresh, null, recovery);
+
+        var found = store.findByStreamName("new-stream").orElseThrow();
+        assertEquals(fresh, found.lastSeenToken());
+        assertEquals(recovery, found.lastHeartbeatTimestamp());
+        assertNull(found.lastProcessedToken());
+    }
+
+    @Test
+    void saveProcessed_preservesHeartbeatTimestamp() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var seen = BsonDocument.parse("{\"_data\": \"seen-1\"}");
+        var processed = BsonDocument.parse("{\"_data\": \"processed-2\"}");
+
+        store.save(new Checkpoint("s", null, seen, now, null, null, now,
+                Collections.emptyMap()));
+
+        store.saveProcessed("s", processed, now.plusSeconds(5));
+
+        var found = store.findByStreamName("s").orElseThrow();
+        assertEquals(now, found.lastHeartbeatTimestamp());
+        assertEquals(processed, found.lastProcessedToken());
     }
 }

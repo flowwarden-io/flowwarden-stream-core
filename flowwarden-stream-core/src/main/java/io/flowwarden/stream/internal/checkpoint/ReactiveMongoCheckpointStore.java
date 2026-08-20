@@ -74,6 +74,33 @@ public class ReactiveMongoCheckpointStore implements CheckpointStore {
     }
 
     @Override
+    public void saveSeen(String streamName, BsonDocument token, Instant timestamp,
+                         Instant heartbeatTimestamp) {
+        // Single atomic update: position and its confirmation are never
+        // observable in an intermediate state.
+        Update update = new Update()
+                .set("lastSeenToken", bsonToDocument(token))
+                .set("lastSeenTimestamp", timestamp)
+                .set("lastHeartbeatTimestamp", heartbeatTimestamp);
+        reactiveMongoTemplate.upsert(
+                Query.query(Criteria.where("_id").is(streamName)),
+                update,
+                MongoCheckpointStore.COLLECTION
+        ).block();
+    }
+
+    @Override
+    public void saveHeartbeat(String streamName, Instant heartbeatTimestamp) {
+        Update update = new Update()
+                .set("lastHeartbeatTimestamp", heartbeatTimestamp);
+        reactiveMongoTemplate.upsert(
+                Query.query(Criteria.where("_id").is(streamName)),
+                update,
+                MongoCheckpointStore.COLLECTION
+        ).block();
+    }
+
+    @Override
     public void saveProcessed(String streamName, BsonDocument token, Instant timestamp) {
         Update update = new Update()
                 .set("lastProcessedToken", bsonToDocument(token))
@@ -83,6 +110,48 @@ public class ReactiveMongoCheckpointStore implements CheckpointStore {
                 update,
                 MongoCheckpointStore.COLLECTION
         ).block();
+    }
+
+    @Override
+    public void resetAfterHistoryLost(String streamName, BsonDocument freshSeenToken,
+                                      BsonDocument expectedDeadProcessed, Instant timestamp) {
+        // Single atomic reset with the at-least-once guard IN the update
+        // filter: the expired processed pair is removed only while it still
+        // matches the value read at history-loss detection. Everything else
+        // (instanceId, metadata, unknown fields) untouched.
+        Update reset = new Update()
+                .unset("lastProcessedToken")
+                .unset("lastProcessedTimestamp");
+        applySeen(reset, freshSeenToken, timestamp);
+        Long modified = reactiveMongoTemplate.updateFirst(
+                Query.query(Criteria.where("_id").is(streamName)
+                        .and("lastProcessedToken").is(bsonToDocument(expectedDeadProcessed))),
+                reset,
+                MongoCheckpointStore.COLLECTION
+        ).map(result -> result.getModifiedCount()).block();
+        if (modified == null || modified == 0) {
+            // A fresh processed token was acquired concurrently (or the
+            // document changed): preserve it, write only the seen position.
+            Update seenOnly = applySeen(new Update(), freshSeenToken, timestamp);
+            reactiveMongoTemplate.upsert(
+                    Query.query(Criteria.where("_id").is(streamName)),
+                    seenOnly,
+                    MongoCheckpointStore.COLLECTION
+            ).block();
+        }
+    }
+
+    private static Update applySeen(Update update, BsonDocument freshSeenToken, Instant timestamp) {
+        if (freshSeenToken != null) {
+            update.set("lastSeenToken", bsonToDocument(freshSeenToken))
+                    .set("lastSeenTimestamp", timestamp)
+                    .set("lastHeartbeatTimestamp", timestamp);
+        } else {
+            // No recoverable position left: a lingering heartbeat would lie.
+            update.unset("lastSeenToken").unset("lastSeenTimestamp")
+                    .unset("lastHeartbeatTimestamp");
+        }
+        return update;
     }
 
     @Override
@@ -101,6 +170,7 @@ public class ReactiveMongoCheckpointStore implements CheckpointStore {
         doc.put("lastSeenTimestamp", cp.lastSeenTimestamp());
         doc.put("lastProcessedToken", bsonToDocument(cp.lastProcessedToken()));
         doc.put("lastProcessedTimestamp", cp.lastProcessedTimestamp());
+        doc.put("lastHeartbeatTimestamp", cp.lastHeartbeatTimestamp());
         doc.put("metadata", cp.metadata() != null ? new Document(cp.metadata()) : null);
         return doc;
     }
@@ -113,6 +183,7 @@ public class ReactiveMongoCheckpointStore implements CheckpointStore {
                 dateToInstant(doc.get("lastSeenTimestamp", Date.class)),
                 documentToBson(doc.get("lastProcessedToken", Document.class)),
                 dateToInstant(doc.get("lastProcessedTimestamp", Date.class)),
+                dateToInstant(doc.get("lastHeartbeatTimestamp", Date.class)),
                 toMetadataMap(doc.get("metadata", Document.class))
         );
     }

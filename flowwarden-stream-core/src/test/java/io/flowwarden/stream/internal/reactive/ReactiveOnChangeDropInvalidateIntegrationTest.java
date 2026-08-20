@@ -70,15 +70,23 @@ class ReactiveOnChangeDropInvalidateIntegrationTest {
     @Autowired
     ReactiveStreamManager streamManager;
 
+    @org.junit.jupiter.api.AfterEach
+    void tearDown() {
+        // The managed restart resurrects the stream after the invalidate —
+        // stop it explicitly, see the imperative twin.
+        try {
+            streamManager.stopStream(STREAM_NAME);
+        } catch (Exception ignored) {
+        }
+    }
+
     /**
-     * Single test asserting both DROP and INVALIDATE dispatch through
-     * {@code @OnChange}. Dropping the watched collection closes the
-     * change stream cursor permanently — splitting the assertions into
-     * two test methods would leave the second one running against a
-     * dead cursor.
+     * DROP dispatches through {@code @OnChange}; INVALIDATE does NOT — it
+     * became a lifecycle-internal event (SPI signal + repair/terminal stop,
+     * never dispatched). See the imperative twin.
      */
     @Test
-    void dropAndInvalidateDispatchToOnChange() {
+    void dropDispatchesToOnChange_invalidateStaysLifecycleInternal() throws Exception {
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning(STREAM_NAME));
 
@@ -100,26 +108,11 @@ class ReactiveOnChangeDropInvalidateIntegrationTest {
                 .as("DROP carries no fullDocument")
                 .isEmpty();
 
-        // INVALIDATE follows DROP in the same flush on most MongoDB
-        // configurations. The Testcontainers single-node replica set may
-        // close the cursor without surfacing the INVALIDATE event; in
-        // that case we abort rather than fail.
-        try {
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                    assertThat(testHandler.events)
-                            .anyMatch(ctx -> ctx.getOperationType() == OperationType.INVALIDATE));
-        } catch (Throwable t) {
-            Assumptions.abort(
-                    "INVALIDATE event not observed within 5s on the Testcontainers replica set "
-                            + "after dropping the watched collection. Behaviour verified manually "
-                            + "against MongoDB Atlas. Aborting rather than failing.");
-        }
-
-        ChangeStreamContext<Document> invalidateCtx = testHandler.events.stream()
-                .filter(ctx -> ctx.getOperationType() == OperationType.INVALIDATE)
-                .findFirst()
-                .orElseThrow();
-        assertThat(invalidateCtx.getFullDocument(Document.class)).isEmpty();
+        // The INVALIDATE that follows must never reach application handlers.
+        Thread.sleep(2_000);
+        assertThat(testHandler.events)
+                .as("INVALIDATE is lifecycle-internal — never dispatched to @OnChange")
+                .noneMatch(ctx -> ctx.getOperationType() == OperationType.INVALIDATE);
     }
 
     @SpringBootApplication
