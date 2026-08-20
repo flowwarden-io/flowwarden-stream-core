@@ -26,7 +26,12 @@ public final class SharedMongoContainer {
         // withCommand replaces the container's default command entirely.
         MONGO.withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
         MONGO.start();
-        Runtime.getRuntime().addShutdownHook(new Thread(MONGO::stop));
+        // NO manual shutdown hook: JVM hook ordering is unspecified, and a
+        // hook killing Mongo while Spring's own shutdown hooks are still
+        // cancelling reading tasks leaves those cancels stuck in the
+        // driver's 30s server selection (Surefire then kills the fork).
+        // Testcontainers' ryuk reaper removes the container after the JVM
+        // exits — the manual hook was redundant.
     }
 
     private SharedMongoContainer() {}

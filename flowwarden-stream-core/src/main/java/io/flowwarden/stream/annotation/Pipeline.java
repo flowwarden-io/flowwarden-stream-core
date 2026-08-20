@@ -42,6 +42,17 @@ import java.lang.annotation.Target;
  * matched the pipeline. This ensures fast restart even when the pipeline filters out
  * most events. See {@link Checkpoint} for the dual-token model.</p>
  *
+ * <p><strong>Do not filter out collection-lifecycle events.</strong> The
+ * invalidate detection (collection drop, database drop, rename — see
+ * {@code onStreamInvalidated}) relies on the stream <em>delivering</em>
+ * those events; the pipeline runs server-side, before FlowWarden sees
+ * anything. A {@code $match} that excludes {@code drop}, {@code dropDatabase},
+ * {@code rename} or {@code invalidate} disables the detection entirely: the
+ * imperative stream stalls silently until the heartbeat's failure signal,
+ * and the reactive stream restarts without classifying the cause (a rename
+ * would be self-healed as if it were a drop). Keep lifecycle operation
+ * types out of exclusion filters.</p>
+ *
  * @see ChangeStream
  */
 @Target(ElementType.METHOD)

@@ -24,6 +24,8 @@ import io.flowwarden.stream.ErrorAction;
 import io.flowwarden.stream.FlowWardenMetrics;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.FullDocumentMode;
+import io.flowwarden.stream.OnHistoryLost;
+import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.StartPosition;
 import io.flowwarden.stream.core.FlowWardenStreamManager;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
@@ -126,11 +128,21 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 return t;
             });
 
+    /**
+     * Per-stream state. The invalidate bookkeeping lives HERE, per
+     * generation — see the imperative manager's twin record for the full
+     * rationale (a late delivery from an old subscription must never repair,
+     * terminate or classify the generation that replaced it).
+     */
     private record ReactiveStreamState(
             AtomicReference<Disposable> disposableHolder,
             ChangeStreamDefinition definition,
             AtomicBoolean gracefulStop,
-            AtomicReference<Throwable> lastError) {
+            AtomicReference<Throwable> lastError,
+            ReactiveHeartbeatProbe probe,
+            AtomicReference<OperationType> pendingInvalidateCause,
+            AtomicBoolean invalidatedTerminal,
+            AtomicBoolean terminated) {
     }
 
     /**
@@ -153,14 +165,10 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
                 @Override
                 public void onTerminalGiveUp(String streamName) {
-                    ChangeStreamDefinition def = registry.findByName(streamName).orElse(null);
-                    if (def != null && def.config().deploymentMode() == DeploymentMode.SINGLE_LEADER
-                            && leaderElection != null) {
-                        // The lease must not be renewed for a stream the loop
-                        // gave up on — release it so a standby's operator at
-                        // least sees the same terminal failure honestly.
-                        leaderElection.stop(streamName);
-                    }
+                    // The lease must not be renewed for a stream the loop
+                    // gave up on — release it so a standby's operator at
+                    // least sees the same terminal failure honestly.
+                    releaseSingleLeaderLease(streamName);
                 }
             });
 
@@ -280,6 +288,9 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         // termination flag tells the code below that cleanup already ran —
         // otherwise a dead stream would keep a scheduled heartbeat forever.
         AtomicReference<Disposable> disposableHolder = new AtomicReference<>();
+        // Termination flag of THIS generation — part of the state so that
+        // isRunning() and the invalidate handling can flip it immediately,
+        // before any repair I/O.
         AtomicBoolean terminated = new AtomicBoolean(false);
 
         if (seedToken != null) {
@@ -293,7 +304,8 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         }
 
         ReactiveStreamState state =
-                new ReactiveStreamState(disposableHolder, def, gracefulStop, lastError);
+                new ReactiveStreamState(disposableHolder, def, gracefulStop, lastError, probe,
+                        new AtomicReference<>(), new AtomicBoolean(false), terminated);
         streams.put(streamName, state);
         scheduleIntervalCheckpoint(def, probe, resumeContext);
 
@@ -302,7 +314,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 .concatMap(event -> {
                     ChangeStreamDocument<Document> raw = event.getRaw();
                     if (raw != null) {
-                        return handleEventReactive(raw, def);
+                        return handleEventReactive(raw, def, state);
                     }
                     return Mono.empty();
                 })
@@ -377,12 +389,22 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                             if (deathHandoffTestHook != null) {
                                 deathHandoffTestHook.run();
                             }
-                            // Runtime death (cursor error or unexpected
-                            // completion): hand the stream to the managed
-                            // resubscription loop — it re-enters the full
-                            // startup path, resume cascade included, with
-                            // capped exponential backoff.
-                            restarter.onRuntimeDeath(streamName, lastError.get());
+                            if (state.invalidatedTerminal().get()) {
+                                // Rename, or invalidation under FAIL: no
+                                // restart — operator action required (the
+                                // invalidate marker in the checkpoint keeps
+                                // later boots honest too).
+                                log.error("Stream '{}' stopped terminally after invalidation — "
+                                        + "no automatic restart", streamName);
+                                releaseSingleLeaderLease(streamName);
+                            } else {
+                                // Runtime death (cursor error or unexpected
+                                // completion): hand the stream to the managed
+                                // resubscription loop — it re-enters the full
+                                // startup path, resume cascade included, with
+                                // capped exponential backoff.
+                                restarter.onRuntimeDeath(streamName, lastError.get());
+                            }
                         }
                     }
                 })
@@ -478,7 +500,10 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     @Override
     public boolean isRunning(String streamName) {
         ReactiveStreamState state = streams.get(streamName);
-        if (state == null) {
+        if (state == null || state.terminated().get()) {
+            // The terminated flag flips at invalidate recognition, BEFORE the
+            // repair I/O — a stream whose cursor is gone must never report
+            // RUNNING while its post-mortem repair is still in flight.
             return false;
         }
         Disposable disposable = state.disposableHolder().get();
@@ -508,6 +533,155 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         return restarter.isRestartPending(streamName);
     }
 
+    /**
+     * Reaction to a delivered INVALIDATE event — see the imperative
+     * manager's twin method for the full rationale (terminal on rename or
+     * under FAIL, marker persisted; synchronous checkpoint self-repair
+     * otherwise, so the restart cascades onto a sane position instead of
+     * replaying the invalidate).
+     */
+    /**
+     * Test hook: runs after the lock-free part of the invalidate handling
+     * (signal, probe) and before the lifecycle-locked repair section — the
+     * TOCTOU window a stop/start can race into.
+     */
+    volatile Runnable invalidateRepairTestHook;
+
+    private Mono<Void> handleInvalidate(ChangeStreamDefinition def,
+                                        ChangeStreamDocument<Document> raw,
+                                        ReactiveStreamState state) {
+        String streamName = def.streamName();
+        // Generation fencing, cheap early exit — re-checked under the
+        // lifecycle lock before any shared mutation.
+        if (streams.get(streamName) != state) {
+            log.debug("Ignoring INVALIDATE from a previous generation of stream '{}'", streamName);
+            return Mono.empty();
+        }
+        // The RUNNING exit comes FIRST — before any external callback and any
+        // network I/O: a stream whose cursor is gone must never keep
+        // reporting healthy while its post-mortem repair runs.
+        state.terminated().set(true);
+
+        OperationType cause = state.pendingInvalidateCause().get() != null
+                ? state.pendingInvalidateCause().get() : OperationType.DROP;
+        log.error("Watched collection invalidated for stream '{}' (cause: {})", streamName, cause);
+        try {
+            FlowWardenMetrics.get().onStreamInvalidated(streamName, cause);
+        } catch (Exception metricsError) {
+            log.warn("Metrics provider failed on invalidate signal for stream '{}': {}",
+                    streamName, metricsError.getMessage());
+        }
+
+        OnHistoryLost strategy = def.checkpointAnnotation() != null
+                ? def.checkpointAnnotation().onHistoryLost() : null;
+        boolean terminal = cause == OperationType.RENAME || strategy == OnHistoryLost.FAIL;
+        BsonDocument invalidateToken = raw.getResumeToken();
+        Instant now = Instant.now();
+
+        if (terminal) {
+            state.invalidatedTerminal().set(true); // this generation's field
+            if (cause == OperationType.RENAME) {
+                log.error("Stream '{}' stops terminally: the watched collection was renamed — "
+                        + "redeploy with @ChangeStream pointing at the new collection", streamName);
+            }
+        }
+        if (def.checkpointAnnotation() == null) {
+            return Mono.empty(); // nothing persisted — the doFinally termination follows
+        }
+        // The repair (probe I/O + store writes) runs off the Reactor thread;
+        // the caller's concatMap awaits this Mono, so the Flux completion
+        // (and the restart armed by doFinally) strictly follows the repair.
+        return Mono.<Void>fromRunnable(
+                        () -> repairInvalidate(streamName, def, state, terminal, invalidateToken, now))
+                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic());
+    }
+
+    private void repairInvalidate(String streamName, ChangeStreamDefinition def,
+                                  ReactiveStreamState state, boolean terminal,
+                                  BsonDocument invalidateToken, Instant now) {
+        // Slow I/O OUTSIDE the lifecycle lock.
+        BsonDocument fresh = null;
+        RuntimeException probeFailure = null;
+        if (!terminal) {
+            try {
+                fresh = state.probe().initialPosition();
+            } catch (RuntimeException e) {
+                probeFailure = e;
+            }
+        }
+
+        if (invalidateRepairTestHook != null) {
+            invalidateRepairTestHook.run();
+        }
+
+        synchronized (lifecycleLock(streamName)) {
+            // TOCTOU fence: a stale generation must not touch the checkpoint
+            // (it would even read the NEW generation's processed token as the
+            // dead-guard and legitimately clear it) or the shared snapshot.
+            if (streams.get(streamName) != state) {
+                log.debug("Discarding invalidate repair of a previous generation of stream '{}'",
+                        streamName);
+                return;
+            }
+            if (terminal) {
+                persistInvalidateMarker(streamName, def, invalidateToken, now);
+            } else if (fresh != null) {
+                try {
+                    BsonDocument deadProcessed = checkpointStore.findByStreamName(streamName)
+                            .map(io.flowwarden.stream.spi.Checkpoint::lastProcessedToken)
+                            .orElse(null);
+                    checkpointStore.resetAfterHistoryLost(streamName, fresh, deadProcessed, now);
+                    latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>())
+                            .set(new TokenSnapshot(fresh, now, TokenSnapshot.Source.SEED));
+                    log.info("Stream '{}' checkpoint self-repaired after invalidate — the restart "
+                            + "will resume from a fresh certified position", streamName);
+                } catch (RuntimeException e) {
+                    log.warn("Post-invalidate self-repair failed for stream '{}' ({}) — falling "
+                            + "back to the level-3 marker", streamName, e.getMessage());
+                    persistInvalidateMarker(streamName, def, invalidateToken, now);
+                }
+            } else {
+                log.warn("Post-invalidate self-repair probe failed for stream '{}' ({}) — falling "
+                        + "back to the level-3 marker", streamName,
+                        probeFailure != null ? probeFailure.getMessage() : "no position");
+                persistInvalidateMarker(streamName, def, invalidateToken, now);
+            }
+        }
+    }
+
+    /**
+     * Durable invalidate marker — see the imperative manager's twin method:
+     * seen = the (unusable) invalidate token, processed cleared atomically,
+     * so every future cascade escalates to level 3 regardless of strategy.
+     */
+    private void persistInvalidateMarker(String streamName, ChangeStreamDefinition def,
+                                         BsonDocument invalidateToken, Instant now) {
+        if (def.checkpointAnnotation() == null || invalidateToken == null) {
+            return;
+        }
+        try {
+            BsonDocument deadProcessed = checkpointStore.findByStreamName(streamName)
+                    .map(io.flowwarden.stream.spi.Checkpoint::lastProcessedToken)
+                    .orElse(null);
+            checkpointStore.resetAfterHistoryLost(streamName, invalidateToken, deadProcessed, now);
+        } catch (RuntimeException e) {
+            log.warn("Failed to persist the invalidate marker for stream '{}': {}",
+                    streamName, e.getMessage());
+        }
+    }
+
+    /**
+     * Under {@code SINGLE_LEADER}, stop the election so the lock is released
+     * instead of being renewed for a stream that terminally gave up.
+     */
+    private void releaseSingleLeaderLease(String streamName) {
+        ChangeStreamDefinition def = registry.findByName(streamName).orElse(null);
+        if (def != null && def.config().deploymentMode() == DeploymentMode.SINGLE_LEADER
+                && leaderElection != null) {
+            leaderElection.stop(streamName);
+        }
+    }
+
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down FlowWarden ReactiveStreamManager ({} streams)", streams.size());
@@ -523,7 +697,8 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     }
 
     private Mono<Void> handleEventReactive(ChangeStreamDocument<Document> raw,
-                                                                     ChangeStreamDefinition def) {
+                                           ChangeStreamDefinition def,
+                                           ReactiveStreamState state) {
         // The event's token is NOT published to the heartbeat snapshot here:
         // a token observed at receipt is not a safe certification chain
         // source while its handler outcome is undecided (a probe chained
@@ -567,6 +742,14 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
                     @Override
                     public void saveCheckpointNow() {
+                        if (isLifecycleEvent(ctx.getOperationType())) {
+                            // A lifecycle event's token is never a usable
+                            // resume position — see the imperative twin.
+                            log.warn("Ignoring manual checkpoint of a {} event for stream '{}': "
+                                    + "lifecycle tokens are not resume positions",
+                                    ctx.getOperationType(), def.streamName());
+                            return;
+                        }
                         BsonDocument token = raw.getResumeToken();
                         if (token != null) {
                             try {
@@ -596,17 +779,34 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 ctx.getWallTime());
         FlowWardenMetrics.get().onEventReceived(def.streamName(), eventMetadata);
 
-        HandlerMethod handler = def.resolveHandler(ctx.getOperationType());
+        OperationType opType = ctx.getOperationType();
+        if (opType == OperationType.DROP || opType == OperationType.DROP_DATABASE
+                || opType == OperationType.RENAME) {
+            // Remember the pre-invalidate cause on THIS generation: the
+            // INVALIDATE that follows carries no indication of what killed
+            // the collection.
+            state.pendingInvalidateCause().set(opType);
+        } else if (opType == OperationType.INVALIDATE) {
+            // INVALIDATE is a lifecycle-internal event: SPI signal + repair
+            // or terminal classification, never dispatched to application
+            // handlers. The returned Mono carries the repair off the Reactor
+            // thread; concatMap sequencing guarantees the Flux completes
+            // (doFinally: eviction, CRASHED, restart) only AFTER the repair
+            // committed.
+            return handleInvalidate(def, raw, state);
+        }
+
+        HandlerMethod handler = def.resolveHandler(opType);
         if (handler == null) {
-            log.debug("No handler for {} in stream '{}'", ctx.getOperationType(), def.streamName());
-            publishSettledToken(def, raw);
+            log.debug("No handler for {} in stream '{}'", opType, def.streamName());
+            publishSettledToken(def, raw, opType);
             return Mono.empty();
         }
 
         if (def.filterMethod() != null) {
             if (!def.filterMethod().evaluate(def.bean(), ctx)) {
                 log.debug("Event filtered by @Filter in stream '{}'", def.streamName());
-                publishSettledToken(def, raw);
+                publishSettledToken(def, raw, opType);
                 return Mono.empty();
             }
         }
@@ -691,12 +891,14 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             long durationNanos = System.nanoTime() - startNanos;
             FlowWardenMetrics.get().onEventProcessed(def.streamName(), durationNanos, true);
             lastActivityTimes.put(def.streamName(), Instant.now());
-            if (!ctx.isCheckpointSavedManually()) {
+            if (!ctx.isCheckpointSavedManually() && !isLifecycleEvent(opType)) {
+                // Lifecycle events never anchor a resume position — see the
+                // imperative manager's twin call site.
                 saveCheckpointIfNeeded(def, raw.getResumeToken(), ctx.getClusterTime());
             }
             // Handler success is terminal — publish AFTER the processed
             // anchor had its chance to be written.
-            publishSettledToken(def, raw);
+            publishSettledToken(def, raw, opType);
         }).onErrorResume(e -> {
             long durationNanos = System.nanoTime() - startNanos;
             // Every error reaching this operator is terminal (SKIP, DLQ,
@@ -705,7 +907,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             // token may serve as a chain source. DLQ reserve: the DECISION
             // settles — the DLQ write below is best-effort and detached,
             // its failure is signaled but does not suspend terminality.
-            publishSettledToken(def, raw);
+            publishSettledToken(def, raw, opType);
 
             // REQ-015: handle sentinel exceptions from @OnError decisions
             if (e instanceof SkipEventException) {
@@ -732,14 +934,32 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     /**
      * Publishes a resume token to the heartbeat's shared snapshot. Only
      * called on terminal-safe outcomes — a token observed at receipt is
-     * never certifiable while its handler outcome is undecided.
+     * never certifiable while its handler outcome is undecided. An INVALIDATE
+     * token is excluded entirely: it is not a usable resume position
+     * ({@code resumeAfter} rejects it) and must never overwrite the fresh
+     * position the post-invalidate self-repair just installed.
      */
     private void publishSettledToken(ChangeStreamDefinition def,
-                                     ChangeStreamDocument<Document> raw) {
+                                     ChangeStreamDocument<Document> raw,
+                                     OperationType opType) {
+        if (isLifecycleEvent(opType)) {
+            return;
+        }
         if (def.checkpointAnnotation() != null && raw.getResumeToken() != null) {
             latestTokens.computeIfAbsent(def.streamName(), k -> new AtomicReference<>())
                     .set(new TokenSnapshot(raw.getResumeToken(), Instant.now()));
         }
+    }
+
+    /**
+     * Collection-lifecycle events (as opposed to data events). Their tokens
+     * never become resume positions.
+     */
+    private static boolean isLifecycleEvent(OperationType opType) {
+        return opType == OperationType.INVALIDATE
+                || opType == OperationType.DROP
+                || opType == OperationType.DROP_DATABASE
+                || opType == OperationType.RENAME;
     }
 
     // --- REQ-015: sentinel exceptions for @OnError decisions in reactive pipeline ---

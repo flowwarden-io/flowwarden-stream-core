@@ -86,8 +86,20 @@ public final class ChangeStreamProbeCommands {
         return new Document("aggregate", def.collection())
                 .append("pipeline", stages)
                 .append("cursor", new Document("batchSize", 1))
+                // Bound the cursor CREATION on the server: probe aggregates
+                // run on lifecycle paths (bootstrap, post-invalidate repair)
+                // and must not execute open-endedly server-side. This is a
+                // server-side bound ONLY — it caps neither server selection
+                // nor a client socket read; a strict wall-clock bound has to
+                // come from the Mongo client's own timeouts. The subsequent
+                // getMore waits are bounded separately by the probes'
+                // maxAwaitTime.
+                .append("maxTimeMS", AGGREGATE_MAX_TIME_MS)
                 .append("comment", comment(def));
     }
+
+    /** Server-side bound for probe cursor creation. */
+    public static final long AGGREGATE_MAX_TIME_MS = 5_000;
 
     public static Document killCursorsCommand(ChangeStreamDefinition def, long cursorId) {
         return new Document("killCursors", def.collection())

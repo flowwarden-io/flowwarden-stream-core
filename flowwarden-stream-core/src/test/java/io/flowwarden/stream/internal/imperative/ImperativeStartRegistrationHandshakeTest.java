@@ -377,6 +377,331 @@ class ImperativeStartRegistrationHandshakeTest {
         manager.shutdown();
     }
 
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void lateInvalidateFromOldGeneration_neverTouchesTheNewGeneration() throws Exception {
+        // Issue-51 fencing: a stop/start can race an in-flight delivery of
+        // the OLD subscription — its INVALIDATE must not repair, classify or
+        // terminate the generation that replaced it.
+        FlowWardenMetrics.setProvider(metrics);
+
+        MongoTemplate template = mock(MongoTemplate.class);
+        MongoTemplateRegistry templateRegistry = mock(MongoTemplateRegistry.class);
+        when(templateRegistry.getDefaultTemplate()).thenReturn(template);
+        when(templateRegistry.resolve(anyString())).thenReturn(template);
+        StreamRegistry registry = mock(StreamRegistry.class);
+        when(registry.findByName(STREAM)).thenReturn(Optional.of(definition()));
+        CheckpointStore checkpointStore = mock(CheckpointStore.class);
+        when(checkpointStore.findByStreamName(anyString())).thenReturn(Optional.empty());
+
+        Subscription liveSubscription = mock(Subscription.class);
+        when(liveSubscription.isActive()).thenReturn(true);
+        MessageListenerContainer container = mock(MessageListenerContainer.class);
+        List<Object> capturedRequests = new CopyOnWriteArrayList<>();
+        when(container.register(any(), any(Class.class), any(ErrorHandler.class)))
+                .thenAnswer(invocation -> {
+                    capturedRequests.add(invocation.getArgument(0));
+                    return liveSubscription;
+                });
+
+        ImperativeStreamManager manager = new ImperativeStreamManager(
+                templateRegistry, registry, checkpointStore, DlqStore.noOp(), null) {
+            @Override
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+                return container;
+            }
+        };
+        // Generation 1, then a stop/start installing generation 2.
+        manager.startStream(STREAM);
+        manager.stopStream(STREAM);
+        manager.startStream(STREAM);
+        assertThat(manager.isRunning(STREAM)).isTrue();
+        assertThat(capturedRequests).hasSize(2);
+        org.mockito.Mockito.clearInvocations(checkpointStore);
+
+        // The OLD generation's listener delivers a late INVALIDATE.
+        org.springframework.data.mongodb.core.messaging.MessageListener oldListener =
+                ((org.springframework.data.mongodb.core.messaging.SubscriptionRequest) capturedRequests.get(0))
+                        .getMessageListener();
+        com.mongodb.client.model.changestream.ChangeStreamDocument<org.bson.Document> raw =
+                mock(com.mongodb.client.model.changestream.ChangeStreamDocument.class);
+        when(raw.getOperationType())
+                .thenReturn(com.mongodb.client.model.changestream.OperationType.INVALIDATE);
+        org.springframework.data.mongodb.core.messaging.Message poison =
+                mock(org.springframework.data.mongodb.core.messaging.Message.class);
+        when(poison.getRaw()).thenReturn(raw);
+        oldListener.onMessage(poison);
+
+        // The fence rejected it before any signal, mutation or repair.
+        assertThat(manager.isRunning(STREAM))
+                .as("the new generation must stay untouched")
+                .isTrue();
+        assertThat(manager.isRestartPending(STREAM)).isFalse();
+        assertThat(metrics.invalidations).isEmpty();
+        assertThat(metrics.stops)
+                .as("only the intermediate stop's GRACEFUL — no crash from the fence")
+                .noneMatch(s -> s.contains("CRASHED"));
+        org.mockito.Mockito.verifyNoInteractions(checkpointStore);
+
+        manager.shutdown();
+    }
+
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void manualCheckpoint_refusesLifecycleEventTokens() throws Exception {
+        // Issue-51 round 2: ctx.saveCheckpointNow() must refuse DROP /
+        // DROP_DATABASE / RENAME tokens — a manually anchored RENAME token
+        // would resume past the classification on the next boot.
+        FlowWardenMetrics.setProvider(metrics);
+
+        MongoTemplate template = mock(MongoTemplate.class);
+        MongoTemplateRegistry templateRegistry = mock(MongoTemplateRegistry.class);
+        when(templateRegistry.getDefaultTemplate()).thenReturn(template);
+        when(templateRegistry.resolve(anyString())).thenReturn(template);
+        StreamRegistry registry = mock(StreamRegistry.class);
+        when(registry.findByName(STREAM))
+                .thenReturn(Optional.of(definitionWithManualSaver()));
+        CheckpointStore checkpointStore = mock(CheckpointStore.class);
+        when(checkpointStore.findByStreamName(anyString())).thenReturn(Optional.empty());
+
+        Subscription liveSubscription = mock(Subscription.class);
+        when(liveSubscription.isActive()).thenReturn(true);
+        MessageListenerContainer container = mock(MessageListenerContainer.class);
+        java.util.concurrent.atomic.AtomicReference<Object> capturedRequest =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        when(container.register(any(), any(Class.class), any(ErrorHandler.class)))
+                .thenAnswer(invocation -> {
+                    capturedRequest.set(invocation.getArgument(0));
+                    return liveSubscription;
+                });
+
+        ImperativeStreamManager manager = new ImperativeStreamManager(
+                templateRegistry, registry, checkpointStore, DlqStore.noOp(), null) {
+            @Override
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+                return container;
+            }
+        };
+        manager.startStream(STREAM);
+        org.springframework.data.mongodb.core.messaging.MessageListener listener =
+                ((org.springframework.data.mongodb.core.messaging.SubscriptionRequest) capturedRequest.get())
+                        .getMessageListener();
+
+        // A data event: the manual save goes through.
+        listener.onMessage(message(com.mongodb.client.model.changestream.OperationType.INSERT));
+        org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.atLeastOnce())
+                .save(any());
+        org.mockito.Mockito.clearInvocations(checkpointStore);
+
+        // Lifecycle events: the manual save is refused — no store write of
+        // any kind may anchor their tokens.
+        listener.onMessage(message(com.mongodb.client.model.changestream.OperationType.DROP));
+        listener.onMessage(message(com.mongodb.client.model.changestream.OperationType.RENAME));
+        org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.never()).save(any());
+        org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.never())
+                .saveProcessed(anyString(), any(), any());
+        org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.never())
+                .saveSeen(anyString(), any(), any());
+        org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.never())
+                .saveSeen(anyString(), any(), any(), any());
+
+        manager.shutdown();
+    }
+
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void invalidateRepairRacingStopStart_staleGenerationNeverTouchesTheNewOne() throws Exception {
+        // Issue-51 round 2 TOCTOU: generation A passes its entry fence, then
+        // blocks (signal/probe window); a stop/start installs generation B;
+        // A resumes — it must re-check under the lifecycle lock and discard
+        // its repair instead of writing the marker over B's checkpoint (it
+        // would even read B's processed token as the dead-guard).
+        FlowWardenMetrics.setProvider(metrics);
+
+        MongoTemplate template = mock(MongoTemplate.class);
+        MongoTemplateRegistry templateRegistry = mock(MongoTemplateRegistry.class);
+        when(templateRegistry.getDefaultTemplate()).thenReturn(template);
+        when(templateRegistry.resolve(anyString())).thenReturn(template);
+        StreamRegistry registry = mock(StreamRegistry.class);
+        when(registry.findByName(STREAM))
+                .thenReturn(Optional.of(definitionWithCheckpoint()));
+        CheckpointStore checkpointStore = mock(CheckpointStore.class);
+        when(checkpointStore.findByStreamName(anyString())).thenReturn(Optional.empty());
+
+        Subscription liveSubscription = mock(Subscription.class);
+        when(liveSubscription.isActive()).thenReturn(true);
+        MessageListenerContainer container = mock(MessageListenerContainer.class);
+        List<Object> capturedRequests = new CopyOnWriteArrayList<>();
+        when(container.register(any(), any(Class.class), any(ErrorHandler.class)))
+                .thenAnswer(invocation -> {
+                    capturedRequests.add(invocation.getArgument(0));
+                    return liveSubscription;
+                });
+
+        ImperativeStreamManager manager = new ImperativeStreamManager(
+                templateRegistry, registry, checkpointStore, DlqStore.noOp(), null) {
+            @Override
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+                return container;
+            }
+        };
+        manager.startStream(STREAM);
+        org.springframework.data.mongodb.core.messaging.MessageListener oldListener =
+                ((org.springframework.data.mongodb.core.messaging.SubscriptionRequest) capturedRequests.get(0))
+                        .getMessageListener();
+
+        java.util.concurrent.CountDownLatch hookEntered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch hookGate = new java.util.concurrent.CountDownLatch(1);
+        manager.invalidateRepairTestHook = () -> {
+            hookEntered.countDown();
+            try {
+                hookGate.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+
+        // Generation A delivers the INVALIDATE and blocks in the window.
+        Thread deliveryThread = new Thread(() -> oldListener.onMessage(
+                message(com.mongodb.client.model.changestream.OperationType.INVALIDATE)));
+        deliveryThread.start();
+        assertThat(hookEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        manager.invalidateRepairTestHook = null;
+
+        // Stop/start installs generation B while A is suspended.
+        manager.stopStream(STREAM);
+        manager.startStream(STREAM);
+        assertThat(manager.isRunning(STREAM)).isTrue();
+        org.mockito.Mockito.clearInvocations(checkpointStore);
+
+        hookGate.countDown();
+        deliveryThread.join(5_000);
+
+        // A discarded its repair: no marker, no reset, no snapshot write, no
+        // restart armed over the living generation B.
+        org.mockito.Mockito.verifyNoInteractions(checkpointStore);
+        assertThat(manager.isRunning(STREAM)).isTrue();
+        assertThat(manager.isRestartPending(STREAM)).isFalse();
+
+        manager.shutdown();
+    }
+
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void invalidateRecognition_exitsRunningBeforeAnyCallbackOrRepairIo() throws Exception {
+        // Issue-51 round 3: the health transition must precede every
+        // external callback and the repair probe — a blocked metrics
+        // provider (or a slow probe) must never keep a cursor-less stream
+        // reporting RUNNING (the original symptom of the issue).
+        metrics.invalidationsEntered = new java.util.concurrent.CountDownLatch(1);
+        metrics.invalidationsGate = new java.util.concurrent.CountDownLatch(1);
+        FlowWardenMetrics.setProvider(metrics);
+
+        MongoTemplate template = mock(MongoTemplate.class);
+        MongoTemplateRegistry templateRegistry = mock(MongoTemplateRegistry.class);
+        when(templateRegistry.getDefaultTemplate()).thenReturn(template);
+        when(templateRegistry.resolve(anyString())).thenReturn(template);
+        StreamRegistry registry = mock(StreamRegistry.class);
+        when(registry.findByName(STREAM))
+                .thenReturn(Optional.of(definitionWithCheckpoint()));
+        CheckpointStore checkpointStore = mock(CheckpointStore.class);
+        when(checkpointStore.findByStreamName(anyString())).thenReturn(Optional.empty());
+
+        Subscription liveSubscription = mock(Subscription.class);
+        when(liveSubscription.isActive()).thenReturn(true);
+        MessageListenerContainer container = mock(MessageListenerContainer.class);
+        java.util.concurrent.atomic.AtomicReference<Object> capturedRequest =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        when(container.register(any(), any(Class.class), any(ErrorHandler.class)))
+                .thenAnswer(invocation -> {
+                    capturedRequest.set(invocation.getArgument(0));
+                    return liveSubscription;
+                });
+
+        ImperativeStreamManager manager = new ImperativeStreamManager(
+                templateRegistry, registry, checkpointStore, DlqStore.noOp(), null) {
+            @Override
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+                return container;
+            }
+        };
+        manager.startStream(STREAM);
+        assertThat(manager.isRunning(STREAM)).isTrue();
+
+        org.springframework.data.mongodb.core.messaging.MessageListener listener =
+                ((org.springframework.data.mongodb.core.messaging.SubscriptionRequest) capturedRequest.get())
+                        .getMessageListener();
+        Thread deliveryThread = new Thread(() -> listener.onMessage(
+                message(com.mongodb.client.model.changestream.OperationType.INVALIDATE)));
+        deliveryThread.start();
+
+        // The provider is blocked inside onStreamInvalidated: the RUNNING
+        // exit already happened.
+        assertThat(metrics.invalidationsEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                .isTrue();
+        assertThat(manager.isRunning(STREAM))
+                .as("the health transition precedes callbacks and repair I/O")
+                .isFalse();
+
+        metrics.invalidationsGate.countDown();
+        deliveryThread.join(5_000);
+        manager.shutdown();
+    }
+
+    private static org.springframework.data.mongodb.core.messaging.Message message(
+            com.mongodb.client.model.changestream.OperationType driverType) {
+        com.mongodb.client.model.changestream.ChangeStreamDocument<org.bson.Document> raw =
+                mock(com.mongodb.client.model.changestream.ChangeStreamDocument.class);
+        when(raw.getOperationType()).thenReturn(driverType);
+        when(raw.getResumeToken()).thenReturn(
+                org.bson.BsonDocument.parse("{\"_data\": \"token-" + driverType.getValue() + "\"}"));
+        org.springframework.data.mongodb.core.messaging.Message message =
+                mock(org.springframework.data.mongodb.core.messaging.Message.class);
+        when(message.getRaw()).thenReturn(raw);
+        return message;
+    }
+
+    /** Bean whose catch-all handler manually checkpoints every event. */
+    public static class ManualSaverBean {
+        public void handle(io.flowwarden.stream.ChangeStreamContext<Document> ctx) {
+            ctx.saveCheckpointNow();
+        }
+    }
+
+    @io.flowwarden.stream.annotation.Checkpoint(startPosition = io.flowwarden.stream.StartPosition.LATEST,
+            onHistoryLost = io.flowwarden.stream.OnHistoryLost.RESUME_FROM_NOW)
+    private static final class CheckpointAnnotationCarrier { }
+
+    private static ChangeStreamDefinition definitionWithManualSaver() throws Exception {
+        io.flowwarden.stream.internal.discovery.HandlerMethod onChange =
+                new io.flowwarden.stream.internal.discovery.HandlerMethod(
+                        ManualSaverBean.class.getMethod("handle",
+                                io.flowwarden.stream.ChangeStreamContext.class),
+                        io.flowwarden.stream.internal.discovery.HandlerMethod.SignatureStyle.CONTEXT_ONLY,
+                        false);
+        StreamConfig config = new StreamConfig(true, false, Document.class, "",
+                FullDocumentMode.DEFAULT, FullDocumentBeforeChangeMode.OFF,
+                DeploymentMode.ALL_INSTANCES);
+        return new ChangeStreamDefinition(STREAM, "handshake_test", "", "",
+                new ManualSaverBean(), onChange, Map.of(), config, null, null,
+                CheckpointAnnotationCarrier.class.getAnnotation(
+                        io.flowwarden.stream.annotation.Checkpoint.class),
+                null, null, null,
+                new ErrorHandlerResolver(List.of()), Map.of());
+    }
+
+    private static ChangeStreamDefinition definitionWithCheckpoint() {
+        StreamConfig config = new StreamConfig(true, false, Document.class, "",
+                FullDocumentMode.DEFAULT, FullDocumentBeforeChangeMode.OFF,
+                DeploymentMode.ALL_INSTANCES);
+        return new ChangeStreamDefinition(STREAM, "handshake_test", "", "",
+                new Object(), null, Map.of(), config, null, null,
+                CheckpointAnnotationCarrier.class.getAnnotation(
+                        io.flowwarden.stream.annotation.Checkpoint.class),
+                null, null, null,
+                new ErrorHandlerResolver(List.of()), Map.of());
+    }
+
     private static ChangeStreamDefinition definition() {
         StreamConfig config = new StreamConfig(true, false, Document.class, "",
                 FullDocumentMode.DEFAULT, FullDocumentBeforeChangeMode.OFF,
@@ -390,6 +715,23 @@ class ImperativeStartRegistrationHandshakeTest {
     private static final class RecordingMetrics implements StreamMetricsProvider {
         final List<String> stops = new CopyOnWriteArrayList<>();
         final List<String> started = new CopyOnWriteArrayList<>();
+        final List<String> invalidations = new CopyOnWriteArrayList<>();
+        volatile java.util.concurrent.CountDownLatch invalidationsEntered;
+        volatile java.util.concurrent.CountDownLatch invalidationsGate;
+
+        @Override
+        public void onStreamInvalidated(String streamName,
+                io.flowwarden.stream.OperationType cause) {
+            invalidations.add(streamName + ":" + cause);
+            if (invalidationsEntered != null) {
+                invalidationsEntered.countDown();
+                try {
+                    invalidationsGate.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
         volatile java.util.concurrent.CountDownLatch stopsEntered;
         volatile java.util.concurrent.CountDownLatch stopsGate;
 
