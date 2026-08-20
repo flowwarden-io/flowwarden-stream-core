@@ -813,7 +813,10 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         if (leaderElection != null) {
             leaderElection.shutdown();
         }
-        for (String streamName : streams.keySet()) {
+        // Snapshot before iterating: a crash eviction on a listener thread
+        // mutates the map concurrently, and the weakly-consistent iterator
+        // could then skip a live stream (leaking its container).
+        for (String streamName : new java.util.ArrayList<>(streams.keySet())) {
             stopStream(streamName);
         }
         intervalScheduler.shutdownNow();
