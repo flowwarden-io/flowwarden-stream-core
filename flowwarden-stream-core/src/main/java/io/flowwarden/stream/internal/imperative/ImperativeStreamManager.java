@@ -100,7 +100,9 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
     private final MongoTemplate defaultTemplate;
     private final StreamRegistry registry;
     private final CheckpointStore checkpointStore;
-    private final DlqStore dlqStore;
+    // Only save() (the hot path) is ever invoked from here — the DlqStore
+    // read methods are cold-path API for downstream consumers.
+    private final DlqStore dlqWriter;
     private final LeaderElectionCoordinator leaderElection; // nullable
     private final Map<String, StreamState> streams = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> eventCounters = new ConcurrentHashMap<>();
@@ -185,13 +187,13 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
     public ImperativeStreamManager(MongoTemplateRegistry templateRegistry,
                                    StreamRegistry registry,
                                    CheckpointStore checkpointStore,
-                                   DlqStore dlqStore,
+                                   DlqStore dlqWriter,
                                    LeaderElectionCoordinator leaderElection) {
         this.templateRegistry = templateRegistry;
         this.defaultTemplate = templateRegistry.getDefaultTemplate();
         this.registry = registry;
         this.checkpointStore = checkpointStore;
-        this.dlqStore = dlqStore;
+        this.dlqWriter = dlqWriter;
         this.leaderElection = leaderElection;
     }
 
@@ -856,7 +858,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                                 ? raw.getFullDocument() : null;
                         Instant expiresAt = policy.computeExpiresAt(Instant.now());
                         try {
-                            dlqStore.save(new FailedEvent(
+                            dlqWriter.save(new FailedEvent(
                                     ctx.getEventId(), def.streamName(),
                                     ctx.getOperationType() != null ? ctx.getOperationType().name() : null,
                                     raw.getDocumentKey(), fullDocument,
@@ -1138,7 +1140,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                     now, now, now,
                     policy.computeExpiresAt(now), ctx.getAllMetadata());
 
-            dlqStore.save(failedEvent, policy);
+            dlqWriter.save(failedEvent, policy);
             FlowWardenMetrics.get().onEventSentToDlq(def.streamName());
             log.info("Event sent to DLQ for stream '{}'", def.streamName());
         } catch (Exception e) {
@@ -1148,7 +1150,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
     }
 
     private void registerDlqCollections() {
-        if (!(dlqStore instanceof MongoDlqStore mongoStore)) {
+        if (!(dlqWriter instanceof MongoDlqStore mongoStore)) {
             return;
         }
         for (ChangeStreamDefinition def : registry.getDefinitions()) {
