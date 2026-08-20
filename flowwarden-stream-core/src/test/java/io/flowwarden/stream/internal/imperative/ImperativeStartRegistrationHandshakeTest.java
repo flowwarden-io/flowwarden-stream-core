@@ -98,7 +98,7 @@ class ImperativeStartRegistrationHandshakeTest {
         ImperativeStreamManager manager = new ImperativeStreamManager(
                 templateRegistry, registry, CheckpointStore.noOp(), DlqStore.noOp(), null) {
             @Override
-            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate, String name) {
                 return container;
             }
         };
@@ -175,7 +175,7 @@ class ImperativeStartRegistrationHandshakeTest {
         ImperativeStreamManager manager = new ImperativeStreamManager(
                 templateRegistry, registry, CheckpointStore.noOp(), DlqStore.noOp(), null) {
             @Override
-            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate, String name) {
                 return container;
             }
         };
@@ -256,7 +256,7 @@ class ImperativeStartRegistrationHandshakeTest {
         ImperativeStreamManager manager = new ImperativeStreamManager(
                 templateRegistry, registry, CheckpointStore.noOp(), DlqStore.noOp(), null) {
             @Override
-            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate, String name) {
                 return container;
             }
         };
@@ -336,7 +336,7 @@ class ImperativeStartRegistrationHandshakeTest {
         ImperativeStreamManager manager = new ImperativeStreamManager(
                 templateRegistry, registry, CheckpointStore.noOp(), DlqStore.noOp(), null) {
             @Override
-            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate, String name) {
                 return container;
             }
         };
@@ -407,7 +407,7 @@ class ImperativeStartRegistrationHandshakeTest {
         ImperativeStreamManager manager = new ImperativeStreamManager(
                 templateRegistry, registry, checkpointStore, DlqStore.noOp(), null) {
             @Override
-            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate, String name) {
                 return container;
             }
         };
@@ -478,7 +478,7 @@ class ImperativeStartRegistrationHandshakeTest {
         ImperativeStreamManager manager = new ImperativeStreamManager(
                 templateRegistry, registry, checkpointStore, DlqStore.noOp(), null) {
             @Override
-            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate, String name) {
                 return container;
             }
         };
@@ -541,7 +541,7 @@ class ImperativeStartRegistrationHandshakeTest {
         ImperativeStreamManager manager = new ImperativeStreamManager(
                 templateRegistry, registry, checkpointStore, DlqStore.noOp(), null) {
             @Override
-            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate, String name) {
                 return container;
             }
         };
@@ -621,7 +621,7 @@ class ImperativeStartRegistrationHandshakeTest {
         ImperativeStreamManager manager = new ImperativeStreamManager(
                 templateRegistry, registry, checkpointStore, DlqStore.noOp(), null) {
             @Override
-            MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+            MessageListenerContainer createContainer(MongoTemplate streamTemplate, String name) {
                 return container;
             }
         };

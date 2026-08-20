@@ -57,6 +57,14 @@ class ChangeStreamProbeCommandsTest {
     }
 
     @Test
+    void aggregateCommand_carriesTheHeartbeatComment() {
+        Document command = ChangeStreamProbeCommands.aggregateCommand(definition(), null, null);
+
+        assertThat(command.getString("comment"))
+                .isEqualTo("flowwarden:heartbeat:probe-commands");
+    }
+
+    @Test
     void aggregateCommand_resumeVariantsKeepTheBound() {
         Document resuming = ChangeStreamProbeCommands.aggregateCommand(definition(), null,
                 BsonDocument.parse("{\"_data\": \"token\"}"));

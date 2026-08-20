@@ -107,8 +107,15 @@ class ReactiveInvalidateHarnessTest {
                     return sink.asFlux();
                 });
 
+        // Bypass the comment-stamping template rebuild: the harness template
+        // is a mock whose changeStream() IS the seam under test.
         ReactiveStreamManager manager = new ReactiveStreamManager(
-                templateRegistry, registry, checkpointStore, DlqStore.noOp(), null);
+                templateRegistry, registry, checkpointStore, DlqStore.noOp(), null) {
+            @Override
+            ReactiveMongoTemplate stampedForStream(ReactiveMongoTemplate t, String name) {
+                return t;
+            }
+        };
         return new Harness(manager, checkpointStore, sinks);
     }
 
