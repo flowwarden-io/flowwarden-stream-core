@@ -47,6 +47,11 @@ class MongoDlqStoreIntegrationTest extends DlqStoreContractTest {
     }
 
     @Override
+    protected boolean supportsReplay() {
+        return true; // Mongo overrides the cold-path reads
+    }
+
+    @Override
     protected void cleanState() {
         mongoTemplate = new MongoTemplate(
                 MongoClients.create(SharedMongoContainer.MONGO.getReplicaSetUrl()), "test"

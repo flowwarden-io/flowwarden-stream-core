@@ -24,6 +24,15 @@ import java.util.Optional;
  * <p>The Core ships with a {@linkplain #noOp() no-op} implementation and a
  * MongoDB-backed implementation registered via auto-configuration.
  * Users may provide their own implementation as a Spring bean.</p>
+ *
+ * <p>The contract has two halves. The <strong>hot path</strong> is
+ * {@link #save}: the runtime invokes it on every handler failure. The
+ * <strong>cold path</strong> is the {@code find*} read methods: they exist
+ * for downstream consumers (forensics, a replay UI) and are never called by
+ * the runtime itself. The reads are {@code default} and return empty so a
+ * publish-only backend (message queue, log sink — anywhere consumed means
+ * gone) can implement {@code save} honestly without faking reads it cannot
+ * serve. Stateful backends that can replay override them.</p>
  */
 public interface DlqStore {
 
@@ -44,18 +53,30 @@ public interface DlqStore {
     /**
      * Retrieves a failed event by its unique identifier.
      *
+     * <p>Cold path — read by downstream consumers, never by the runtime.
+     * Defaults to empty so publish-only backends can ship without faking
+     * reads; backends that can replay override.</p>
+     *
      * @param id event identifier
-     * @return the failed event, or empty if none exists
+     * @return the failed event, or empty if none exists (always empty for
+     *         a backend that does not override this method)
      */
-    Optional<FailedEvent> findById(String id);
+    default Optional<FailedEvent> findById(String id) {
+        return Optional.empty();
+    }
 
     /**
      * Retrieves all failed events for the given stream.
      *
+     * <p>Cold path — see {@link #findById(String)}.</p>
+     *
      * @param streamName stream identifier
-     * @return list of failed events (may be empty)
+     * @return list of failed events (may be empty; always empty for a
+     *         backend that does not override this method)
      */
-    List<FailedEvent> findByStreamName(String streamName);
+    default List<FailedEvent> findByStreamName(String streamName) {
+        return List.of();
+    }
 
     /**
      * Returns the shared no-op implementation that silently ignores all calls.

@@ -99,7 +99,9 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     private final ReactiveMongoTemplate defaultReactiveTemplate;
     private final StreamRegistry registry;
     private final CheckpointStore checkpointStore;
-    private final DlqStore dlqStore;
+    // Only save() (the hot path) is ever invoked from here — the DlqStore
+    // read methods are cold-path API for downstream consumers.
+    private final DlqStore dlqWriter;
     private final LeaderElectionCoordinator leaderElection; // nullable
     private final Map<String, ReactiveStreamState> streams = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> eventCounters = new ConcurrentHashMap<>();
@@ -175,13 +177,13 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     public ReactiveStreamManager(MongoTemplateRegistry templateRegistry,
                                   StreamRegistry registry,
                                   CheckpointStore checkpointStore,
-                                  DlqStore dlqStore,
+                                  DlqStore dlqWriter,
                                   LeaderElectionCoordinator leaderElection) {
         this.templateRegistry = templateRegistry;
         this.defaultReactiveTemplate = templateRegistry.getDefaultReactiveTemplate();
         this.registry = registry;
         this.checkpointStore = checkpointStore;
-        this.dlqStore = dlqStore;
+        this.dlqWriter = dlqWriter;
         this.leaderElection = leaderElection;
     }
 
@@ -725,7 +727,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                                 ? raw.getFullDocument() : null;
                         Instant expiresAt = policy.computeExpiresAt(Instant.now());
                         try {
-                            dlqStore.save(new FailedEvent(
+                            dlqWriter.save(new FailedEvent(
                                     ctx.getEventId(), def.streamName(),
                                     ctx.getOperationType() != null ? ctx.getOperationType().name() : null,
                                     raw.getDocumentKey(), fullDocument,
@@ -1011,7 +1013,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     policy.computeExpiresAt(now), ctx.getAllMetadata());
 
             // DlqStore.save() uses blocking I/O, so schedule it off the reactive thread
-            Mono.fromRunnable(() -> dlqStore.save(failedEvent, policy))
+            Mono.fromRunnable(() -> dlqWriter.save(failedEvent, policy))
                     .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
                     .doOnSuccess(v -> {
                         FlowWardenMetrics.get().onEventSentToDlq(def.streamName());
@@ -1029,7 +1031,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     }
 
     private void registerDlqCollections() {
-        if (!(dlqStore instanceof ReactiveMongoDlqStore reactiveStore)) {
+        if (!(dlqWriter instanceof ReactiveMongoDlqStore reactiveStore)) {
             return;
         }
         for (ChangeStreamDefinition def : registry.getDefinitions()) {
