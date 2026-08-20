@@ -82,6 +82,30 @@ public interface StreamMetricsProvider {
     default void onStreamRestarted(String streamName, int attempt, Throwable cause) {}
 
     /**
+     * Called when the watched collection was invalidated (dropped, its
+     * database dropped, or renamed) — MongoDB closed the underlying change
+     * stream cursor. Always followed by an
+     * {@code onStreamStopped(streamName, CRASHED, cause)} for the cursor
+     * death itself.
+     *
+     * <p>What happens next depends on the cause and the stream's
+     * {@code onHistoryLost} strategy: a drop under a self-repairing strategy
+     * heals automatically (fresh certified position, managed resubscription —
+     * an {@link #onStreamRestarted} follows); a rename, or any invalidation
+     * under {@code FAIL}, stops the stream terminally (the declared
+     * collection identity is gone, or the stream refuses to skip history) —
+     * an operator action is required.</p>
+     *
+     * @param streamName stream identifier
+     * @param cause      the operation that invalidated the stream:
+     *                   {@code DROP}, {@code DROP_DATABASE} or {@code RENAME}
+     *                   ({@code DROP} when the pre-invalidate event was not
+     *                   observed)
+     */
+    default void onStreamInvalidated(String streamName,
+                                     io.flowwarden.stream.OperationType cause) {}
+
+    /**
      * Called when an event is received from MongoDB, before handler execution.
      *
      * @param streamName stream identifier

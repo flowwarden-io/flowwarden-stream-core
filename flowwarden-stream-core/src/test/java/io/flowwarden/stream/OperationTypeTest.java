@@ -22,8 +22,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class OperationTypeTest {
 
     @Test
-    void hasSixValues() {
-        assertEquals(6, OperationType.values().length);
+    void hasEightValues() {
+        assertEquals(8, OperationType.values().length);
     }
 
     @Test
@@ -33,6 +33,8 @@ class OperationTypeTest {
         assertNotNull(OperationType.valueOf("REPLACE"));
         assertNotNull(OperationType.valueOf("DELETE"));
         assertNotNull(OperationType.valueOf("DROP"));
+        assertNotNull(OperationType.valueOf("DROP_DATABASE"));
+        assertNotNull(OperationType.valueOf("RENAME"));
         assertNotNull(OperationType.valueOf("INVALIDATE"));
     }
 }

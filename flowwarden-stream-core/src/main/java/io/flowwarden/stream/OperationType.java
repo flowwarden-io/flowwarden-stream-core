@@ -24,5 +24,13 @@ public enum OperationType {
     REPLACE,
     DELETE,
     DROP,
+    /** The watched collection's database was dropped. Followed by {@link #INVALIDATE}. */
+    DROP_DATABASE,
+    /**
+     * The watched collection was renamed. Followed by {@link #INVALIDATE};
+     * the declared collection identity no longer matches, so the stream
+     * stops terminally instead of self-healing.
+     */
+    RENAME,
     INVALIDATE
 }
