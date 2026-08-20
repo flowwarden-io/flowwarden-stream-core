@@ -21,6 +21,7 @@ import io.flowwarden.stream.spi.FailedEvent;
 import org.bson.BsonDocument;
 import org.bson.BsonString;
 import org.bson.Document;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -40,6 +41,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>Subclass for each backend (Mongo, Redis, Kafka, …) and provide a fresh
  * {@link DlqStore} via {@link #createDlqStore()} plus a {@link #cleanState()}
  * hook that resets the backing storage between tests.</p>
+ *
+ * <p>The contract mirrors the SPI's hot/cold split: the write tests always
+ * run, the read tests only run when the subclass declares the replay
+ * capability. Like the SPI itself, replay is opt-in: a publish-only
+ * backend (queue, log sink) keeps the inherited empty defaults and is
+ * green out of the box; a stateful backend that overrides the cold-path
+ * {@code find*} methods overrides {@link #supportsReplay()} to return
+ * {@code true} — until then its read tests are reported as skipped
+ * {@linkplain Assumptions assumptions}, not failures.</p>
  */
 public abstract class DlqStoreContractTest {
 
@@ -57,14 +67,66 @@ public abstract class DlqStoreContractTest {
      */
     protected abstract void cleanState();
 
+    /**
+     * Whether the implementation under test overrides the cold-path read
+     * methods ({@code findById} / {@code findByStreamName}). Defaults to
+     * {@code false}, mirroring the SPI where replay is absent until a
+     * backend implements it: stateful backends override this to return
+     * {@code true} to activate the read-contract tests.
+     */
+    protected boolean supportsReplay() {
+        return false;
+    }
+
+    private void assumeReplay() {
+        Assumptions.assumeTrue(supportsReplay(),
+                "read contract skipped: override supportsReplay() to return true "
+                        + "if this backend overrides the cold-path find* methods");
+    }
+
     @BeforeEach
     void setUpContract() {
         cleanState();
         store = createDlqStore();
     }
 
+    // --- Write contract: always runs, read-free -------------------------
+
+    @Test
+    void saveAcceptsFullyPopulatedEvent() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var event = new FailedEvent(
+                "evt-w1", "my-stream", "INSERT",
+                new BsonDocument("_id", new BsonString("doc-w1")),
+                new Document("status", "NEW").append("amount", 42),
+                BsonDocument.parse("{\"_data\": \"resume-w1\"}"),
+                new FailedEvent.ErrorInfo("RuntimeException", "boom", "stack trace here"),
+                3, FailedEvent.STATUS_PENDING,
+                now, now, now, null, Map.of("env", "test")
+        );
+
+        store.save(event, DEFAULT_POLICY);
+    }
+
+    @Test
+    void saveAcceptsNullableFields() {
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        var event = new FailedEvent(
+                "evt-w-null", "stream-x", "DELETE",
+                null, null, null,
+                new FailedEvent.ErrorInfo("Ex", "msg", null),
+                1, FailedEvent.STATUS_PENDING,
+                now, now, now, null, Collections.emptyMap()
+        );
+
+        store.save(event, DEFAULT_POLICY);
+    }
+
+    // --- Read contract: requires overridden cold-path reads -------------
+
     @Test
     void saveAndFindById() {
+        assumeReplay();
         var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
         var docKey = new BsonDocument("_id", new BsonString("doc-1"));
         var fullDoc = new Document("status", "NEW").append("amount", 42);
@@ -106,11 +168,13 @@ public abstract class DlqStoreContractTest {
 
     @Test
     void findByIdReturnsEmptyWhenNotFound() {
+        assumeReplay();
         assertTrue(store.findById("nonexistent").isEmpty());
     }
 
     @Test
     void findByStreamName() {
+        assumeReplay();
         var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
 
         store.save(makeEvent("e1", "stream-A", now), DEFAULT_POLICY);
@@ -131,6 +195,7 @@ public abstract class DlqStoreContractTest {
 
     @Test
     void roundTripWithNullableFields() {
+        assumeReplay();
         var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
         var event = new FailedEvent(
                 "evt-null", "stream-x", "DELETE",
@@ -152,6 +217,7 @@ public abstract class DlqStoreContractTest {
 
     @Test
     void saveOverwritesExisting() {
+        assumeReplay();
         var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
         store.save(makeEvent("e1", "s", now), DEFAULT_POLICY);
         store.save(new FailedEvent(
