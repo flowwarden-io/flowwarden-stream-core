@@ -131,7 +131,13 @@ class ImperativeCheckpointFailureIntegrationTest {
 
         // The 3rd write succeeded → exactly 1 onCheckpoint emitted (NOT 3 — the
         // optimistic-emit bug is fixed: failed writes no longer report success).
-        assertThat(metrics.checkpointSuccesses("imp-cp-fail-post-handler")).isEqualTo(1);
+        // Await: the handler records the event BEFORE the post-handler
+        // checkpoint write, so the previous awaits can be satisfied while the
+        // 3rd save is still in flight. A regression to optimistic emission
+        // still fails here — the count would be 3, never 1.
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(
+                        metrics.checkpointSuccesses("imp-cp-fail-post-handler")).isEqualTo(1));
     }
 
     @Test
