@@ -107,7 +107,8 @@ public final class ChangeStreamProbeCommands {
     }
 
     public static String comment(ChangeStreamDefinition def) {
-        return "flowwarden:heartbeat:" + def.streamName();
+        return io.flowwarden.stream.internal.CursorCommentStamping
+                .heartbeatCommentFor(def.streamName());
     }
 
     public static long cursorId(Document reply) {

@@ -125,7 +125,7 @@ final class ImperativeHeartbeatProbe implements HeartbeatProbe {
                 .watch(pipeline)
                 .batchSize(1)
                 .maxAwaitTime(MAX_AWAIT_MILLIS, TimeUnit.MILLISECONDS)
-                .comment("flowwarden:heartbeat:" + def.streamName());
+                .comment(ChangeStreamProbeCommands.comment(def));
         if (def.config().fullDocument() != FullDocumentMode.DEFAULT) {
             iterable = iterable.fullDocument(
                     FullDocument.valueOf(def.config().fullDocument().name()));

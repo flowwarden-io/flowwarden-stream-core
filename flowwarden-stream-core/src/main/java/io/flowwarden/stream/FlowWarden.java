@@ -20,6 +20,21 @@ package io.flowwarden.stream;
  */
 public final class FlowWarden {
 
+    /**
+     * Prefix of the {@code comment} stamped on every MongoDB change stream
+     * cursor opened by FlowWarden, for attribution in {@code $currentOp},
+     * server logs and the profiler. (Ordinary query cursors — checkpoint,
+     * DLQ, lock reads — are not stamped.) A stream's main change stream cursor carries
+     * {@code flowwarden:<streamName>}; heartbeat probe cursors carry
+     * {@code flowwarden:heartbeat:<streamName>}; the ephemeral resume-token
+     * validation cursors opened during the startup/restart resume cascade
+     * carry {@code flowwarden:resume-validation:<streamName>}. Downstream
+     * tooling can
+     * match on this prefix to tell FlowWarden cursors apart from any other
+     * change stream consumer on the deployment.
+     */
+    public static final String CURSOR_COMMENT_PREFIX = "flowwarden:";
+
     private FlowWarden() {
     }
 }

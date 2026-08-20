@@ -252,7 +252,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         ChangeStreamDefinition def = findDefinition(streamName);
 
         MongoTemplate streamTemplate = templateFor(def);
-        MessageListenerContainer container = createContainer(streamTemplate);
+        MessageListenerContainer container = createContainer(streamTemplate, streamName);
 
         // Resolve the @Pipeline stages once: the main stream and the heartbeat
         // probe MUST observe the exact same pipeline documents.
@@ -294,7 +294,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                 && def.checkpointAnnotation().startPosition() == StartPosition.RESUME) {
             resumeContext = ResumeCascade.resolve(streamName, def.checkpointAnnotation(),
                     checkpointStore, probe,
-                    token -> isTokenValid(def.collection(), token, streamTemplate),
+                    token -> isTokenValid(def.collection(), token, streamTemplate, streamName),
                     () -> getOldestOplogTimestamp(streamTemplate));
             if (resumeContext.seedToken() != null) {
                 builder.resumeAfter(resumeContext.seedToken());
@@ -460,7 +460,17 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
     }
 
     /** Test seam: the reading-task container for one stream. */
-    MessageListenerContainer createContainer(MongoTemplate streamTemplate) {
+    MessageListenerContainer createContainer(MongoTemplate streamTemplate, String streamName) {
+        // The container gets a template whose database factory stamps
+        // comment "flowwarden:<stream>" on the change stream cursor for
+        // $currentOp attribution — Spring Data exposes no comment option, so
+        // the stamp rides the only object the cursor is created from. Same
+        // converter, so document mapping is untouched.
+        MongoTemplate stamped = new MongoTemplate(
+                io.flowwarden.stream.internal.CursorCommentStamping.stamp(
+                        streamTemplate.getMongoDatabaseFactory(),
+                        io.flowwarden.stream.internal.CursorCommentStamping.commentFor(streamName)),
+                streamTemplate.getConverter());
         // Named reading threads (Spring's default executor spawns anonymous
         // "SimpleAsyncTaskExecutor-N" threads). Deliberately NON-daemon: in a
         // non-web application whose only permanent work is the change stream,
@@ -469,7 +479,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         // Spring context and the stream are healthy.
         org.springframework.core.task.SimpleAsyncTaskExecutor executor =
                 new org.springframework.core.task.SimpleAsyncTaskExecutor("fw-stream-listener-");
-        return new DefaultMessageListenerContainer(streamTemplate, executor);
+        return new DefaultMessageListenerContainer(stamped, executor);
     }
 
     /**
@@ -1269,10 +1279,13 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         }
     }
 
-    boolean isTokenValid(String collection, BsonDocument token, MongoTemplate template) {
+    boolean isTokenValid(String collection, BsonDocument token, MongoTemplate template,
+                         String streamName) {
         try (MongoCursor<ChangeStreamDocument<Document>> cursor =
                      template.getCollection(collection).watch()
                              .resumeAfter(token)
+                             .comment(io.flowwarden.stream.internal.CursorCommentStamping
+                                     .validationCommentFor(streamName))
                              .batchSize(1)
                              .maxAwaitTime(1, TimeUnit.MILLISECONDS)
                              .cursor()) {

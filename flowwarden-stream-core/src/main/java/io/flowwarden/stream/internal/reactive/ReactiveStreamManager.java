@@ -253,7 +253,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 && def.checkpointAnnotation().startPosition() == StartPosition.RESUME) {
             resumeContext = ResumeCascade.resolve(streamName, def.checkpointAnnotation(),
                     checkpointStore, probe,
-                    token -> isTokenValid(def.collection(), token, streamTemplate),
+                    token -> isTokenValid(def.collection(), token, streamTemplate, streamName),
                     () -> getOldestOplogTimestamp(streamTemplate));
             if (resumeContext.seedToken() != null) {
                 optionsBuilder.resumeAfter(resumeContext.seedToken());
@@ -311,7 +311,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         streams.put(streamName, state);
         scheduleIntervalCheckpoint(def, probe, resumeContext);
 
-        Disposable disposable = streamTemplate
+        Disposable disposable = stampedForStream(streamTemplate, streamName)
                 .changeStream(def.collection(), options, Document.class)
                 .concatMap(event -> {
                     ChangeStreamDocument<Document> raw = event.getRaw();
@@ -1150,9 +1150,33 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         }
     }
 
-    boolean isTokenValid(String collection, BsonDocument token, ReactiveMongoTemplate template) {
+    /**
+     * Test seam + stamping point: the subscription goes through a template
+     * whose database factory stamps comment "flowwarden:&lt;stream&gt;" on
+     * the change stream cursor for $currentOp attribution — Spring Data
+     * exposes no comment option, so the stamp rides the only object the
+     * cursor is created from. Same converter, so mapping is untouched.
+     */
+    ReactiveMongoTemplate stampedForStream(ReactiveMongoTemplate template, String streamName) {
+        return new ReactiveMongoTemplate(
+                io.flowwarden.stream.internal.CursorCommentStamping.stamp(
+                        template.getMongoDatabaseFactory(),
+                        io.flowwarden.stream.internal.CursorCommentStamping.commentFor(streamName)),
+                template.getConverter());
+    }
+
+    boolean isTokenValid(String collection, BsonDocument token, ReactiveMongoTemplate template,
+                         String streamName) {
+        // The validation cursor goes through Spring Data too — stamp it via
+        // a decorated template, same mechanism as the main cursor.
+        ReactiveMongoTemplate probeTemplate = new ReactiveMongoTemplate(
+                io.flowwarden.stream.internal.CursorCommentStamping.stamp(
+                        template.getMongoDatabaseFactory(),
+                        io.flowwarden.stream.internal.CursorCommentStamping
+                                .validationCommentFor(streamName)),
+                template.getConverter());
         try {
-            template
+            probeTemplate
                     .changeStream(collection,
                             ChangeStreamOptions.builder().resumeAfter(token).build(),
                             Document.class)
