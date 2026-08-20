@@ -52,6 +52,26 @@ class MongoDlqStoreIntegrationTest extends DlqStoreContractTest {
     }
 
     @Override
+    protected boolean supportsCount() {
+        return true; // Mongo overrides DlqStore.count
+    }
+
+    @Test
+    void registeringAStream_provisionsTheCountCoveringIndex() {
+        mongoStore.registerStream("idx-probe-stream", CUSTOM_COLLECTION);
+
+        // The acceptable cost of count() rests on this compound index —
+        // assert both fields and their order.
+        var compound = mongoTemplate.indexOps(CUSTOM_COLLECTION).getIndexInfo().stream()
+                .filter(info -> info.getIndexFields().size() == 2
+                        && info.getIndexFields().get(0).getKey().equals("streamName")
+                        && info.getIndexFields().get(1).getKey().equals("status"))
+                .toList();
+        org.junit.jupiter.api.Assertions.assertEquals(1, compound.size(),
+                "expected a {streamName: 1, status: 1} index on the DLQ collection");
+    }
+
+    @Override
     protected void cleanState() {
         mongoTemplate = new MongoTemplate(
                 MongoClients.create(SharedMongoContainer.MONGO.getReplicaSetUrl()), "test"

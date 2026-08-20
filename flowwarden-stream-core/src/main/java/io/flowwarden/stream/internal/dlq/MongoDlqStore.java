@@ -56,7 +56,7 @@ public class MongoDlqStore implements DlqStore {
     private final MongoTemplate mongoTemplate;
     private final String defaultCollection;
     private final ConcurrentMap<String, String> streamToCollection = new ConcurrentHashMap<>();
-    private final ConcurrentMap<String, Boolean> ttlIndexCreated = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Boolean> indexesCreated = new ConcurrentHashMap<>();
 
     public MongoDlqStore(MongoTemplate mongoTemplate, MongoDlqProperties properties) {
         this.mongoTemplate = mongoTemplate;
@@ -75,22 +75,28 @@ public class MongoDlqStore implements DlqStore {
         String resolved = (collection == null || collection.isEmpty())
                 ? defaultCollection : collection;
         streamToCollection.put(streamName, resolved);
-        ensureTtlIndex(resolved);
+        ensureIndexes(resolved);
     }
 
     String collectionFor(String streamName) {
         return streamToCollection.getOrDefault(streamName, defaultCollection);
     }
 
-    private void ensureTtlIndex(String collection) {
-        ttlIndexCreated.computeIfAbsent(collection, c -> {
+    private void ensureIndexes(String collection) {
+        indexesCreated.computeIfAbsent(collection, c -> {
             try {
                 mongoTemplate.indexOps(c)
                         .ensureIndex(new Index().on("expiresAt", org.springframework.data.domain.Sort.Direction.ASC)
                                 .expire(0));
-                log.debug("Ensured TTL index on '{}.expiresAt' for DLQ collection", c);
+                // Covers the backlog count filter (streamName + status) —
+                // without it every count would collection-scan.
+                mongoTemplate.indexOps(c)
+                        .ensureIndex(new Index()
+                                .on("streamName", org.springframework.data.domain.Sort.Direction.ASC)
+                                .on("status", org.springframework.data.domain.Sort.Direction.ASC));
+                log.debug("Ensured DLQ indexes (TTL, streamName+status) on collection '{}'", c);
             } catch (Exception e) {
-                log.warn("Failed to create TTL index on '{}.expiresAt': {}", c, e.getMessage());
+                log.warn("Failed to create DLQ indexes on '{}': {}", c, e.getMessage());
             }
             return Boolean.TRUE;
         });
@@ -120,6 +126,17 @@ public class MongoDlqStore implements DlqStore {
                 .stream()
                 .map(MongoDlqStore::fromDocument)
                 .toList();
+    }
+
+    @Override
+    public long count(String streamName) {
+        // Always filtered — even a "dedicated" collection is only dedicated
+        // by convention (two streams may register the same one), and only
+        // PENDING entries are backlog. Rules out estimatedDocumentCount
+        // (collection-level, unfilterable) by construction.
+        Query query = Query.query(Criteria.where("streamName").is(streamName)
+                .and("status").is(FailedEvent.STATUS_PENDING));
+        return mongoTemplate.count(query, collectionFor(streamName));
     }
 
     private java.util.Set<String> distinctCollections() {
