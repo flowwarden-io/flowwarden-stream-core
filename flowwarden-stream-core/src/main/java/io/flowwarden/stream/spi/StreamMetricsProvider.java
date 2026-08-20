@@ -62,6 +62,26 @@ public interface StreamMetricsProvider {
     default void onStreamStopped(String streamName, StopReason reason, Throwable cause) {}
 
     /**
+     * Called when a stream that died at runtime (cursor death — network
+     * outage, primary stepdown, non-resumable server error) has been
+     * successfully resubscribed by the managed restart loop.
+     *
+     * <p>Always follows an {@code onStreamStopped(streamName, CRASHED, cause)}
+     * for the same incident, and an {@link #onStreamStarted} fires for the
+     * new subscription as usual — this signal adds the restart-specific
+     * context: how many attempts the recovery took and what killed the
+     * previous subscription. A recurring stream of these is an operational
+     * signal (flaky network, undersized oplog) even though each individual
+     * incident healed itself.</p>
+     *
+     * @param streamName stream identifier
+     * @param attempt    the attempt number that succeeded (1 = first try)
+     * @param cause      the error that killed the previous subscription, or
+     *                   {@code null} if it could not be captured
+     */
+    default void onStreamRestarted(String streamName, int attempt, Throwable cause) {}
+
+    /**
      * Called when an event is received from MongoDB, before handler execution.
      *
      * @param streamName stream identifier

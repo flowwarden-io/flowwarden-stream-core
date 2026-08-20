@@ -42,9 +42,25 @@ import java.util.Objects;
  * container thread is dead. Any exception thrown by the cleanup callback is
  * suppressed onto the original throwable &mdash; cleanup is best-effort and
  * must never replace the cause Spring will see.</p>
+ *
+ * <p>The rethrown throwable is wrapped in {@link ListenerCrashedException}:
+ * the container routes it to the registered {@code ErrorHandler}, which must
+ * tell listener-level crashes (fail-stop: cancel the subscription, no
+ * restart) apart from cursor deaths (managed restart) — the marker is that
+ * provenance.</p>
  */
 final class FlowWardenMessageListenerWrapper
         implements MessageListener<ChangeStreamDocument<Document>, Document> {
+
+    /**
+     * Provenance marker for the manager's {@code ErrorHandler}: the wrapped
+     * cause escaped the <em>listener</em>, the cursor itself is fine.
+     */
+    static final class ListenerCrashedException extends RuntimeException {
+        ListenerCrashedException(Throwable cause) {
+            super(cause);
+        }
+    }
 
     private final MessageListener<ChangeStreamDocument<Document>, Document> delegate;
     private final String streamName;
@@ -64,13 +80,23 @@ final class FlowWardenMessageListenerWrapper
         try {
             delegate.onMessage(message);
         } catch (Throwable t) {
-            FlowWardenMetrics.get().onStreamStopped(streamName, StopReason.CRASHED, t);
+            // Cleanup FIRST: onCrash publishes the lock-free termination
+            // signal — a slow (or throwing) metrics provider must not delay
+            // it, and neither call may replace the cause, skip the other, or
+            // prevent the provenance marker from reaching the ErrorHandler
+            // (an unmarked listener crash would be misclassified as a cursor
+            // death and restarted over a still-active reader).
             try {
                 onCrash.run();
             } catch (RuntimeException cleanupError) {
                 t.addSuppressed(cleanupError);
             }
-            throw t;
+            try {
+                FlowWardenMetrics.get().onStreamStopped(streamName, StopReason.CRASHED, t);
+            } catch (RuntimeException metricsError) {
+                t.addSuppressed(metricsError);
+            }
+            throw new ListenerCrashedException(t);
         }
     }
 }
