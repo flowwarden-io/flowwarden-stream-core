@@ -28,7 +28,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
 import reactor.core.publisher.Mono;
 
-import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 
@@ -44,8 +43,16 @@ import java.util.Objects;
  * PBRT in {@code cursor.postBatchResumeToken}. The server-side cursor is
  * always killed.</p>
  *
- * <p>Blocking with a timeout is acceptable here: the probe runs on
- * stream-core's own daemon scheduler thread, never on a Reactor thread.</p>
+ * <p>Blocking is acceptable here: the probe runs on stream-core's own
+ * daemon scheduler thread, never on a Reactor thread. There is deliberately
+ * NO library-level client timeout on these blocking reads — the library
+ * rides the application's own Mongo client, whose settings
+ * ({@code readTimeoutMS} / {@code socketTimeoutMS} / {@code timeoutMS})
+ * are the authoritative wall-clock policy, exactly like the imperative
+ * probe. The library owns only the <em>semantic</em> server-side bound
+ * ({@code maxTimeMS} on the probe aggregate): a healthy server always
+ * answers within it, and a probe that dies by it dies as an attributable
+ * {@code MaxTimeMSExpired} that leaves no cursor behind.</p>
  *
  * <p>This class is internal and not part of the public API.</p>
  */
@@ -54,7 +61,6 @@ final class ReactiveHeartbeatProbe implements HeartbeatProbe {
     private static final Logger log = LoggerFactory.getLogger(ReactiveHeartbeatProbe.class);
 
     static final long MAX_AWAIT_MILLIS = 1_000;
-    private static final Duration COMMAND_TIMEOUT = Duration.ofSeconds(5);
 
     private final ReactiveMongoTemplate template;
     private final ChangeStreamDefinition def;
@@ -144,7 +150,7 @@ final class ReactiveHeartbeatProbe implements HeartbeatProbe {
 
     private MongoDatabase database() {
         MongoDatabase db = template.getMongoDatabaseFactory().getMongoDatabase()
-                .block(COMMAND_TIMEOUT);
+                .block();
         if (db == null) {
             throw new IllegalStateException("MongoDatabase unavailable");
         }
@@ -152,7 +158,7 @@ final class ReactiveHeartbeatProbe implements HeartbeatProbe {
     }
 
     private static Document runCommand(MongoDatabase db, Document command) {
-        Document reply = Mono.from(db.runCommand(command)).block(COMMAND_TIMEOUT);
+        Document reply = Mono.from(db.runCommand(command)).block();
         if (reply == null) {
             throw new IllegalStateException("No reply for command: " + command.keySet());
         }
@@ -166,7 +172,7 @@ final class ReactiveHeartbeatProbe implements HeartbeatProbe {
         try {
             Mono.from(db.runCommand(
                     ChangeStreamProbeCommands.killCursorsCommand(def, cursorId)))
-                    .block(COMMAND_TIMEOUT);
+                    .block();
         } catch (Exception e) {
             log.debug("Failed to kill heartbeat probe cursor for stream '{}': {}",
                     def.streamName(), e.getMessage());
