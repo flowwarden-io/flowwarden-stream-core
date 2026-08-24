@@ -65,6 +65,17 @@
         <module>flowwarden-bom</module>
     </modules>
 
+    <!-- SNAPSHOTs only: CI publishes main snapshots to GitHub Packages so the
+         satellite repos can build against unreleased core between releases.
+         Releases never go through here — they ship to Maven Central via the
+         central-publishing plugin in the `release` profile. -->
+    <distributionManagement>
+        <snapshotRepository>
+            <id>github</id>
+            <url>https://maven.pkg.github.com/flowwarden-io/flowwarden-stream-core</url>
+        </snapshotRepository>
+    </distributionManagement>
+
     <properties>
         <java.version>17</java.version>
         <testcontainers.version>1.21.4</testcontainers.version>
