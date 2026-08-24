@@ -43,4 +43,11 @@ final class NoOpDlqStore implements DlqStore {
     public List<FailedEvent> findByStreamName(String streamName) {
         return Collections.emptyList();
     }
+
+    @Override
+    public long count(String streamName) {
+        // Truthfully empty: this store never keeps anything — unlike the
+        // SPI default (-1), which means "cannot count".
+        return 0;
+    }
 }

@@ -99,8 +99,10 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     private final ReactiveMongoTemplate defaultReactiveTemplate;
     private final StreamRegistry registry;
     private final CheckpointStore checkpointStore;
-    // Only save() (the hot path) is ever invoked from here — the DlqStore
-    // read methods are cold-path API for downstream consumers.
+    // save() (the hot path) is invoked from event processing; count() only
+    // ever runs on the stats thread (startup, periodic tick, coalesced
+    // post-write refresh). The remaining read methods are cold-path API for
+    // downstream consumers.
     private final DlqStore dlqWriter;
     private final LeaderElectionCoordinator leaderElection; // nullable
     private final Map<String, ReactiveStreamState> streams = new ConcurrentHashMap<>();
@@ -126,6 +128,21 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     private final ScheduledExecutorService probeScheduler =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "fw-heartbeat-probe-reactive");
+                t.setDaemon(true);
+                return t;
+            });
+    /**
+     * Dedicated single thread for observability collection (periodic oplog
+     * stats, DLQ backlog counts): unbounded backend I/O that must never ride
+     * the flush scheduler (checkpoint coalescing) nor the probe thread. A
+     * blocked count blocks only this thread — flushes, probes and event
+     * processing keep advancing. Single-threaded on purpose: periodic
+     * refreshes never overlap themselves, and fresh post-DLQ-write emits
+     * serialize with them.
+     */
+    private final ScheduledExecutorService statsScheduler =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "fw-stats-reactive");
                 t.setDaemon(true);
                 return t;
             });
@@ -207,8 +224,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 startStream(def.streamName());
             }
         }
-        collectOplogStats();
-        scheduleOplogStatsRefresh();
+        scheduleStatsRefresh();
     }
 
     /**
@@ -699,6 +715,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         }
         intervalScheduler.shutdownNow();
         probeScheduler.shutdownNow();
+        statsScheduler.shutdownNow();
     }
 
     private Mono<Void> handleEventReactive(ChangeStreamDocument<Document> raw,
@@ -743,6 +760,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                                     def.streamName(), e.getMessage(), e);
                             throw e;
                         }
+                        emitDlqBacklogAsync(def.streamName());
                     }
 
                     @Override
@@ -1018,6 +1036,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     .doOnSuccess(v -> {
                         FlowWardenMetrics.get().onEventSentToDlq(def.streamName());
                         log.info("Event sent to DLQ for stream '{}'", def.streamName());
+                        emitDlqBacklogAsync(def.streamName());
                     })
                     .doOnError(e -> {
                         FlowWardenMetrics.get().onEventDlqFailed(def.streamName(), e);
@@ -1282,16 +1301,111 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     private static final long OPLOG_REFRESH_INTERVAL_SECONDS = 60;
 
     /**
-     * Schedules periodic refresh of oplog stats (every 60s).
+     * Pushes the standing DLQ backlog gauge for every DLQ-enabled stream —
+     * whether or not the stream currently runs, its backlog stays
+     * console-relevant. Best-effort per stream; a store that cannot count
+     * (negative) emits nothing rather than a lying zero.
      */
-    private void scheduleOplogStatsRefresh() {
-        intervalScheduler.scheduleAtFixedRate(() -> {
-            try {
-                collectOplogStats();
-            } catch (Exception e) {
-                log.debug("Periodic oplog stats refresh failed: {}", e.getMessage());
+    private void collectDlqBacklogs() {
+        for (ChangeStreamDefinition def : registry.getDefinitions()) {
+            DeadLetterQueue dlqAnn = def.deadLetterQueueAnnotation();
+            if (dlqAnn == null || !dlqAnn.enabled()) {
+                continue;
             }
-        }, OPLOG_REFRESH_INTERVAL_SECONDS, OPLOG_REFRESH_INTERVAL_SECONDS, TimeUnit.SECONDS);
+            emitDlqBacklog(def.streamName());
+        }
+    }
+
+    private final Map<String, AtomicBoolean> backlogEmitScheduled = new ConcurrentHashMap<>();
+    private final Map<String, AtomicBoolean> backlogEmitDirty = new ConcurrentHashMap<>();
+
+    /**
+     * Fresh backlog gauge right after a successful DLQ write, submitted to
+     * the stats thread: the count is unbounded backend I/O and must never
+     * hold up the event-processing path — the DLQ entry is already durable.
+     *
+     * <p>Coalesced per stream: at most one count queued or running, plus a
+     * dirty bit granting exactly one more pass when a write lands during an
+     * active count. A blocked backend therefore costs a bounded queue (one
+     * task per stream, not one per write) and its return triggers one
+     * catch-up count, not one per missed write — while the LAST state is
+     * always eventually published. Each pass runs as its own task so a
+     * write flood never monopolizes the stats thread.</p>
+     */
+    private void emitDlqBacklogAsync(String streamName) {
+        AtomicBoolean scheduled =
+                backlogEmitScheduled.computeIfAbsent(streamName, k -> new AtomicBoolean());
+        AtomicBoolean dirty =
+                backlogEmitDirty.computeIfAbsent(streamName, k -> new AtomicBoolean());
+        dirty.set(true);
+        if (scheduled.compareAndSet(false, true)) {
+            submitToStats(() -> runCoalescedBacklogEmit(streamName, scheduled, dirty));
+        }
+    }
+
+    private void runCoalescedBacklogEmit(String streamName,
+                                         AtomicBoolean scheduled,
+                                         AtomicBoolean dirty) {
+        dirty.set(false);
+        try {
+            emitDlqBacklog(streamName);
+        } finally {
+            scheduled.set(false);
+            // A write that landed during the count saw scheduled=true and
+            // did not submit — pick it up here (exactly one of the two
+            // racing sides wins the CAS).
+            if (dirty.get() && scheduled.compareAndSet(false, true)) {
+                submitToStats(() -> runCoalescedBacklogEmit(streamName, scheduled, dirty));
+            }
+        }
+    }
+
+    private void submitToStats(Runnable task) {
+        try {
+            statsScheduler.execute(task);
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Shutting down — the gauge is best-effort.
+        }
+    }
+
+    private void emitDlqBacklog(String streamName) {
+        try {
+            long backlog = dlqWriter.count(streamName);
+            if (backlog >= 0) {
+                FlowWardenMetrics.get().onDlqBacklog(streamName, backlog);
+            }
+        } catch (Exception e) {
+            log.debug("DLQ backlog count failed for stream '{}': {}", streamName, e.getMessage());
+        }
+    }
+
+    /**
+     * Schedules the periodic stats refresh (oplog window + DLQ backlogs)
+     * on the dedicated stats thread. Fixed DELAY, not fixed rate: an
+     * observability poll doing I/O means "60s after the previous pass
+     * finished" — a pass blocked for minutes must not be followed by a
+     * catch-up burst of the missed deadlines.
+     */
+    private void scheduleStatsRefresh() {
+        // Initial delay 0: the startup collection IS the first pass of the
+        // same fixed-delay chain — a blocked initial pass therefore delays
+        // the first tick instead of being overlapped by it.
+        statsScheduler.scheduleWithFixedDelay(this::collectStats,
+                0, OPLOG_REFRESH_INTERVAL_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /** One stats pass — the first one doubles as the startup collection. */
+    private void collectStats() {
+        try {
+            collectOplogStats();
+        } catch (Exception e) {
+            log.debug("Oplog stats refresh failed: {}", e.getMessage());
+        }
+        try {
+            collectDlqBacklogs();
+        } catch (Exception e) {
+            log.debug("DLQ backlog refresh failed: {}", e.getMessage());
+        }
     }
 
     /**
@@ -1300,7 +1414,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
      */
     private void collectOplogStats() {
         try {
-            defaultReactiveTemplate.getMongoDatabaseFactory()
+            // Deliberately BLOCKING: this runs on the dedicated fw-stats
+            // thread (never a Reactor thread), and the fixed-delay contract
+            // needs the pass's real duration — a fire-and-forget subscribe
+            // would let the next tick overlap an oplog read still in flight.
+            var tuple = defaultReactiveTemplate.getMongoDatabaseFactory()
                     .getMongoDatabase("local")
                     .flatMap(db -> {
                         var collection = db.getCollection("oplog.rs");
@@ -1312,19 +1430,18 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                                 .limit(1).first());
                         return Mono.zip(oldestMono, newestMono);
                     })
-                    .subscribe(
-                            tuple -> {
-                                BsonTimestamp oldestTs = tuple.getT1().get("ts", BsonTimestamp.class);
-                                BsonTimestamp newestTs = tuple.getT2().get("ts", BsonTimestamp.class);
-                                double logLengthHours = (newestTs.getTime() - oldestTs.getTime()) / 3600.0;
-                                FlowWardenMetrics.get().onOplogStats(Math.max(0, logLengthHours), "OK");
-                                log.debug("Oplog window: {}h", String.format("%.1f", logLengthHours));
-                            },
-                            e -> {
-                                log.debug("Oplog stats unavailable: {}", e.getMessage());
-                                FlowWardenMetrics.get().onOplogStats(0.0, "UNAVAILABLE");
-                            }
-                    );
+                    .block();
+            if (tuple != null) {
+                BsonTimestamp oldestTs = tuple.getT1().get("ts", BsonTimestamp.class);
+                BsonTimestamp newestTs = tuple.getT2().get("ts", BsonTimestamp.class);
+                double logLengthHours = (newestTs.getTime() - oldestTs.getTime()) / 3600.0;
+                FlowWardenMetrics.get().onOplogStats(Math.max(0, logLengthHours), "OK");
+                log.debug("Oplog window: {}h", String.format("%.1f", logLengthHours));
+            } else {
+                // Empty zip (empty oplog): previously terminated without any
+                // callback — now published as UNAVAILABLE.
+                FlowWardenMetrics.get().onOplogStats(0.0, "UNAVAILABLE");
+            }
         } catch (Exception e) {
             log.debug("Oplog stats unavailable: {}", e.getMessage());
             FlowWardenMetrics.get().onOplogStats(0.0, "UNAVAILABLE");

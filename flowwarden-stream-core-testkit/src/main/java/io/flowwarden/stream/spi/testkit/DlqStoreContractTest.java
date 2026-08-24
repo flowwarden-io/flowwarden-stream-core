@@ -49,7 +49,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * green out of the box; a stateful backend that overrides the cold-path
  * {@code find*} methods overrides {@link #supportsReplay()} to return
  * {@code true} — until then its read tests are reported as skipped
- * {@linkplain Assumptions assumptions}, not failures.</p>
+ * {@linkplain Assumptions assumptions}, not failures. The backlog count is
+ * a separate capability with its own {@link #supportsCount()} hook, so all
+ * four combinations stay expressible: publish-only, replay-only,
+ * count-only, replay+count.</p>
  */
 public abstract class DlqStoreContractTest {
 
@@ -78,10 +81,29 @@ public abstract class DlqStoreContractTest {
         return false;
     }
 
+    /**
+     * Whether the implementation under test overrides
+     * {@code DlqStore.count}. Independent of {@link #supportsReplay()} —
+     * the SPI models them as separate capabilities (a backend may replay
+     * without counting, or count without replaying), and the SPI default
+     * {@code -1} is a supported value, not a contract failure. Defaults to
+     * {@code false}; counting backends override with {@code true} to
+     * activate the backlog-count tests.
+     */
+    protected boolean supportsCount() {
+        return false;
+    }
+
     private void assumeReplay() {
         Assumptions.assumeTrue(supportsReplay(),
                 "read contract skipped: override supportsReplay() to return true "
                         + "if this backend overrides the cold-path find* methods");
+    }
+
+    private void assumeCount() {
+        Assumptions.assumeTrue(supportsCount(),
+                "count contract skipped: override supportsCount() to return true "
+                        + "if this backend overrides DlqStore.count");
     }
 
     @BeforeEach
@@ -231,6 +253,44 @@ public abstract class DlqStoreContractTest {
         var found = store.findById("e1").orElseThrow();
         assertEquals("s-updated", found.streamName());
         assertEquals(5, found.attempts());
+    }
+
+    @Test
+    void countIsZeroOnEmptyBacklog() {
+        assumeCount();
+        assertEquals(0, store.count("no-such-stream"));
+    }
+
+    @Test
+    void countReturnsPendingEntriesPerStream() {
+        assumeCount();
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+
+        store.save(makeEvent("c1", "stream-A", now), DEFAULT_POLICY);
+        store.save(makeEvent("c2", "stream-A", now), DEFAULT_POLICY);
+        store.save(makeEvent("c3", "stream-B", now), DEFAULT_POLICY);
+
+        assertEquals(2, store.count("stream-A"));
+        assertEquals(1, store.count("stream-B"));
+        assertEquals(0, store.count("stream-C"));
+    }
+
+    @Test
+    void countIgnoresNonPendingEntries() {
+        assumeCount();
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+
+        store.save(makeEvent("p1", "stream-A", now), DEFAULT_POLICY);
+        // A reprocessed/acknowledged entry is no longer backlog.
+        store.save(new FailedEvent(
+                "p2", "stream-A", "INSERT",
+                null, null, null,
+                new FailedEvent.ErrorInfo("TestEx", "test", null),
+                1, "REPROCESSED",
+                now, now, now, null, Collections.emptyMap()
+        ), DEFAULT_POLICY);
+
+        assertEquals(1, store.count("stream-A"));
     }
 
     protected static FailedEvent makeEvent(String id, String streamName, Instant now) {

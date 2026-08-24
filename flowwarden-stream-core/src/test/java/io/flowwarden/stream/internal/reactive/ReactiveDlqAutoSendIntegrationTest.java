@@ -16,6 +16,7 @@
 package io.flowwarden.stream.internal.reactive;
 
 import io.flowwarden.stream.ChangeStreamContext;
+import io.flowwarden.stream.FlowWardenMetrics;
 import io.flowwarden.stream.annotation.ChangeStream;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
 import io.flowwarden.stream.annotation.EnableFlowWarden;
@@ -23,6 +24,8 @@ import io.flowwarden.stream.annotation.OnInsert;
 import io.flowwarden.stream.annotation.RetryPolicy;
 import io.flowwarden.stream.spi.DlqStore;
 import io.flowwarden.stream.spi.FailedEvent;
+import io.flowwarden.stream.spi.StreamMetricsProvider;
+import io.flowwarden.stream.test.RecordingBacklogMetrics;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -67,6 +70,30 @@ class ReactiveDlqAutoSendIntegrationTest {
 
     @Autowired
     DlqStore dlqStore;
+
+    @Test
+    void dlqBacklogGauge_emittedWithFreshCountAfterDlqWrite() {
+        RecordingBacklogMetrics metrics = new RecordingBacklogMetrics();
+        FlowWardenMetrics.setProvider(metrics);
+        try {
+            await().atMost(Duration.ofSeconds(5))
+                    .until(() -> streamManager.isRunning("reactive-dlq-direct"));
+            reactiveMongoTemplate.insert(new Document("test", "backlog-gauge"),
+                    "reactiveDlqDirectOrders").block();
+
+            // Fresh gauge right after the DLQ write — the console channel.
+            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                    assertThat(metrics.backlogs)
+                            .anyMatch(b -> b.streamName().equals("reactive-dlq-direct")
+                                    && b.pending() >= 1));
+
+            // The SPI count agrees with listing (all entries PENDING here).
+            assertThat(dlqStore.count("reactive-dlq-direct"))
+                    .isEqualTo(dlqStore.findByStreamName("reactive-dlq-direct").size());
+        } finally {
+            FlowWardenMetrics.setProvider(StreamMetricsProvider.noOp());
+        }
+    }
 
     @Test
     void eventSentToDlqAfterRetryExhaustion() {

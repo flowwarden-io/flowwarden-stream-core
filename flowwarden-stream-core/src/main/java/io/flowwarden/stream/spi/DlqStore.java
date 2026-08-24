@@ -79,6 +79,25 @@ public interface DlqStore {
     }
 
     /**
+     * Number of pending DLQ entries for the stream — its standing backlog,
+     * i.e. entries with status {@link FailedEvent#STATUS_PENDING} waiting to
+     * be reprocessed.
+     *
+     * <p>Cold path — see {@link #findById(String)}. Defaults to {@code -1},
+     * meaning this backend cannot serve counts (publish-only backends:
+     * queue consumed means gone). Stateful backends override with a real
+     * count; the runtime only emits a backlog gauge for non-negative
+     * values, so an unknowing backend never produces a lying zero.</p>
+     *
+     * @param streamName stream identifier
+     * @return the pending entry count, or {@code -1} when the backend
+     *         cannot count
+     */
+    default long count(String streamName) {
+        return -1;
+    }
+
+    /**
      * Returns the shared no-op implementation that silently ignores all calls.
      */
     static DlqStore noOp() {

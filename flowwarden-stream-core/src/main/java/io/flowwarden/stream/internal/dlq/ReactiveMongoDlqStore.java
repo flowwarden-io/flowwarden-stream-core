@@ -50,7 +50,7 @@ public class ReactiveMongoDlqStore implements DlqStore {
     private final ReactiveMongoTemplate reactiveMongoTemplate;
     private final String defaultCollection;
     private final ConcurrentMap<String, String> streamToCollection = new ConcurrentHashMap<>();
-    private final ConcurrentMap<String, Boolean> ttlIndexCreated = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Boolean> indexesCreated = new ConcurrentHashMap<>();
 
     public ReactiveMongoDlqStore(ReactiveMongoTemplate reactiveMongoTemplate,
                                  MongoDlqProperties properties) {
@@ -62,22 +62,29 @@ public class ReactiveMongoDlqStore implements DlqStore {
         String resolved = (collection == null || collection.isEmpty())
                 ? defaultCollection : collection;
         streamToCollection.put(streamName, resolved);
-        ensureTtlIndex(resolved);
+        ensureIndexes(resolved);
     }
 
     String collectionFor(String streamName) {
         return streamToCollection.getOrDefault(streamName, defaultCollection);
     }
 
-    private void ensureTtlIndex(String collection) {
-        ttlIndexCreated.computeIfAbsent(collection, c -> {
+    private void ensureIndexes(String collection) {
+        indexesCreated.computeIfAbsent(collection, c -> {
             try {
                 reactiveMongoTemplate.indexOps(c)
                         .ensureIndex(new Index().on("expiresAt", Sort.Direction.ASC).expire(0))
                         .block();
-                log.debug("Ensured TTL index on '{}.expiresAt' for DLQ collection", c);
+                // Covers the backlog count filter (streamName + status) —
+                // without it every count would collection-scan.
+                reactiveMongoTemplate.indexOps(c)
+                        .ensureIndex(new Index()
+                                .on("streamName", Sort.Direction.ASC)
+                                .on("status", Sort.Direction.ASC))
+                        .block();
+                log.debug("Ensured DLQ indexes (TTL, streamName+status) on collection '{}'", c);
             } catch (Exception e) {
-                log.warn("Failed to create TTL index on '{}.expiresAt': {}", c, e.getMessage());
+                log.warn("Failed to create DLQ indexes on '{}': {}", c, e.getMessage());
             }
             return Boolean.TRUE;
         });
@@ -109,6 +116,16 @@ public class ReactiveMongoDlqStore implements DlqStore {
         return docs.stream()
                 .map(MongoDlqStore::fromDocument)
                 .toList();
+    }
+
+    @Override
+    public long count(String streamName) {
+        // Same contract as the sync store: always filtered (shared default
+        // collection; "dedicated" is only a convention), PENDING only.
+        Query query = Query.query(Criteria.where("streamName").is(streamName)
+                .and("status").is(FailedEvent.STATUS_PENDING));
+        Long count = reactiveMongoTemplate.count(query, collectionFor(streamName)).block();
+        return count != null ? count : -1;
     }
 
     private Set<String> distinctCollections() {

@@ -60,4 +60,15 @@ class DlqStoreDefaultsTest {
         assertThat(publishOnly.findById("anything")).isEmpty();
         assertThat(publishOnly.findByStreamName("anything")).isEmpty();
     }
+
+    @Test
+    void defaultCount_isMinusOne_meaningCannotCount() {
+        DlqStore publishOnly = (event, policy) -> { };
+
+        // -1 = "this backend cannot serve counts" — distinct from the no-op
+        // store's truthful 0. The runtime only emits a backlog gauge for
+        // non-negative values.
+        assertThat(publishOnly.count("anything")).isEqualTo(-1);
+        assertThat(DlqStore.noOp().count("anything")).isZero();
+    }
 }
