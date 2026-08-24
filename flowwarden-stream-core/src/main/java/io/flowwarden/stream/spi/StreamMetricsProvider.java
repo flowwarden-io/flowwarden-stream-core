@@ -292,6 +292,24 @@ public interface StreamMetricsProvider {
     void onOplogStats(double logLengthHours, String status);
 
     /**
+     * Standing DLQ backlog gauge: the number of {@code PENDING} entries
+     * sitting in the stream's DLQ, from {@link DlqStore#count(String)}.
+     * Complements {@link #onEventSentToDlq}, which only observes write
+     * activity — this is the backlog itself, drain included.
+     *
+     * <p>Emitted periodically (same cadence as {@link #onOplogStats}) for
+     * every stream with a DLQ configured, and refreshed right after each
+     * successful DLQ write. Never emitted when the configured store cannot
+     * count (a negative {@code count}), so a publish-only backend produces
+     * no lying zero-gauge.</p>
+     *
+     * @param streamName   the stream name
+     * @param pendingCount the current pending entry count (never negative)
+     */
+    default void onDlqBacklog(String streamName, long pendingCount) {
+    }
+
+    /**
      * Called when this instance's leadership role changes for a stream.
      *
      * @param streamName the stream name

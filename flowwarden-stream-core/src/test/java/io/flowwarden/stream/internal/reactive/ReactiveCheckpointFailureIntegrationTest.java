@@ -129,13 +129,21 @@ class ReactiveCheckpointFailureIntegrationTest {
                     assertThat(failures).allMatch(t -> t instanceof MongoWriteConcernException);
                 });
 
-        // Await: the handler records the event BEFORE the post-handler
-        // checkpoint write, so the previous awaits can be satisfied while the
-        // 3rd save is still in flight. A regression to optimistic emission
-        // still fails here — the count would be 3, never 1.
+        // Store-confirmed oracle, exact with or without restarts/replays:
+        // every write the store actually confirmed emits exactly one
+        // onCheckpoint. An optimistic-emit regression makes the emissions
+        // exceed the confirmed writes (failed writes reporting success) —
+        // that inequality can never be produced by legitimate replays,
+        // which increment both sides together.
         await().atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> assertThat(
-                        metrics.checkpointSuccesses("rea-cp-fail-post-handler")).isEqualTo(1));
+                        metrics.checkpointSuccesses("rea-cp-fail-post-handler"))
+                        .isGreaterThanOrEqualTo(1));
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(
+                        metrics.checkpointSuccesses("rea-cp-fail-post-handler"))
+                        .as("failed checkpoint writes must not report success")
+                        .isEqualTo(failingStore.confirmedSaveProcessed("rea-cp-fail-post-handler")));
     }
 
     @Test
@@ -196,8 +204,14 @@ class ReactiveCheckpointFailureIntegrationTest {
         }
     }
 
+    // Both periodic policies opted out: the interval flush AND the probe
+    // certifications (diagnostic probe shortly after start, idle probes)
+    // all emit onCheckpoint when they persist a position — through saveSeen,
+    // which the store-confirmed counter does not track. Disabling them
+    // isolates the saveProcessed emissions so they can be compared exactly
+    // to the store-confirmed write count.
     @ChangeStream(name = "rea-cp-fail-post-handler", collection = "rea_cp_fail_post_handler")
-    @Checkpoint(saveEveryN = 1)
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 0, idleHeartbeatIntervalSeconds = 0)
     static class PostHandlerStream {
         private final List<ChangeStreamContext<?>> events = new CopyOnWriteArrayList<>();
 
@@ -261,6 +275,7 @@ class ReactiveCheckpointFailureIntegrationTest {
 
         void reset() {
             remainingFailures.clear();
+            confirmedSaveProcessed.clear();
         }
 
         private void maybeThrow(String key) {
@@ -280,6 +295,15 @@ class ReactiveCheckpointFailureIntegrationTest {
         public void saveProcessed(String streamName, BsonDocument token, Instant timestamp) {
             maybeThrow("saveProcessed:" + streamName);
             delegate.saveProcessed(streamName, token, timestamp);
+            confirmedSaveProcessed.computeIfAbsent(streamName, k -> new AtomicInteger())
+                    .incrementAndGet();
+        }
+
+        private final Map<String, AtomicInteger> confirmedSaveProcessed = new ConcurrentHashMap<>();
+
+        int confirmedSaveProcessed(String streamName) {
+            AtomicInteger c = confirmedSaveProcessed.get(streamName);
+            return c == null ? 0 : c.get();
         }
 
         @Override
