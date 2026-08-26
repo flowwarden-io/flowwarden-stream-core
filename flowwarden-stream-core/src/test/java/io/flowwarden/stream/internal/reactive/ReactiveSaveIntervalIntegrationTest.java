@@ -74,24 +74,25 @@ class ReactiveSaveIntervalIntegrationTest {
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning("interval-reactive-test"));
 
-        // Insert 1 doc — not enough for saveEveryN=100, so lastProcessedToken
-        // will NOT be persisted. The periodic timer (saveIntervalSeconds=2)
-        // is responsible for advancing lastSeenToken so the stream can recover
-        // even on streams where the saveEveryN counter rarely triggers.
+        // Insert 1 doc — not enough for the count threshold (saveEveryN=100).
+        // The time threshold (saveIntervalSeconds=2) is responsible for
+        // anchoring the settled token so an active-but-slow stream stays
+        // recoverable even when the counter rarely triggers.
         reactiveMongoTemplate.insert(new Document("item", "A"), "interval_orders").block();
 
         await().atMost(Duration.ofSeconds(5))
                 .untilAsserted(() ->
                         assertThat(handler.getEvents()).hasSizeGreaterThanOrEqualTo(1));
 
-        // Wait for the periodic timer (2s interval) to save the checkpoint
+        // Wait for the periodic timer (2s interval) to persist the anchor
         await().atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> {
                     var checkpoint = checkpointStore.findByStreamName("interval-reactive-test");
                     assertThat(checkpoint).isPresent();
-                    // Timer advances lastSeenToken only — lastProcessedToken stays null
-                    // because saveEveryN=100 hasn't triggered yet
-                    assertThat(checkpoint.get().lastSeenToken()).isNotNull();
+                    assertThat(checkpoint.get().lastProcessedToken()).isNotNull();
+                    assertThat(checkpoint.get().lastHeartbeatTimestamp())
+                            .as("an anchor write confirms the recoverable position")
+                            .isNotNull();
                 });
     }
 
@@ -107,29 +108,29 @@ class ReactiveSaveIntervalIntegrationTest {
                 .untilAsserted(() ->
                         assertThat(handler.getEvents()).hasSizeGreaterThanOrEqualTo(1));
 
-        // Wait for periodic checkpoint (timer writes lastSeenToken)
+        // Wait for periodic checkpoint (timer anchors lastProcessedToken)
         await().atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> {
                     var cp = checkpointStore.findByStreamName("interval-reactive-test");
                     assertThat(cp).isPresent();
-                    assertThat(cp.get().lastSeenToken()).isNotNull();
+                    assertThat(cp.get().lastProcessedToken()).isNotNull();
                 });
 
-        Instant firstSeenTimestamp = checkpointStore.findByStreamName("interval-reactive-test")
-                .get().lastSeenTimestamp();
-        assertThat(firstSeenTimestamp).isNotNull();
+        Instant firstProcessedTimestamp = checkpointStore.findByStreamName("interval-reactive-test")
+                .get().lastProcessedTimestamp();
+        assertThat(firstProcessedTimestamp).isNotNull();
 
         // Insert another doc so the timer has fresher input to persist
         reactiveMongoTemplate.insert(new Document("item", "C"), "interval_orders").block();
 
-        // Wait for a second periodic save — lastSeenTimestamp should advance
+        // Wait for a second periodic save — lastProcessedTimestamp advances
         await().atMost(Duration.ofSeconds(5))
                 .pollInterval(Duration.ofMillis(500))
                 .untilAsserted(() -> {
                     var cp = checkpointStore.findByStreamName("interval-reactive-test");
                     assertThat(cp).isPresent();
-                    assertThat(cp.get().lastSeenTimestamp())
-                            .isAfterOrEqualTo(firstSeenTimestamp);
+                    assertThat(cp.get().lastProcessedTimestamp())
+                            .isAfterOrEqualTo(firstProcessedTimestamp);
                 });
     }
 

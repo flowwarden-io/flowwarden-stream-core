@@ -138,8 +138,11 @@ class ReactiveInvalidateHarnessTest {
         Sinks.Many<ChangeStreamEvent<Document>> sink = h.sinks().get(0);
 
         sink.tryEmitNext(event(com.mongodb.client.model.changestream.OperationType.INSERT));
+        // The manual save is a targeted processed write (a delivered token is
+        // an anchor, never a seen position).
         await().atMost(java.time.Duration.ofSeconds(5)).untilAsserted(() ->
-                verify(h.checkpointStore(), org.mockito.Mockito.atLeastOnce()).save(any()));
+                verify(h.checkpointStore(), org.mockito.Mockito.atLeastOnce())
+                        .saveProcessed(anyString(), any(), any(), any()));
         clearInvocations(h.checkpointStore());
 
         sink.tryEmitNext(event(com.mongodb.client.model.changestream.OperationType.DROP));
@@ -147,6 +150,7 @@ class ReactiveInvalidateHarnessTest {
         Thread.sleep(1_000);
         verify(h.checkpointStore(), never()).save(any());
         verify(h.checkpointStore(), never()).saveProcessed(anyString(), any(), any());
+        verify(h.checkpointStore(), never()).saveProcessed(anyString(), any(), any(), any());
         verify(h.checkpointStore(), never()).saveSeen(anyString(), any(), any());
         verify(h.checkpointStore(), never()).saveSeen(anyString(), any(), any(), any());
 

@@ -52,9 +52,11 @@ import static org.awaitility.Awaitility.await;
 /**
  * Regression tests from the PR #61 review.
  *
- * <p>First: a {@code PROCESSED_FIRST} resume seeds the heartbeat with the
+ * <p>First: a resume from the processed anchor seeds the heartbeat with the
  * older processed token; neither that seed nor the replayed events may ever
- * regress the persisted {@code lastSeenToken} below its high-water mark.</p>
+ * regress the persisted {@code lastSeenToken} below its high-water mark —
+ * structurally guaranteed now that delivered tokens only feed the processed
+ * anchor and the seen position accepts certified PBRTs only.</p>
  *
  * <p>Second: {@code StartPosition.LATEST} ignores persisted tokens — the
  * heartbeat must not chain from an old checkpoint (probing unconsumed history
@@ -204,10 +206,12 @@ class ImperativeHeartbeatMonotonicityIntegrationTest {
     }
 
     @Test
-    void divergenceWithIdleProbingOptedOut_catchUpStillCompletes_flushKeepsWorking() {
-        // The catch-up correction must run even with idleHeartbeatIntervalSeconds=0:
-        // opting out of idle probing must never permanently disable the flush
-        // (PR-review blocking point on the catch-up/idle coupling).
+    void divergenceWithIdleProbingOptedOut_replayNeverTouchesTheSeen_anchorKeepsWorking() {
+        // A divergent checkpoint with idleHeartbeatIntervalSeconds=0: no
+        // probe will ever run, so the certified seen position must stay
+        // byte-identical forever — replayed and live deliveries alike feed
+        // only the processed anchor (whose writes carry the health
+        // confirmation).
         BsonDocument processedPos = currentPosition(CATCHUP_OPTOUT_COLLECTION);
         mongoTemplate.insert(new Document("tag", "replayed"), CATCHUP_OPTOUT_COLLECTION);
         BsonDocument seenPos = currentPosition(CATCHUP_OPTOUT_COLLECTION);
@@ -221,31 +225,26 @@ class ImperativeHeartbeatMonotonicityIntegrationTest {
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning(CATCHUP_OPTOUT_STREAM));
 
-        // The replay is delivered, and the transient catch-up chain (immediate
-        // attempt + 5s retries) certifies completion despite idle probing
-        // being opted out — observable through the heartbeat timestamp (the
-        // certified PBRT may be byte-identical to seenPos on a quiet cluster,
-        // so the token itself is not a reliable certification signal).
+        // The replay is delivered (at-least-once from processed), the timer
+        // anchors it (saveIntervalSeconds=1) and confirms the position.
         await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
             assertThat(catchUpOptOutHandler.tags()).contains("replayed");
-            assertThat(checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM)
-                    .orElseThrow().lastHeartbeatTimestamp()).isAfter(savedAt);
+            var cp = checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM).orElseThrow();
+            assertThat(dataOf(cp.lastProcessedToken()))
+                    .as("the settled replay advances the processed anchor")
+                    .isGreaterThan(dataOf(processedPos));
+            assertThat(cp.lastHeartbeatTimestamp()).isAfter(savedAt);
         });
-        BsonDocument certifiedToken = checkpointStore
-                .findByStreamName(CATCHUP_OPTOUT_STREAM).orElseThrow().lastSeenToken();
 
-        // Only THEN insert the live event: with idle=0 and the catch-up chain
-        // finished, the flush is the only mechanism able to move the position
-        // again — this pins that the flush actually resumed (the previous
-        // assertion was satisfied by the certification PBRT alone).
+        // A live event keeps the anchor moving; the seen position never moves.
         mongoTemplate.insert(new Document("tag", "live"), CATCHUP_OPTOUT_COLLECTION);
         await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
             assertThat(catchUpOptOutHandler.tags()).contains("live");
-            assertThat(checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM)
-                    .orElseThrow().lastSeenToken())
-                    .as("the flush must persist events again once catch-up completed")
-                    .isNotEqualTo(certifiedToken);
         });
+        assertThat(checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM)
+                .orElseThrow().lastSeenToken())
+                .as("with the probe opted out, nothing may ever write the seen position")
+                .isEqualTo(seenPos);
     }
 
     /**

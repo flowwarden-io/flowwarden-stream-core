@@ -29,9 +29,6 @@ import org.bson.BsonTimestamp;
  *                             {@code null} when no token-based position was
  *                             established ({@code LATEST},
  *                             {@code RESUME_FROM_OPLOG_START} recovery)
- * @param persistedSeenToken   the {@code lastSeenToken} persisted at cascade
- *                             time (after a bootstrap, the freshly persisted
- *                             position — equal to the seed by construction)
  * @param initialOperationTime {@code RESUME_FROM_OPLOG_START} recovery only:
  *                             the operation time the stream resumes at. The
  *                             heartbeat uses it as a last-resort chain source
@@ -47,14 +44,13 @@ import org.bson.BsonTimestamp;
  *                             value)
  */
 public record ResumeContext(BsonDocument seedToken,
-                            BsonDocument persistedSeenToken,
                             BsonTimestamp initialOperationTime,
                             BsonDocument deadProcessedToken) {
 
-    public static final ResumeContext NONE = new ResumeContext(null, null, null, null);
+    public static final ResumeContext NONE = new ResumeContext(null, null, null);
 
-    public ResumeContext(BsonDocument seedToken, BsonDocument persistedSeenToken) {
-        this(seedToken, persistedSeenToken, null, null);
+    public ResumeContext(BsonDocument seedToken) {
+        this(seedToken, null, null);
     }
 
     /**
@@ -64,18 +60,5 @@ public record ResumeContext(BsonDocument seedToken,
      */
     public boolean allowPersistedFallback() {
         return seedToken != null;
-    }
-
-    /**
-     * Whether the stream resumes <em>behind</em> a persisted seen position it
-     * must not regress: a real divergence requires both a seed and an
-     * existing persisted position differing from it. Without a persisted seen
-     * there is nothing to protect — resuming from the processed token is not
-     * a regression and the flush operates normally.
-     */
-    public boolean startInCatchUp() {
-        return seedToken != null
-                && persistedSeenToken != null
-                && !seedToken.equals(persistedSeenToken);
     }
 }

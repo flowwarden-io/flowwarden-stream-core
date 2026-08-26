@@ -170,9 +170,12 @@ class ReactiveIdleHeartbeatIntegrationTest {
     }
 
     @Test
-    void divergenceWithIdleProbingOptedOut_catchUpStillCompletes_flushKeepsWorking() {
-        // Reactive twin of the imperative catch-up/opt-out regression: the
-        // scheduling logic is duplicated per manager, so is the coverage.
+    void divergenceWithIdleProbingOptedOut_replayNeverTouchesTheSeen_anchorKeepsWorking() {
+        // Reactive twin of the imperative opt-out coverage: the scheduling
+        // logic is duplicated per manager, so is the coverage. With the
+        // probe opted out, nothing may ever write the seen position —
+        // deliveries feed only the processed anchor, whose writes carry the
+        // health confirmation.
         BsonDocument processedPos = currentPosition(CATCHUP_OPTOUT_COLLECTION);
         reactiveMongoTemplate.insert(new Document("tag", "replayed"), CATCHUP_OPTOUT_COLLECTION)
                 .block();
@@ -187,28 +190,25 @@ class ReactiveIdleHeartbeatIntegrationTest {
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning(CATCHUP_OPTOUT_STREAM));
 
-        // Catch-up certification observable through the heartbeat timestamp
-        // (the certified PBRT may be byte-identical to seenPos on a quiet
-        // cluster — the token itself is not a reliable certification signal).
+        // The replay is delivered, the timer anchors it and confirms the
+        // position through the anchor write.
         await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
             assertThat(catchUpOptOutHandler.tags()).contains("replayed");
-            assertThat(checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM)
-                    .orElseThrow().lastHeartbeatTimestamp()).isAfter(savedAt);
+            var cp = checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM).orElseThrow();
+            assertThat(cp.lastProcessedToken()).isNotEqualTo(processedPos);
+            assertThat(cp.lastHeartbeatTimestamp()).isAfter(savedAt);
         });
-        BsonDocument certifiedToken = checkpointStore
-                .findByStreamName(CATCHUP_OPTOUT_STREAM).orElseThrow().lastSeenToken();
 
-        // With idle=0 and the chain finished, only the flush can move the
-        // position again.
+        // A live event keeps the anchor moving; the seen position never moves.
         reactiveMongoTemplate.insert(new Document("tag", "live"), CATCHUP_OPTOUT_COLLECTION)
                 .block();
         await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
             assertThat(catchUpOptOutHandler.tags()).contains("live");
-            assertThat(checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM)
-                    .orElseThrow().lastSeenToken())
-                    .as("the flush must persist events again once catch-up completed")
-                    .isNotEqualTo(certifiedToken);
         });
+        assertThat(checkpointStore.findByStreamName(CATCHUP_OPTOUT_STREAM)
+                .orElseThrow().lastSeenToken())
+                .as("with the probe opted out, nothing may ever write the seen position")
+                .isEqualTo(seenPos);
 
         streamManager.stopStream(CATCHUP_OPTOUT_STREAM);
         checkpointStore.delete(CATCHUP_OPTOUT_STREAM);

@@ -23,6 +23,7 @@ import io.flowwarden.stream.annotation.Filter;
 import io.flowwarden.stream.annotation.OnInsert;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.test.SharedMongoContainer;
+import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -44,29 +45,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 /**
- * Regression test for issue #22: a handler-success checkpoint save must not
- * overwrite the {@code lastSeenToken} that the heartbeat timer has been
- * advancing through filtered events.
- *
- * <p>Scenario: a stream with a {@code @Filter} that rejects two thirds of
- * incoming events plus {@code @Checkpoint(saveIntervalSeconds = 1)} for a
- * fast-firing timer. After driving a mix of rejected and accepted events,
- * the persisted checkpoint must reflect the dual-token model — that is,
- * {@code lastSeenTimestamp > lastProcessedTimestamp} (the timer has advanced
- * seen past the latest processed event by capturing rejected events).</p>
- *
- * <p>Before the fix, {@code saveCheckpointIfNeeded} called the legacy
- * {@code CheckpointStore.save(Checkpoint)} with the same token in both pairs
- * of fields, overwriting the heartbeat timer's work on every successful
- * handler invocation. The checkpoint always collapsed to
- * {@code lastSeenTimestamp == lastProcessedTimestamp}.</p>
+ * The settled-anchor semantics of {@code lastProcessedToken}: every
+ * terminally settled event counts, {@code @Filter} rejections included — a
+ * filter-heavy stream stays recoverable at level 1 through its rejected
+ * traffic. And the structural counterpart of the old catch-up problem:
+ * delivered tokens never touch {@code lastSeenToken}, which belongs
+ * exclusively to the idle probe's certified PBRTs.
  */
-@SpringBootTest(classes = ImperativeCheckpointDivergencePersistenceIntegrationTest.TestApp.class)
+@SpringBootTest(classes = ImperativeSettledAnchorIntegrationTest.TestApp.class)
 @ActiveProfiles("test-mvc")
-class ImperativeCheckpointDivergencePersistenceIntegrationTest {
+class ImperativeSettledAnchorIntegrationTest {
 
-    private static final String STREAM_NAME = "divergence-persistence";
-    private static final String COLLECTION = "divergence_persistence";
+    private static final String STREAM_NAME = "settled-anchor";
+    private static final String COLLECTION = "settled_anchor";
 
     @DynamicPropertySource
     static void mongoProperties(DynamicPropertyRegistry registry) {
@@ -76,7 +67,7 @@ class ImperativeCheckpointDivergencePersistenceIntegrationTest {
     @Autowired MongoTemplate mongoTemplate;
     @Autowired ImperativeStreamManager streamManager;
     @Autowired CheckpointStore checkpointStore;
-    @Autowired DivergenceHandler handler;
+    @Autowired AnchorHandler handler;
 
     @BeforeEach
     void setUp() {
@@ -92,62 +83,63 @@ class ImperativeCheckpointDivergencePersistenceIntegrationTest {
     }
 
     @Test
-    void timerSeenAdvanceIsPreservedAfterHandlerSuccess() {
+    void filteredSettlements_advanceTheProcessedAnchor_neverTheSeenPosition() {
+        streamManager.startStream(STREAM_NAME);
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning(STREAM_NAME));
+        // The bootstrap persisted an initial certified position — the only
+        // legitimate seen writer besides the idle probe.
+        BsonDocument bootstrapSeen = checkpointStore.findByStreamName(STREAM_NAME)
+                .orElseThrow().lastSeenToken();
 
-        // 1) Drive an accepted event so lastProcessedToken is set at a known position.
+        // 1) An accepted event anchors a known position (saveEveryN = 1).
         mongoTemplate.insert(new Document("type", "keep").append("seq", 1), COLLECTION);
         await().atMost(Duration.ofSeconds(10))
                 .untilAsserted(() -> assertThat(handler.size()).isEqualTo(1));
-
-        // Wait for the checkpoint to be persisted (saveEveryN = 1).
         await().atMost(Duration.ofSeconds(10))
-                .untilAsserted(() -> {
-                    var cp = checkpointStore.findByStreamName(STREAM_NAME);
-                    assertThat(cp).isPresent();
-                    assertThat(cp.get().lastProcessedToken()).isNotNull();
-                    assertThat(cp.get().lastSeenToken()).isNotNull();
-                });
+                .untilAsserted(() -> assertThat(checkpointStore.findByStreamName(STREAM_NAME)
+                        .map(cp -> cp.lastProcessedToken()).orElse(null)).isNotNull());
+        BsonDocument acceptedAnchor = checkpointStore.findByStreamName(STREAM_NAME)
+                .orElseThrow().lastProcessedToken();
 
-        // 2) Drive several rejected events. These bump the in-memory snapshot
-        // (handleMessage updates lastSeenToken snapshot before checking the filter),
-        // so the heartbeat timer will advance lastSeenToken through them — without
-        // any saveCheckpointIfNeeded call (filter rejects → handler never runs).
+        // 2) Rejected events are terminal settlements too: the anchor must
+        // advance through them — no handler ran, yet a restart from the
+        // anchor must not re-deliver the whole rejected backlog.
         for (int i = 2; i <= 6; i++) {
             mongoTemplate.insert(new Document("type", "skip").append("seq", i), COLLECTION);
         }
 
-        // 3) Wait long enough for the timer (saveIntervalSeconds = 1) to fire AT
-        // LEAST ONCE after the rejected events landed. We allow several ticks
-        // to ensure determinism.
-        await().atMost(Duration.ofSeconds(8))
-                .pollDelay(Duration.ofSeconds(3))
+        await().atMost(Duration.ofSeconds(10))
                 .untilAsserted(() -> {
                     var cp = checkpointStore.findByStreamName(STREAM_NAME).orElseThrow();
-                    // After timer ticks, lastSeenTimestamp must have advanced past
-                    // lastProcessedTimestamp (which is still pinned to the single
-                    // accepted event from step 1).
-                    assertThat(cp.lastSeenTimestamp())
-                            .as("lastSeenTimestamp must be strictly after lastProcessedTimestamp — "
-                                    + "the heartbeat timer should advance seen through filtered events, "
-                                    + "and the handler-success save must not overwrite it")
-                            .isAfter(cp.lastProcessedTimestamp());
-                    assertThat(cp.lastSeenToken())
-                            .as("lastSeenToken must differ from lastProcessedToken once the timer "
-                                    + "has captured a rejected event")
-                            .isNotEqualTo(cp.lastProcessedToken());
+                    assertThat(cp.lastProcessedToken())
+                            .as("filtered settlements advance the processed anchor")
+                            .isNotEqualTo(acceptedAnchor);
                 });
+
+        // 3) The seen position belongs to the probe alone: no delivered
+        // token — accepted or rejected — may ever appear there. With idle
+        // probing opted out, the certified position must still be the
+        // bootstrap PBRT, byte-identical.
+        assertThat(checkpointStore.findByStreamName(STREAM_NAME).orElseThrow().lastSeenToken())
+                .as("delivered tokens never write lastSeenToken")
+                .isEqualTo(bootstrapSeen);
+        assertThat(handler.size()).as("the filter kept rejecting").isEqualTo(1);
     }
 
     @SpringBootApplication
     @EnableFlowWarden
-    @Import(DivergenceHandler.class)
+    @Import(AnchorHandler.class)
     static class TestApp {}
 
-    @ChangeStream(name = STREAM_NAME, collection = COLLECTION, documentType = Document.class)
-    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1)
-    static class DivergenceHandler {
+    @ChangeStream(name = STREAM_NAME, collection = COLLECTION, documentType = Document.class,
+            autoStart = false)
+    // Idle probing opted out: the startup diagnostic probe could otherwise
+    // legitimately advance the seen to a fresher certified PBRT — this test
+    // pins that DELIVERED tokens never write it, so the bootstrap position
+    // must stay byte-identical.
+    @Checkpoint(saveEveryN = 1, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 0)
+    static class AnchorHandler {
 
         private final List<ChangeStreamContext<Document>> events = new CopyOnWriteArrayList<>();
 
@@ -158,9 +150,8 @@ class ImperativeCheckpointDivergencePersistenceIntegrationTest {
 
         @Filter
         boolean keepOnly(ChangeStreamContext<Document> ctx) {
-            // Reject anything that isn't explicitly tagged "keep". This drops the
-            // "skip"-tagged events before they reach the handler — they still
-            // traverse handleMessage so the timer captures their resume token.
+            // Reject anything that isn't explicitly tagged "keep": the
+            // "skip"-tagged events settle terminally without a handler run.
             return ctx.getFullDocument(Document.class)
                     .map(doc -> "keep".equals(doc.getString("type")))
                     .orElse(false);

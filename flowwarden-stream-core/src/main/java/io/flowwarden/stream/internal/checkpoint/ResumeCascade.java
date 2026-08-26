@@ -18,7 +18,6 @@ package io.flowwarden.stream.internal.checkpoint;
 import io.flowwarden.stream.FlowWardenMetrics;
 import io.flowwarden.stream.HistoryLostException;
 import io.flowwarden.stream.OnHistoryLost;
-import io.flowwarden.stream.ResumeStrategy;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.spi.CheckpointStore;
 import org.bson.BsonDocument;
@@ -33,9 +32,9 @@ import java.util.function.Supplier;
 /**
  * The resume cascade, shared by both stream managers and by every entry
  * point that (re-)establishes a stream position — boot and runtime restarts
- * alike: try the primary token chosen by {@link ResumeStrategy} (level 1),
- * fall back to the secondary if the primary has aged out (level 2), apply
- * the {@link OnHistoryLost} strategy if both have aged out (level 3), and
+ * alike, in a fixed order: try the processed anchor (level 1), fall back to
+ * the certified seen position if it has aged out (level 2), apply the
+ * {@link OnHistoryLost} strategy if both have aged out (level 3), and
  * bootstrap a fresh server-certified position when no prior position exists
  * at all.
  *
@@ -71,7 +70,7 @@ public final class ResumeCascade {
      *
      * @param streamName            the stream identifier
      * @param checkpointAnnotation  the stream's {@code @Checkpoint}
-     *                              (resume strategy + history-lost strategy)
+     *                              (history-lost strategy)
      * @param checkpointStore       the checkpoint store
      * @param probe                 the stream's heartbeat probe — used for
      *                              {@link HeartbeatProbe#initialPosition()}
@@ -101,52 +100,30 @@ public final class ResumeCascade {
         io.flowwarden.stream.spi.Checkpoint cp = cpOpt.get();
         BsonDocument processedToken = cp.lastProcessedToken();
         BsonDocument seenToken = cp.lastSeenToken();
-        ResumeStrategy strategy = checkpointAnnotation.resumeStrategy();
 
-        BsonDocument primary;
-        BsonDocument secondary;
-        String primaryLabel;
-        String secondaryLabel;
-        Runnable onFallback;
-        switch (strategy) {
-            case SEEN_FIRST -> {
-                primary = seenToken;
-                secondary = processedToken;
-                primaryLabel = "lastSeenToken";
-                secondaryLabel = "lastProcessedToken";
-                onFallback = () -> FlowWardenMetrics.get().onResumeFallbackToProcessed(streamName);
-            }
-            case PROCESSED_FIRST -> {
-                primary = processedToken;
-                secondary = seenToken;
-                primaryLabel = "lastProcessedToken";
-                secondaryLabel = "lastSeenToken";
-                onFallback = () -> FlowWardenMetrics.get().onResumeFallbackToSeen(streamName);
-            }
-            default -> throw new IllegalStateException("Unknown ResumeStrategy: " + strategy);
+        // Level 1: the processed anchor — everything after the last settled
+        // event is re-delivered, strict at-least-once.
+        if (processedToken != null && tokenValidator.isValid(processedToken)) {
+            log.info("Resuming stream '{}' from lastProcessedToken", streamName);
+            return new ResumeContext(processedToken);
         }
 
-        // Level 1: try the primary token
-        if (primary != null && tokenValidator.isValid(primary)) {
-            log.info("Resuming stream '{}' from {}", streamName, primaryLabel);
-            return new ResumeContext(primary, seenToken);
-        }
-
-        // Level 2: the secondary, validated exactly once. With a null primary
-        // (never recorded — typical after a history-lost self-repair) this is
-        // not a degradation: INFO, no "aged out" warning, no fallback metric.
-        if (secondary != null
-                && (primary == null || !secondary.equals(primary))
-                && tokenValidator.isValid(secondary)) {
-            if (primary == null) {
-                log.info("Resuming stream '{}' from {} ({} not recorded)",
-                        streamName, secondaryLabel, primaryLabel);
+        // Level 2: the certified position, validated exactly once. With a null
+        // processed anchor (never recorded — typical after a history-lost
+        // self-repair) this is not a degradation: INFO, no "aged out" warning,
+        // no fallback metric.
+        if (seenToken != null
+                && (processedToken == null || !seenToken.equals(processedToken))
+                && tokenValidator.isValid(seenToken)) {
+            if (processedToken == null) {
+                log.info("Resuming stream '{}' from lastSeenToken "
+                        + "(lastProcessedToken not recorded)", streamName);
             } else {
-                log.warn("Resuming stream '{}' from {}: {} aged out of oplog",
-                        streamName, secondaryLabel, primaryLabel);
-                onFallback.run();
+                log.warn("Resuming stream '{}' from lastSeenToken: "
+                        + "lastProcessedToken aged out of oplog", streamName);
+                FlowWardenMetrics.get().onResumeFallbackToSeen(streamName);
             }
-            return new ResumeContext(secondary, seenToken);
+            return new ResumeContext(seenToken);
         }
 
         // Level 3: both tokens unusable → apply onHistoryLost strategy
@@ -196,8 +173,7 @@ public final class ResumeCascade {
         }
         FlowWardenMetrics.get().onCheckpoint(streamName, pbrt.toJson());
         log.info("Bootstrapped stream '{}' from an initial server-certified position", streamName);
-        // seed == freshly persisted seen: never a phantom catch-up.
-        return new ResumeContext(pbrt, pbrt);
+        return new ResumeContext(pbrt);
     }
 
     private static ResumeContext handleHistoryLost(String streamName,
@@ -246,7 +222,7 @@ public final class ResumeCascade {
                 // performs the deferred cleanup, guarded by the dead
                 // processed token carried in the context.
                 log.info("Stream '{}' will resume from oldest oplog entry at {}", streamName, oldestTs);
-                return new ResumeContext(null, null, oldestTs, deadProcessedToken);
+                return new ResumeContext(null, oldestTs, deadProcessedToken);
             }
         }
         throw new IllegalStateException("Unknown OnHistoryLost strategy: " + strategy);

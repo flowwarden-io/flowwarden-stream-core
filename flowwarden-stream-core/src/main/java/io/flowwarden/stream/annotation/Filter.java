@@ -42,11 +42,13 @@ import java.lang.annotation.Target;
  *
  * <h2>Interaction with {@link Checkpoint}</h2>
  *
- * <p>Events rejected by this filter still advance {@code lastSeenToken} (FlowWarden
- * tracks the receipt of every event, regardless of filter outcome). They do not
- * advance {@code lastProcessedToken}, which only moves when a handler returns
- * successfully. This keeps the resume cascade meaningful for streams where the
- * vast majority of events are filtered out.</p>
+ * <p>A rejection by this filter is a <em>terminal settlement</em>: the event
+ * advances {@code lastProcessedToken} like a handler success does (per the
+ * {@code saveEveryN}/{@code saveIntervalSeconds} policy), so a filter-heavy
+ * stream stays recoverable at cascade level 1 through its rejected traffic —
+ * a restart does not re-deliver the rejected backlog. Rejected events never
+ * touch {@code lastSeenToken}, which holds exclusively server-certified
+ * positions written by the idle heartbeat.</p>
  *
  * @see ChangeStream
  * @see Pipeline

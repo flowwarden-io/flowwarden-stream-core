@@ -147,38 +147,53 @@ class ImperativeCheckpointFailureIntegrationTest {
     }
 
     @Test
-    void streamContinuesWhenManualSaveCheckpointFails() {
+    void failedManualSave_isNotDeclaredDurable_theFlushRetriesTheToken() {
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning("imp-cp-fail-manual"));
 
-        // saveCheckpointNow() inside the handler routes through CheckpointStore.save()
-        failingStore.failNextNCalls("save:imp-cp-fail-manual", 1);
+        // saveCheckpointNow() routes through the targeted saveProcessed
+        // write (a delivered token is an anchor). A SINGLE event whose
+        // manual save fails: the failure must not be recorded as a manual
+        // save — the anchor stays dirty and a later flush genuinely retries
+        // the token, not merely "the stream continues".
+        failingStore.failNextNCalls("saveProcessed:imp-cp-fail-manual", 1);
 
         mongoTemplate.insert(new Document("item", "M1"), "imp_cp_fail_manual");
-        mongoTemplate.insert(new Document("item", "M2"), "imp_cp_fail_manual");
 
-        // Both events processed despite the manual save failure on the first.
         await().atMost(Duration.ofSeconds(15))
                 .untilAsserted(() ->
-                        assertThat(manualSaveStream.getEvents()).hasSize(2));
-
+                        assertThat(manualSaveStream.getEvents()).hasSize(1));
         await().atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> {
                     List<Throwable> failures = metrics.checkpointFailures("imp-cp-fail-manual");
                     assertThat(failures).hasSize(1);
                     assertThat(failures.get(0)).isInstanceOf(MongoWriteConcernException.class);
                 });
+
+        // The count threshold is out of reach (saveEveryN=100): only the
+        // time threshold can repair the anchor — and it must.
+        await().atMost(Duration.ofSeconds(15))
+                .untilAsserted(() -> {
+                    var cp = failingStore.findByStreamName("imp-cp-fail-manual");
+                    assertThat(cp).isPresent();
+                    assertThat(cp.get().lastProcessedToken())
+                            .as("the flush must retry the token the manual save failed to persist")
+                            .isNotNull();
+                });
+        assertThat(failingStore.confirmedSaveProcessed("imp-cp-fail-manual"))
+                .isGreaterThanOrEqualTo(1);
     }
 
     @Test
-    void timerKeepsSchedulingWhenSaveSeenFails() {
+    void timerKeepsSchedulingWhenSaveProcessedFails() {
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning("imp-cp-fail-timer"));
 
-        // The timer calls saveSeen() periodically (every 1s). Make every
-        // saveSeen call throw for a long stretch so we can observe repeated
-        // failure signals without the scheduler giving up.
-        failingStore.failNextNCalls("saveSeen:imp-cp-fail-timer", 100);
+        // The timer anchors the processed token periodically (every 1s; the
+        // count threshold is out of reach at saveEveryN=100). Make every
+        // write throw for a long stretch so we can observe repeated failure
+        // signals without the scheduler giving up.
+        failingStore.failNextNCalls("saveProcessed:imp-cp-fail-timer", 100);
 
         mongoTemplate.insert(new Document("item", "T1"), "imp_cp_fail_timer");
 
@@ -249,7 +264,10 @@ class ImperativeCheckpointFailureIntegrationTest {
     }
 
     @ChangeStream(name = "imp-cp-fail-timer", collection = "imp_cp_fail_timer")
-    @Checkpoint(saveEveryN = 100, saveIntervalSeconds = 1)  // saveEveryN high so only timer path triggers
+    // saveEveryN high so only the timer path triggers; idle probing opted
+    // out so no startup diagnostic probe can hold the heartbeat lock under
+    // full-suite load (the flush would tryLock-skip for its whole duration).
+    @Checkpoint(saveEveryN = 100, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 0)
     static class TimerStream {
         private final List<ChangeStreamContext<?>> events = new CopyOnWriteArrayList<>();
 
@@ -303,6 +321,15 @@ class ImperativeCheckpointFailureIntegrationTest {
         public void saveProcessed(String streamName, BsonDocument token, Instant timestamp) {
             maybeThrow("saveProcessed:" + streamName);
             delegate.saveProcessed(streamName, token, timestamp);
+            confirmedSaveProcessed.computeIfAbsent(streamName, k -> new AtomicInteger())
+                    .incrementAndGet();
+        }
+
+        @Override
+        public void saveProcessed(String streamName, BsonDocument token, Instant timestamp,
+                                  Instant heartbeatTimestamp) {
+            maybeThrow("saveProcessed:" + streamName);
+            delegate.saveProcessed(streamName, token, timestamp, heartbeatTimestamp);
             confirmedSaveProcessed.computeIfAbsent(streamName, k -> new AtomicInteger())
                     .incrementAndGet();
         }

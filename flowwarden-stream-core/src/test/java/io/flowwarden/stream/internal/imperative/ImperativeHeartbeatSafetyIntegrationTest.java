@@ -304,11 +304,13 @@ class ImperativeHeartbeatSafetyIntegrationTest {
         // Review blocker's IT, rebuilt to force the scenario: the event is
         // preloaded INTO the replay window before the stream starts, and the
         // @Filter is latch-instrumented. While the filter decision is
-        // pending, the event is not settled: the establishment chain (both
-        // periodic policies are opted out — it is the only writer) must keep
-        // abstaining and the durable recovery marker must stay intact. The
-        // rejection settles the event; only then may the chain certify and
-        // perform the deferred cleanup (no processed was reacquired).
+        // pending, the event is not settled: the establishment chain must
+        // keep abstaining, the settlement counter must not fire, and the
+        // durable recovery marker must stay intact. The rejection settles
+        // the event; only then may the anchor advance and the chain certify
+        // — and the deferred cleanup's guard must preserve the freshly
+        // reacquired processed anchor (the settled rejection is durable
+        // work progress).
         Instant past = Instant.now().minusSeconds(86_400);
         checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
                 FILTERED_OPLOG_STREAM, null, EXPIRED_TOKEN, past, EXPIRED_TOKEN, past,
@@ -341,8 +343,10 @@ class ImperativeHeartbeatSafetyIntegrationTest {
                     .isNotNull()
                     .isNotEqualTo(EXPIRED_TOKEN);
             assertThat(cp.lastProcessedToken())
-                    .as("no processed was reacquired: the deferred cleanup applies")
-                    .isNull();
+                    .as("the settled rejection reacquired a fresh processed anchor and "
+                            + "the deferred cleanup's guard preserved it")
+                    .isNotNull()
+                    .isNotEqualTo(EXPIRED_TOKEN);
         });
     }
 

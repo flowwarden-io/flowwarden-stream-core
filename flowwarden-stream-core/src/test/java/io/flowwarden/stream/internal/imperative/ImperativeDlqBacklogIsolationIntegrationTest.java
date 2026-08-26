@@ -101,10 +101,10 @@ class ImperativeDlqBacklogIsolationIntegrationTest {
         streamManager.startStream(STREAM);
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning(STREAM));
-        // Bootstrap already persisted a position — the flush oracle below
-        // must observe PROGRESS from it, not mere presence.
-        org.bson.BsonDocument bootstrapToken = checkpointStore.findByStreamName(STREAM)
-                .map(cp -> cp.lastSeenToken()).orElse(null);
+        // The flush oracle below must observe PROGRESS of the processed
+        // anchor, not mere presence.
+        org.bson.BsonDocument initialProcessed = checkpointStore.findByStreamName(STREAM)
+                .map(cp -> cp.lastProcessedToken()).orElse(null);
 
         // A failing event: durable DLQ write, then the fresh gauge emit is
         // queued behind a count that will NOT return.
@@ -130,14 +130,13 @@ class ImperativeDlqBacklogIsolationIntegrationTest {
                 .untilAsserted(() -> assertThat(handler.tags()).contains("after-block"));
 
         // Checkpoint flushes keep advancing too: saveEveryN is out of reach,
-        // so progress past the bootstrap position can only come from the
-        // interval flush.
+        // so anchor progress can only come from the interval flush.
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
                 assertThat(checkpointStore.findByStreamName(STREAM)
-                        .map(cp -> cp.lastSeenToken()).orElse(null))
-                        .as("interval flush must progress past bootstrap while count is blocked")
+                        .map(cp -> cp.lastProcessedToken()).orElse(null))
+                        .as("interval flush must anchor settlements while count is blocked")
                         .isNotNull()
-                        .isNotEqualTo(bootstrapToken));
+                        .isNotEqualTo(initialProcessed));
 
         // No gauge was emitted while blocked; once unblocked, the LAST state
         // (all 5 entries) is published.
