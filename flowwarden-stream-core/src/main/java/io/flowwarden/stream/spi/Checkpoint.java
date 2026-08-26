@@ -23,24 +23,31 @@ import java.util.Map;
 /**
  * Immutable checkpoint representing the state of a Change Stream's progress.
  *
- * <p>Holds dual resume tokens: {@code lastSeenToken} tracks the last position
- * certified gap-free (an event received by the listener, or an interval the
- * server certified empty via the heartbeat probe), while
- * {@code lastProcessedToken} tracks the last event successfully handled.
- * This distinction enables at-least-once delivery guarantees.</p>
+ * <p>Holds two anchors of distinct natures: {@code lastProcessedToken} is
+ * the durability anchor of the <em>work</em> — the token of the last
+ * terminally settled event (handler success, {@code @Filter} rejection, no
+ * matching handler, or a terminal skip/DLQ decision) — while
+ * {@code lastSeenToken} is the durability anchor of the <em>position</em> —
+ * exclusively a server-certified post-batch resume token written by the
+ * idle heartbeat (or the bootstrap/recovery establishment). The resume
+ * cascade tries the processed anchor first (strict at-least-once), the
+ * certified position as the safety net. Checkpoints written by earlier
+ * versions may hold an event token in {@code lastSeenToken}; it remains a
+ * valid resume position.</p>
  *
  * <p>{@code lastHeartbeatTimestamp} records the last time a recoverable
- * position was <em>confirmed</em> — a fresh event token saved, or a successful
- * empty heartbeat probe (position write or re-certification of the unchanged
- * position). It is never updated on probe abstentions or failures, so its age
- * is the single operational signal for resume-point health.</p>
+ * position was <em>confirmed</em> — a processed-anchor write, or a
+ * successful empty heartbeat probe (position write or re-certification of
+ * the unchanged position). It is never updated on probe abstentions or
+ * failures, so its age is the single operational signal for resume-point
+ * health.</p>
  *
  * @param streamName             unique stream identifier
  * @param instanceId             pod/instance identifier (nullable)
- * @param lastSeenToken          resume token of the last gap-free position (nullable)
- * @param lastSeenTimestamp      when that position was established (nullable)
- * @param lastProcessedToken     resume token of the last event successfully processed (nullable)
- * @param lastProcessedTimestamp timestamp of the last event successfully processed (nullable)
+ * @param lastSeenToken          server-certified resume position (nullable)
+ * @param lastSeenTimestamp      when that position was certified (nullable)
+ * @param lastProcessedToken     resume token of the last terminally settled event (nullable)
+ * @param lastProcessedTimestamp cluster time of the last terminally settled event (nullable)
  * @param lastHeartbeatTimestamp last time a recoverable position was confirmed (nullable)
  * @param metadata               additional key-value data
  */

@@ -29,34 +29,26 @@ import java.util.function.Supplier;
 
 /**
  * Checkpoint heartbeat shared by both stream managers, carrying two
- * independent periodic responsibilities running on two separate threads:
+ * independent periodic responsibilities running on two separate threads —
+ * one per checkpoint anchor:
  *
  * <ul>
- *   <li>{@link #flushTick()} — write-pressure coalescing on the flush
- *       scheduler ({@code saveIntervalSeconds}): persists the latest
- *       <em>event</em> token only if it changed since the last flush. Never
- *       opens a cursor, and never blocks: if this stream's probe is in
- *       flight, the tick is skipped and the token stays dirty for the next
- *       one.</li>
+ *   <li>{@link #flushTick()} — the <em>time threshold</em> of the
+ *       processed-anchor policy on the flush scheduler
+ *       ({@code saveIntervalSeconds}): delegates to the stream's
+ *       {@link ProcessedAnchorPolicy}, which serializes every processed
+ *       write (count threshold, time threshold, manual save) under its own
+ *       local lock — this tick never touches the heartbeat lock, so probes
+ *       and flushes can never delay each other. Never opens a cursor.</li>
  *   <li>{@link #idleTick()} — oplog-rollover protection on the dedicated
- *       probe scheduler ({@code idleHeartbeatIntervalSeconds}): probes when
- *       the main cursor has delivered nothing for the idle threshold, or
- *       unconditionally while the stream is {@linkplain #isCatchingUp()
- *       catching up} after a resume from a position behind the persisted
- *       one.</li>
+ *       probe scheduler ({@code idleHeartbeatIntervalSeconds}), the
+ *       <strong>sole writer</strong> of {@code lastSeenToken}: probes when
+ *       the main cursor has settled nothing for the idle threshold, and
+ *       persists exclusively server-certified PBRTs. A token carried by a
+ *       delivered event is never written as seen — a resume that replays
+ *       old events therefore cannot regress the certified position by
+ *       construction, with no state machine involved.</li>
  * </ul>
- *
- * <p><strong>Catch-up state.</strong> A {@code PROCESSED_FIRST} resume starts
- * the stream behind the persisted {@code lastSeenToken}. Resume tokens carry
- * no client-comparable order (the driver spec defines none), so instead of
- * comparing tokens the heartbeat tracks an explicit {@code catchingUp} flag:
- * while set, replayed events are neither persisted as seen nor allowed to
- * refresh the heartbeat (nothing has been re-certified), and the probe runs
- * without the idleness precondition. A probe returning {@code EMPTY} with a
- * winning CAS certifies the backlog is consumed: its PBRT is persisted as
- * the new safe position and normal semantics resume. Outside catch-up no
- * ordering is needed at all — the stream resumed exactly at the persisted
- * position, so every delivered event is past it by construction.</p>
  *
  * <p><strong>Persist-then-publish.</strong> A probe PBRT is written to the
  * store first and only installed into the shared in-memory snapshot on
@@ -109,13 +101,23 @@ public final class CheckpointHeartbeat {
     private final ReentrantLock lock = new ReentrantLock();
 
     /**
-     * Last {@code lastSeenToken} value this heartbeat persisted. Guarded by
-     * {@link #lock}.
+     * The stream's processed-anchor persistence policy — the single
+     * serialization point of every {@code lastProcessedToken} write. May be
+     * null when the stream has no checkpoint annotation (nothing to flush).
      */
-    private BsonDocument lastPersistedSeen;
+    private final ProcessedAnchorPolicy processedPolicy;
 
-    /** Catch-up state, see class Javadoc. Guarded by {@link #lock}. */
-    private boolean catchingUp;
+    /**
+     * Last certified position this heartbeat durably installed as
+     * {@code lastSeenToken}. Guarded by {@link #lock}. Deliberately seeded
+     * null: the first certification of a run always goes through a durable
+     * write — the store may hold a stale (even pathological) seen from an
+     * earlier version, and comparing against the probe's chain token would
+     * not detect it (the chain token is a settled event anchored as
+     * processed, not the stored seen). One extra write per start, and any
+     * stale seen heals at the first certification by construction.
+     */
+    private BsonDocument lastCertifiedSeen;
 
     /** Consecutive EVENT_PENDING outcomes. Guarded by {@link #lock}. */
     private int consecutiveAbstentions;
@@ -154,19 +156,19 @@ public final class CheckpointHeartbeat {
                                Supplier<AtomicReference<TokenSnapshot>> latestTokenRef,
                                boolean allowPersistedFallback,
                                Duration idleThreshold,
-                               boolean startInCatchUp,
                                org.bson.BsonTimestamp initialOperationTime,
-                               BsonDocument deadProcessedToken) {
+                               BsonDocument deadProcessedToken,
+                               ProcessedAnchorPolicy processedPolicy) {
         this.streamName = streamName;
         this.checkpointStore = checkpointStore;
         this.probe = probe;
         this.latestTokenRef = latestTokenRef;
         this.allowPersistedFallback = allowPersistedFallback;
         this.idleThreshold = idleThreshold;
-        this.catchingUp = startInCatchUp;
         this.initialOperationTime = initialOperationTime;
         this.pendingHistoryLostReset = initialOperationTime != null;
         this.deadProcessedToken = deadProcessedToken;
+        this.processedPolicy = processedPolicy;
     }
 
     /**
@@ -179,15 +181,6 @@ public final class CheckpointHeartbeat {
         cancelled = true;
     }
 
-    public boolean isCatchingUp() {
-        lock.lock();
-        try {
-            return catchingUp;
-        } finally {
-            lock.unlock();
-        }
-    }
-
     /**
      * Whether this heartbeat has not been {@linkplain #cancel() cancelled}.
      * Used by the manager's transient retry chain to stop rescheduling once
@@ -198,67 +191,43 @@ public final class CheckpointHeartbeat {
     }
 
     /**
-     * Whether the transient probe chain still has work to do: an unfinished
-     * catch-up, or a {@code RESUME_FROM_OPLOG_START} recovery that has not
-     * yet produced a <em>durable</em> write. A delivered token is only a new
-     * chain source, not proof that a position was persisted — only a
-     * successful {@code writeSeen} clears {@code initialOperationTime} and
-     * releases the chain.
+     * Whether the transient probe chain still has work to do: a
+     * {@code RESUME_FROM_OPLOG_START} recovery that has not yet produced a
+     * <em>durable</em> write. A delivered token is only a new chain source,
+     * not proof that a position was persisted — only a successful
+     * {@code writeSeen} clears {@code initialOperationTime} and releases the
+     * chain.
      */
     public boolean needsEstablishment() {
         lock.lock();
         try {
-            return catchingUp || initialOperationTime != null;
+            return initialOperationTime != null;
         } finally {
             lock.unlock();
         }
     }
 
-
     /**
-     * Write-coalescing flush ({@code saveIntervalSeconds} cadence, flush
-     * scheduler): persists the latest event token only if dirty. Clean tick,
-     * catch-up in progress, or this stream's probe in flight → zero writes,
-     * zero blocking. Never throws.
+     * Time threshold of the processed-anchor policy
+     * ({@code saveIntervalSeconds} cadence, flush scheduler): delegates to
+     * the {@link ProcessedAnchorPolicy}, whose own lock serializes this
+     * write against the count threshold and the manual save — an in-flight
+     * write of an older token can never land after a newer one. Does not
+     * touch the heartbeat lock: probes never delay the flush and vice
+     * versa. Never throws.
      */
     public void flushTick() {
-        if (cancelled) {
+        if (cancelled || processedPolicy == null) {
             return;
         }
-        if (!lock.tryLock()) {
-            // This stream's probe is in flight: skip — the token stays dirty
-            // and the next flush retries. The flush thread never waits.
-            return;
-        }
-        try {
-            if (cancelled || catchingUp) {
-                // During catch-up, delivered events are replays: neither a
-                // seen position nor a health confirmation.
-                return;
-            }
-            TokenSnapshot snapshot = latestTokenRef.get().get();
-            if (snapshot == null
-                    || snapshot.source() != TokenSnapshot.Source.EVENT
-                    || snapshot.token().equals(lastPersistedSeen)) {
-                return; // nothing dirty — SEED positions are never flushed
-            }
-            writeSeen(snapshot.token(), snapshot.timestamp(), Instant.now());
-        } catch (Exception e) {
-            FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
-            log.warn("Failed to flush periodic checkpoint for stream '{}': {}",
-                    streamName, e.getMessage(), e);
-        } finally {
-            lock.unlock();
-        }
+        processedPolicy.flushIfDirty();
     }
 
     /**
      * Idle-protection tick (short check cadence on the probe scheduler):
      * probes when the main cursor has been idle past the threshold. During
      * sustained idleness, probes stay spaced a full idle interval apart
-     * regardless of the check cadence. While catching up, this tick abstains
-     * entirely — the transient catch-up chain is the sole owner of probing
-     * during that transition. Never throws.
+     * regardless of the check cadence. Never throws.
      */
     public void idleTick() {
         if (cancelled) {
@@ -266,9 +235,6 @@ public final class CheckpointHeartbeat {
         }
         lock.lock();
         try {
-            if (catchingUp) {
-                return; // the catch-up chain owns probing during catch-up
-            }
             Instant now = Instant.now();
             TokenSnapshot snapshot = latestTokenRef.get().get();
             if (snapshot != null
@@ -297,9 +263,9 @@ public final class CheckpointHeartbeat {
      * incompatible probe pipeline surfaces as WARN +
      * {@code onHeartbeatProbeFailed} right away instead of an idle-interval
      * later — best-effort, not a startup precondition), and the transient
-     * catch-up retry chain (which needs a certification attempt regardless of
-     * the idle policy, including when idle probing is opted out). Never
-     * throws.
+     * establishment retry chain of the {@code OPLOG_START} recovery (which
+     * needs a certification attempt regardless of the idle policy, including
+     * when idle probing is opted out). Never throws.
      */
     public void probeNow() {
         if (cancelled) {
@@ -338,8 +304,9 @@ public final class CheckpointHeartbeat {
         switch (outcome.type()) {
             case EVENT_PENDING -> {
                 // Undelivered events sit between the chained token and the
-                // head — the main stream must deliver them first. Repeated
-                // abstentions mean the stream is lagging or stuck.
+                // head — the main stream must deliver them first. A certified
+                // position never crosses unsettled work. Repeated abstentions
+                // mean the stream is lagging or stuck.
                 consecutiveAbstentions++;
                 if (consecutiveAbstentions == ABSTENTION_WARN_THRESHOLD) {
                     log.warn("Heartbeat probe abstained {} consecutive times for stream '{}': "
@@ -369,13 +336,11 @@ public final class CheckpointHeartbeat {
                                           BsonDocument chainToken,
                                           BsonDocument pbrt,
                                           Instant now) {
-        if (!catchingUp && !pendingHistoryLostReset
-                && chainToken != null && pbrt.equals(chainToken)) {
-            // Fast path only when no establishment/reset is owed: during a
-            // recovery, even an identical PBRT must go through writeSeen —
-            // an empty batch is not contractually required to return a
-            // different PBRT, and the chain must be able to terminate.
-            // Position unchanged but re-certified valid: heartbeat-only write.
+        if (!pendingHistoryLostReset && pbrt.equals(lastCertifiedSeen)) {
+            // Fast path only when THIS position is already durably installed
+            // and no establishment/reset is owed (during a recovery even an
+            // identical PBRT must go through writeSeen — the chain must be
+            // able to terminate). Re-certified valid: heartbeat-only write.
             if (cancelled) {
                 return;
             }
@@ -385,12 +350,7 @@ public final class CheckpointHeartbeat {
         }
         // Persist FIRST, publish to memory only on success: a store failure
         // must never erase a dirty event token from the shared snapshot.
-        boolean wasCatchingUp = catchingUp;
         writeSeen(pbrt, now, now);
-        if (wasCatchingUp) {
-            log.info("Stream '{}' caught up: server certified the backlog consumed, "
-                    + "resume position re-established", streamName);
-        }
         // A concurrent event always wins the in-memory race; its (newer)
         // position stays dirty and the next flush persists it.
         latestTokenRef.get().compareAndSet(snapshot,
@@ -398,9 +358,11 @@ public final class CheckpointHeartbeat {
     }
 
     /**
-     * Persists a seen position (+ heartbeat) and clears the catch-up state.
-     * Caller holds {@link #lock}. Throws on store failure — state is only
-     * updated after a successful write.
+     * Persists a certified seen position (+ heartbeat). The only writer of
+     * {@code lastSeenToken}: a server-certified PBRT from the probe, or the
+     * establishment write of an {@code OPLOG_START} recovery. Caller holds
+     * {@link #lock}. Throws on store failure — state is only updated after a
+     * successful write.
      */
     private void writeSeen(BsonDocument token, Instant positionTimestamp, Instant now) {
         if (cancelled) {
@@ -416,12 +378,11 @@ public final class CheckpointHeartbeat {
         } else {
             checkpointStore.saveSeen(streamName, token, positionTimestamp, now);
         }
-        lastPersistedSeen = token;
-        catchingUp = false;
+        lastCertifiedSeen = token;
         initialOperationTime = null; // a durable position exists from here on
         pendingHistoryLostReset = false;
         FlowWardenMetrics.get().onCheckpoint(streamName, token.toJson());
-        log.debug("Periodic lastSeenToken update for stream '{}'", streamName);
+        log.debug("Certified lastSeenToken update for stream '{}'", streamName);
     }
 
     private BsonDocument persistedSeenToken() {

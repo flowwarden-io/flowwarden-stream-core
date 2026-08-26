@@ -109,7 +109,27 @@ public interface ChangeStreamContext<T> {
      */
     void sendToDlq(String reason);
 
-    /** Immediately persists the current resume token checkpoint. */
+    /**
+     * Immediately persists the current event's token as the processed
+     * anchor ({@code lastProcessedToken}) — an <strong>advanced early
+     * acknowledgement</strong>.
+     *
+     * <p>The write happens while the handler is still running: outside an
+     * atomic transaction covering the handler's effects, the caller takes
+     * responsibility for having completed those effects <em>before</em> the
+     * call — if the handler fails afterwards, or the process crashes before
+     * it returns, the event will NOT be re-delivered on restart. The
+     * automatic terminal-settlement guarantee ("the anchor only advances on
+     * settled events") applies to FlowWarden-managed checkpoints, not to
+     * this manual override.</p>
+     *
+     * <p>Only a <em>confirmed</em> write counts: on a store failure the
+     * anchor stays dirty (the error is signaled via
+     * {@code onCheckpointFailed} without failing the handler) and the
+     * automatic policy — count or time threshold — retries it. A successful
+     * manual save makes the anchor clean: the automatic thresholds will not
+     * rewrite this event's token.</p>
+     */
     void saveCheckpointNow();
 
     /**

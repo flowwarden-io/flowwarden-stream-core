@@ -37,10 +37,12 @@ import java.lang.annotation.Target;
  *
  * <p>At most one {@code @Pipeline} method is allowed per {@link ChangeStream} class.</p>
  *
- * <p>When a {@code @Pipeline} is present, FlowWarden automatically advances a separate
- * {@code lastSeenToken} via periodic oplog sampling, independently of which events
- * matched the pipeline. This ensures fast restart even when the pipeline filters out
- * most events. See {@link Checkpoint} for the dual-token model.</p>
+ * <p>When a {@code @Pipeline} filters out most events, the stream may settle
+ * nothing for long stretches: the idle heartbeat then certifies a fresh
+ * position into {@code lastSeenToken} (a bounded probe replicating this
+ * exact pipeline confirms the interval empty server-side), so the resume
+ * point keeps tracking the oplog head instead of aging out. See
+ * {@link Checkpoint} for the dual-anchor model.</p>
  *
  * <p><strong>Do not filter out collection-lifecycle events.</strong> The
  * invalidate detection (collection drop, database drop, rename — see

@@ -44,6 +44,7 @@ import io.flowwarden.stream.internal.StreamRestarter;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
 import io.flowwarden.stream.spi.ChangeEventMetadata;
 import io.flowwarden.stream.internal.checkpoint.CheckpointHeartbeat;
+import io.flowwarden.stream.internal.checkpoint.ProcessedAnchorPolicy;
 import io.flowwarden.stream.internal.checkpoint.ResumeCascade;
 import io.flowwarden.stream.internal.checkpoint.ResumeContext;
 import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
@@ -106,7 +107,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     private final DlqStore dlqWriter;
     private final LeaderElectionCoordinator leaderElection; // nullable
     private final Map<String, ReactiveStreamState> streams = new ConcurrentHashMap<>();
-    private final Map<String, AtomicInteger> eventCounters = new ConcurrentHashMap<>();
+    private final Map<String, ProcessedAnchorPolicy> processedPolicies = new ConcurrentHashMap<>();
     private final Map<String, AtomicReference<TokenSnapshot>> latestTokens = new ConcurrentHashMap<>();
     private final Map<String, Instant> lastActivityTimes = new ConcurrentHashMap<>();
     private final Map<String, ScheduledFuture<?>> intervalTasks = new ConcurrentHashMap<>();
@@ -314,9 +315,8 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         if (seedToken != null) {
             // Seed the in-memory snapshot with the resume position so the first
             // heartbeat probe chains from it instead of waiting for an event.
-            // SEED, not EVENT: a resume position (possibly the older processed
-            // token under PROCESSED_FIRST) must never be persisted as a newly
-            // delivered seen token.
+            // SEED, not EVENT: a resume position is not a settlement and
+            // must never be flushed as a processed anchor.
             latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>())
                     .set(new TokenSnapshot(seedToken, Instant.now(), TokenSnapshot.Source.SEED));
         }
@@ -324,6 +324,13 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         ReactiveStreamState state =
                 new ReactiveStreamState(disposableHolder, def, gracefulStop, lastError, probe,
                         new AtomicReference<>(), new AtomicBoolean(false), terminated);
+        // The processed-anchor policy is installed before any delivery can
+        // settle: the delivery path, the flush timer and the manual save
+        // all serialize their writes through it.
+        if (def.checkpointAnnotation() != null) {
+            processedPolicies.put(streamName, new ProcessedAnchorPolicy(
+                    streamName, checkpointStore, def.checkpointAnnotation().saveEveryN()));
+        }
         streams.put(streamName, state);
         scheduleIntervalCheckpoint(def, probe, resumeContext);
 
@@ -379,11 +386,14 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                         boolean owner = streams.remove(streamName, state);
                         if (owner) {
                             lastActivityTimes.remove(streamName);
-                            eventCounters.remove(streamName);
                             latestTokens.remove(streamName);
                             CheckpointHeartbeat heartbeat = heartbeats.remove(streamName);
                             if (heartbeat != null) {
                                 heartbeat.cancel();
+                            }
+                            ProcessedAnchorPolicy policy = processedPolicies.remove(streamName);
+                            if (policy != null) {
+                                policy.cancel();
                             }
                             ScheduledFuture<?> task = intervalTasks.remove(streamName);
                             if (task != null) {
@@ -473,12 +483,16 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     }
 
     private void doStopStream(String streamName) {
-        // Invalidate the heartbeat BEFORE cancelling its task: cancel(false)
-        // lets an in-flight tick finish, and it must not write for a stream
-        // being stopped.
+        // Invalidate the heartbeat and the processed policy BEFORE
+        // cancelling their tasks: cancel(false) lets an in-flight tick
+        // finish, and it must not write for a stream being stopped.
         CheckpointHeartbeat heartbeat = heartbeats.remove(streamName);
         if (heartbeat != null) {
             heartbeat.cancel();
+        }
+        ProcessedAnchorPolicy stoppedPolicy = processedPolicies.remove(streamName);
+        if (stoppedPolicy != null) {
+            stoppedPolicy.cancel();
         }
         ScheduledFuture<?> task = intervalTasks.remove(streamName);
         if (task != null) {
@@ -497,7 +511,6 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         }
 
         lastActivityTimes.remove(streamName);
-        eventCounters.remove(streamName);
 
         state.gracefulStop().set(true);
         try {
@@ -764,29 +777,29 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     }
 
                     @Override
-                    public void saveCheckpointNow() {
+                    public boolean saveCheckpointNow() {
                         if (isLifecycleEvent(ctx.getOperationType())) {
                             // A lifecycle event's token is never a usable
                             // resume position — see the imperative twin.
                             log.warn("Ignoring manual checkpoint of a {} event for stream '{}': "
                                     + "lifecycle tokens are not resume positions",
                                     ctx.getOperationType(), def.streamName());
-                            return;
+                            return false;
                         }
                         BsonDocument token = raw.getResumeToken();
-                        if (token != null) {
-                            try {
-                                Instant now = Instant.now();
-                                checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
-                                        def.streamName(), null, token, now,
-                                        token, now, now, Collections.emptyMap()));
-                                FlowWardenMetrics.get().onCheckpoint(def.streamName(), token.toJson());
-                            } catch (RuntimeException e) {
-                                FlowWardenMetrics.get().onCheckpointFailed(def.streamName(), e);
-                                log.warn("Failed to save manual checkpoint for stream '{}': {}",
-                                        def.streamName(), e.getMessage(), e);
-                            }
+                        if (token == null) {
+                            return false;
                         }
+                        // A delivered token is a processed anchor — never a
+                        // seen position (certified PBRTs only). The policy
+                        // serializes this write against the automatic
+                        // thresholds and reports whether it was CONFIRMED:
+                        // a failed write stays dirty and is retried by the
+                        // next settlement or timer tick.
+                        ProcessedAnchorPolicy anchorPolicy =
+                                processedPolicies.get(def.streamName());
+                        return anchorPolicy != null
+                                && anchorPolicy.saveNow(token, ctx.getClusterTime());
                     }
                 }
                 : DefaultChangeStreamContext.NOOP_ACTIONS;
@@ -822,14 +835,14 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         HandlerMethod handler = def.resolveHandler(opType);
         if (handler == null) {
             log.debug("No handler for {} in stream '{}'", opType, def.streamName());
-            publishSettledToken(def, raw, opType);
+            publishSettledToken(def, raw, opType, ctx);
             return Mono.empty();
         }
 
         if (def.filterMethod() != null) {
             if (!def.filterMethod().evaluate(def.bean(), ctx)) {
                 log.debug("Event filtered by @Filter in stream '{}'", def.streamName());
-                publishSettledToken(def, raw, opType);
+                publishSettledToken(def, raw, opType, ctx);
                 return Mono.empty();
             }
         }
@@ -910,18 +923,23 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         }
 
 
-        return pipeline.doOnSuccess(v -> {
+        // The terminal settlement side-effects below perform BLOCKING store
+        // I/O (the sync CheckpointStore/DlqStore SPIs over the reactive
+        // driver): they must never run on a driver event-loop thread — a
+        // block() there waits for a Mongo reply that may need that very
+        // thread, wedging the stream (and, through the anchor policy's
+        // lock, the flush timer with it). publishOn hops the completion and
+        // error signals to a blocking-safe scheduler; the outer concatMap
+        // still awaits this Mono, so per-stream settlement order is
+        // preserved.
+        return pipeline.publishOn(reactor.core.scheduler.Schedulers.boundedElastic())
+                .doOnSuccess(v -> {
             long durationNanos = System.nanoTime() - startNanos;
             FlowWardenMetrics.get().onEventProcessed(def.streamName(), durationNanos, true);
             lastActivityTimes.put(def.streamName(), Instant.now());
-            if (!ctx.isCheckpointSavedManually() && !isLifecycleEvent(opType)) {
-                // Lifecycle events never anchor a resume position — see the
-                // imperative manager's twin call site.
-                saveCheckpointIfNeeded(def, raw.getResumeToken(), ctx.getClusterTime());
-            }
-            // Handler success is terminal — publish AFTER the processed
-            // anchor had its chance to be written.
-            publishSettledToken(def, raw, opType);
+            // Handler success is terminal: the settlement counts toward the
+            // processed-anchor policy inside the publication.
+            publishSettledToken(def, raw, opType, ctx);
         }).onErrorResume(e -> {
             long durationNanos = System.nanoTime() - startNanos;
             // Every error reaching this operator is terminal (SKIP, DLQ,
@@ -930,7 +948,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             // token may serve as a chain source. DLQ reserve: the DECISION
             // settles — the DLQ write below is best-effort and detached,
             // its failure is signaled but does not suspend terminality.
-            publishSettledToken(def, raw, opType);
+            publishSettledToken(def, raw, opType, ctx);
 
             // REQ-015: handle sentinel exceptions from @OnError decisions
             if (e instanceof SkipEventException) {
@@ -955,22 +973,42 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     }
 
     /**
-     * Publishes a resume token to the heartbeat's shared snapshot. Only
-     * called on terminal-safe outcomes — a token observed at receipt is
-     * never certifiable while its handler outcome is undecided. An INVALIDATE
-     * token is excluded entirely: it is not a usable resume position
-     * ({@code resumeAfter} rejects it) and must never overwrite the fresh
-     * position the post-invalidate self-repair just installed.
+     * The delivery-path entry of the processed-anchor policy: every
+     * terminally settled event (handler success, {@code @Filter} rejection,
+     * no matching handler, terminal skip/DLQ decision) publishes its token
+     * to the heartbeat's shared snapshot and enters the stream's
+     * {@link ProcessedAnchorPolicy} — whose single lock serializes the
+     * count threshold with the time threshold and the manual save, and
+     * whose counter only resets on a confirmed write (an already-durable
+     * token, e.g. a successful manual save, resets it without counting).
+     * Only called on terminal-safe outcomes — a token observed at receipt
+     * is never anchorable while its handler outcome is undecided. An
+     * INVALIDATE token is excluded entirely: it is not a usable resume
+     * position ({@code resumeAfter} rejects it) and must never overwrite
+     * the fresh position the post-invalidate self-repair just installed.
+     * Lifecycle events (DROP/RENAME included) never anchor: a drop/rename
+     * token would resume PAST the very event the next boot needs to replay
+     * to reclassify the invalidation.
      */
     private void publishSettledToken(ChangeStreamDefinition def,
                                      ChangeStreamDocument<Document> raw,
-                                     OperationType opType) {
+                                     OperationType opType,
+                                     DefaultChangeStreamContext<Document> ctx) {
         if (isLifecycleEvent(opType)) {
             return;
         }
-        if (def.checkpointAnnotation() != null && raw.getResumeToken() != null) {
-            latestTokens.computeIfAbsent(def.streamName(), k -> new AtomicReference<>())
-                    .set(new TokenSnapshot(raw.getResumeToken(), Instant.now()));
+        if (def.checkpointAnnotation() == null || raw.getResumeToken() == null) {
+            return;
+        }
+        String streamName = def.streamName();
+        BsonDocument token = raw.getResumeToken();
+        Instant clusterTime = ctx.getClusterTime();
+        latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>())
+                .set(new TokenSnapshot(token, Instant.now(),
+                        TokenSnapshot.Source.EVENT, clusterTime));
+        ProcessedAnchorPolicy policy = processedPolicies.get(streamName);
+        if (policy != null) {
+            policy.onSettled(token, clusterTime);
         }
     }
 
@@ -1077,33 +1115,32 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         }
         int flushSeconds = def.checkpointAnnotation().saveIntervalSeconds();
         int idleSeconds = def.checkpointAnnotation().idleHeartbeatIntervalSeconds();
-        boolean needsEstablishmentChain =
-                resumeContext.startInCatchUp() || resumeContext.initialOperationTime() != null;
+        boolean needsEstablishmentChain = resumeContext.initialOperationTime() != null;
         if (flushSeconds <= 0 && idleSeconds <= 0 && !needsEstablishmentChain) {
-            // No periodic policy AND no pending recovery/catch-up transition:
-            // nothing to schedule. The establishment chain, when needed, runs
-            // even with both periodic policies opted out.
+            // No periodic policy AND no pending recovery transition: nothing
+            // to schedule. The establishment chain, when needed, runs even
+            // with both periodic policies opted out.
             return;
         }
         String streamName = def.streamName();
-        // Two independent cadences on two separate threads:
-        // - flush (saveIntervalSeconds, flush scheduler): dirty-only write
-        //   coalescing, no cursor, never blocking;
+        // Two independent cadences on two separate threads, one per anchor:
+        // - flush (saveIntervalSeconds, flush scheduler): the time threshold
+        //   of the processed-anchor policy — dirty-only write coalescing, no
+        //   cursor, never blocking (the count threshold lives on the
+        //   delivery path, see publishSettledToken);
         // - idle heartbeat (idleHeartbeatIntervalSeconds, probe scheduler):
-        //   probe-based oplog rollover protection when the main cursor stalls.
-        // Both advance ONLY lastSeenToken (+ lastHeartbeatTimestamp);
-        // lastProcessedToken is managed by saveCheckpointIfNeeded after
-        // confirmed handler success. Everything derives from the cascade's
-        // ResumeContext — no store re-read, so scheduling cannot fail after
-        // the state is installed.
+        //   probe-based oplog rollover protection when the main cursor goes
+        //   quiet — the sole writer of lastSeenToken, PBRT-only.
+        // Everything derives from the cascade's ResumeContext — no store
+        // re-read, so scheduling cannot fail after the state is installed.
         CheckpointHeartbeat heartbeat = new CheckpointHeartbeat(
                 streamName, checkpointStore, probe,
                 () -> latestTokens.computeIfAbsent(streamName, k -> new AtomicReference<>()),
                 resumeContext.allowPersistedFallback(),
                 Duration.ofSeconds(idleSeconds),
-                resumeContext.startInCatchUp(),
                 resumeContext.initialOperationTime(),
-                resumeContext.deadProcessedToken());
+                resumeContext.deadProcessedToken(),
+                processedPolicies.get(streamName));
         heartbeats.put(streamName, heartbeat);
         if (flushSeconds > 0) {
             intervalTasks.put(streamName, intervalScheduler.scheduleAtFixedRate(
@@ -1122,11 +1159,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         }
         if (needsEstablishmentChain) {
             // Transient establishment chain: immediate certification attempt,
-            // then bounded retries until the server certifies the backlog
-            // consumed (catch-up) or a durable position exists (OPLOG_START
-            // recovery). Independent of both periodic policies — opting out
-            // of them must never disable a correction the flush depends on.
-            scheduleCatchUpAttempt(heartbeat, 0);
+            // then bounded retries until a durable position exists
+            // (OPLOG_START recovery). Independent of both periodic policies —
+            // opting out of them must never disable a correction the
+            // recovery depends on.
+            scheduleEstablishmentAttempt(heartbeat, 0);
         } else if (idleSeconds > 0) {
             // Async diagnostic probe: an incompatible probe pipeline surfaces
             // shortly after start (WARN + onHeartbeatProbeFailed) instead of
@@ -1136,36 +1173,18 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     }
 
     private static final long IDLE_CHECK_PERIOD_SECONDS = 5;
-    private static final long CATCH_UP_RETRY_SECONDS = 5;
+    private static final long ESTABLISHMENT_RETRY_SECONDS = 5;
 
-    private void scheduleCatchUpAttempt(CheckpointHeartbeat heartbeat, long delaySeconds) {
+    private void scheduleEstablishmentAttempt(CheckpointHeartbeat heartbeat, long delaySeconds) {
         try {
             probeScheduler.schedule(() -> {
                 heartbeat.probeNow();
                 if (heartbeat.isActive() && heartbeat.needsEstablishment()) {
-                    scheduleCatchUpAttempt(heartbeat, CATCH_UP_RETRY_SECONDS);
+                    scheduleEstablishmentAttempt(heartbeat, ESTABLISHMENT_RETRY_SECONDS);
                 }
             }, delaySeconds, TimeUnit.SECONDS);
         } catch (java.util.concurrent.RejectedExecutionException e) {
             // Scheduler shut down — the stream is going away with it.
-        }
-    }
-
-    private void saveCheckpointIfNeeded(ChangeStreamDefinition def, BsonDocument token, Instant timestamp) {
-        if (def.checkpointAnnotation() == null || token == null) {
-            return;
-        }
-        int count = eventCounters.computeIfAbsent(def.streamName(), k -> new AtomicInteger(0))
-                .incrementAndGet();
-        if (count % def.checkpointAnnotation().saveEveryN() == 0) {
-            try {
-                checkpointStore.saveProcessed(def.streamName(), token, timestamp);
-                FlowWardenMetrics.get().onCheckpoint(def.streamName(), token.toJson());
-            } catch (RuntimeException e) {
-                FlowWardenMetrics.get().onCheckpointFailed(def.streamName(), e);
-                log.warn("Failed to save checkpoint for stream '{}': {}",
-                        def.streamName(), e.getMessage(), e);
-            }
         }
     }
 

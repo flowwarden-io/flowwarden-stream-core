@@ -16,7 +16,6 @@
 package io.flowwarden.stream.annotation;
 
 import io.flowwarden.stream.OnHistoryLost;
-import io.flowwarden.stream.ResumeStrategy;
 import io.flowwarden.stream.StartPosition;
 
 import java.lang.annotation.Documented;
@@ -29,64 +28,72 @@ import java.lang.annotation.Target;
  * Enables automatic persistence of Change Stream resume tokens.
  *
  * <p>Place this annotation on a class that is also annotated with
- * {@link ChangeStream}. FlowWarden tracks two independent resume tokens
- * for each stream and uses them in a layered resume strategy on restart.</p>
+ * {@link ChangeStream}. FlowWarden tracks two anchors of different natures
+ * for each stream — each with a single writer — and applies a fixed resume
+ * cascade on restart.</p>
  *
- * <h2>Dual-token model</h2>
+ * <h2>Dual-anchor model</h2>
  *
  * <ul>
- *   <li><strong>{@code lastSeenToken}</strong> — advances on every <em>settled</em>
- *       event: one whose outcome is decided — handler success, rejection by
- *       {@code @Filter}, no matching handler, or a terminal skip/DLQ decision.
- *       An event still being processed or retried never advances it, so this
- *       token can never certify past a delivery that a crash would need to
- *       replay. Note the DLQ reserve: the terminal <em>decision</em> settles
- *       the event even when the best-effort DLQ write itself fails (signaled
- *       via {@code onEventDlqFailed}) — an event abandoned after exhaustion
- *       is settled, durably dead-lettered or not. Flushed on the
- *       {@link #saveIntervalSeconds()} cadence — and, when the stream goes idle,
- *       through the {@link #idleHeartbeatIntervalSeconds() idle heartbeat}: a
- *       bounded, ephemeral change stream probe chained from the last settled
- *       position fetches a server-certified post-batch resume token, so the
- *       persisted position keeps tracking the oplog head with zero traffic. As
- *       long as probes succeed within the oplog window, this keeps idle or
- *       massively-filtered streams recoverable.</li>
- *   <li><strong>{@code lastProcessedToken}</strong> — advances only when a handler
- *       method returns successfully (or the event is acknowledged by the DLQ
- *       pipeline). The {@link #saveEveryN() counter} persists this token at the
- *       configured cadence to preserve at-least-once delivery on crash.</li>
+ *   <li><strong>{@code lastProcessedToken}</strong> — the durability anchor of
+ *       the <em>work</em>: the token of the last <em>terminally settled</em>
+ *       event — handler success, rejection by {@code @Filter}, no matching
+ *       handler, or a terminal skip/DLQ decision. An event still being
+ *       processed or retried (or whose retry backoff was interrupted by a
+ *       shutdown) never advances it, so resuming from this anchor can never
+ *       skip a delivery that a crash would need to replay. Note the DLQ
+ *       reserve: the terminal <em>decision</em> settles the event even when
+ *       the best-effort DLQ write itself fails (signaled via
+ *       {@code onEventDlqFailed}) — an event abandoned after exhaustion is
+ *       settled, durably dead-lettered or not. Persisted by a count-or-time
+ *       policy, whichever threshold is reached first: the
+ *       {@link #saveEveryN() counter} bounds the replay in number of events,
+ *       the {@link #saveIntervalSeconds() timer} bounds the age of a dirty
+ *       anchor in time (a clean anchor is never rewritten).</li>
+ *   <li><strong>{@code lastSeenToken}</strong> — the durability anchor of the
+ *       <em>position</em>: exclusively a server-certified post-batch resume
+ *       token (PBRT) written by the {@link #idleHeartbeatIntervalSeconds()
+ *       idle heartbeat}. When the stream stops settling events, a bounded,
+ *       ephemeral probe chained from the last settled position obtains a
+ *       PBRT certified by the server, so the resume point keeps tracking the
+ *       oplog head with zero traffic. A token carried by a delivered event
+ *       is never written here — replayed events therefore cannot regress
+ *       this anchor by construction.</li>
  * </ul>
  *
  * <h2>3-level resume cascade</h2>
  *
- * <p>On restart with {@link StartPosition#RESUME}, the stream resumes in order
- * determined by {@link #resumeStrategy()}:</p>
+ * <p>On restart with {@link StartPosition#RESUME}, the stream resumes in a
+ * fixed order:</p>
  * <ol>
- *   <li>From the <em>primary</em> token (default {@code lastProcessedToken}, which
- *       preserves strict at-least-once).</li>
- *   <li>If the primary has aged out of the oplog, fall back to the <em>secondary</em>
- *       token — the stream avoids a {@code ChangeStreamHistoryLost} at the cost of
- *       either re-delivering events ({@code lastProcessedToken} secondary) or
- *       skipping the re-delivery of events that settled without handler
- *       success — terminal skip/DLQ decisions ({@code lastSeenToken}
- *       secondary).</li>
- *   <li>If both tokens are aged out, apply the {@link #onHistoryLost()} strategy.</li>
+ *   <li>From {@code lastProcessedToken} — preserves strict at-least-once:
+ *       everything after the last settled event is re-delivered.</li>
+ *   <li>If it is absent or has aged out of the oplog, from
+ *       {@code lastSeenToken} — the certified position keeps the stream
+ *       recoverable (typical for idle streams whose processed anchor aged
+ *       out while the heartbeat kept certifying).</li>
+ *   <li>If neither anchor is usable, apply the {@link #onHistoryLost()}
+ *       strategy.</li>
  * </ol>
+ *
+ * <p>Checkpoints written by earlier versions may hold an event token in
+ * {@code lastSeenToken}; it remains a valid resume position for the cascade,
+ * and the field adopts the PBRT-only semantics at the first successful
+ * certification.</p>
  *
  * <h2>Attribute roles</h2>
  *
  * <ul>
- *   <li>{@link #saveEveryN()} = how often to persist {@code lastProcessedToken}.
- *       {@code 1} (default) writes after every handler success — recommended for
- *       at-least-once critical streams.</li>
- *   <li>{@link #saveIntervalSeconds()} = how often the heartbeat timer persists
- *       {@code lastSeenToken}. {@code 5} (default) is a safe trade-off; {@code 0}
- *       disables the timer and removes the cascade level-2 safety net.</li>
- *   <li>{@link #startPosition()} = whether to apply the cascade ({@code RESUME})
- *       or ignore both tokens ({@code LATEST}, bootstrap).</li>
+ *   <li>{@link #saveEveryN()} = count threshold of the processed-anchor
+ *       policy. {@code 1} (default) writes after every settlement.</li>
+ *   <li>{@link #saveIntervalSeconds()} = time threshold of the same policy —
+ *       the maximum age of a dirty processed anchor.</li>
+ *   <li>{@link #idleHeartbeatIntervalSeconds()} = idle certification cadence,
+ *       the sole writer of {@code lastSeenToken}.</li>
+ *   <li>{@link #startPosition()} = whether to apply the cascade
+ *       ({@code RESUME}) or ignore both anchors ({@code LATEST},
+ *       bootstrap).</li>
  *   <li>{@link #onHistoryLost()} = strategy at cascade level 3 only.</li>
- *   <li>{@link #resumeStrategy()} = which token is tried first in the cascade
- *       (at-least-once vs fast restart).</li>
  * </ul>
  */
 @Target(ElementType.TYPE)
@@ -95,32 +102,38 @@ import java.lang.annotation.Target;
 public @interface Checkpoint {
 
     /**
-     * Persist {@code lastProcessedToken} after every N successful handler invocations.
-     * Must be {@code >= 1}; {@code 1} (default) gives strict at-least-once on crash.
-     * Larger values reduce write pressure at the cost of replaying up to {@code N-1}
-     * events on crash recovery.
+     * Count threshold of the processed-anchor policy: persist
+     * {@code lastProcessedToken} at every N-th terminally settled event
+     * (handler success, {@code @Filter} rejection, no matching handler, or
+     * terminal skip/DLQ decision). Must be {@code >= 1}; {@code 1} (default)
+     * gives strict at-least-once on crash. Larger values reduce write
+     * pressure at the cost of replaying up to {@code N-1} settled events on
+     * crash recovery.
      */
     int saveEveryN() default 1;
 
     /**
-     * Write-coalescing flush interval in seconds for {@code lastSeenToken}.
-     *
-     * <p>Each tick persists the most recent event token received (including
-     * filtered or no-handler events) — <em>only if it changed</em> since the
-     * last flush. This is purely a write-pressure control on active streams:
-     * a clean tick writes nothing and never opens any cursor. Keeping a
-     * stream's resume point alive while it is <em>idle</em> is the separate
-     * responsibility of {@link #idleHeartbeatIntervalSeconds()}.</p>
+     * Time threshold of the processed-anchor policy: the maximum time a
+     * <em>dirty</em> {@code lastProcessedToken} waits before being
+     * persisted. Complements {@link #saveEveryN()} — the anchor is written
+     * at whichever threshold is reached first. A clean anchor is never
+     * rewritten: on an active-but-slow stream this bounds the anchor's age
+     * in wall-clock time (protecting it against oplog aging that a pure
+     * count threshold cannot see), while on a stream that settles nothing it
+     * writes nothing at all — keeping an <em>idle</em> stream's resume point
+     * alive is the separate responsibility of
+     * {@link #idleHeartbeatIntervalSeconds()}.
      *
      * <p>{@code 5} (default) is a balanced value; set to {@code 0} to disable
-     * the periodic flush ({@code lastSeenToken} then only advances through
-     * the idle heartbeat).</p>
+     * the time threshold ({@code lastProcessedToken} then only advances
+     * through the {@link #saveEveryN()} counter).</p>
      */
     int saveIntervalSeconds() default 5;
 
     /**
      * Idle heartbeat interval in seconds — the oplog-rollover protection
-     * policy for streams that stop receiving events.
+     * policy for streams that stop settling events, and the <strong>sole
+     * writer</strong> of {@code lastSeenToken}.
      *
      * <p>When the main cursor has not settled any event for this long, the
      * heartbeat opens an ephemeral, bounded change stream probe chained from
@@ -131,9 +144,10 @@ public @interface Checkpoint {
      * post-batch resume token is persisted as {@code lastSeenToken}: the
      * resume point keeps tracking the oplog head with zero traffic — the
      * stream stays recoverable as long as probes keep succeeding within the
-     * oplog window. Any activity of the main cursor re-arms the idle delay;
-     * active streams never probe. This is the level-2 safety net of the
-     * resume cascade for idle workloads.</p>
+     * oplog window. If events sit undelivered, the probe abstains and writes
+     * nothing: a certified position never crosses unsettled work. Any
+     * activity of the main cursor re-arms the idle delay; active streams
+     * never probe (their recoverability rides on the processed anchor).</p>
      *
      * <p>Timing contract (nominal, not a hard bound): idleness is checked
      * every few seconds and the probe runs as soon as the dedicated
@@ -144,9 +158,9 @@ public @interface Checkpoint {
      * apart.</p>
      *
      * <p>The checkpoint's {@code lastHeartbeatTimestamp} records the last time
-     * a recoverable position was confirmed (fresh event flush or successful
-     * empty probe); its age is the operational signal for resume-point
-     * health.</p>
+     * a recoverable position was confirmed (processed-anchor write or
+     * successful empty probe); its age is the operational signal for
+     * resume-point health.</p>
      *
      * <p>The interval must stay well below the expected oplog window, with
      * enough margin to absorb transient probe failures and outages — there is
@@ -161,28 +175,15 @@ public @interface Checkpoint {
     /**
      * Where to start consuming on (re)start.
      * {@link StartPosition#RESUME} applies the 3-level cascade.
-     * {@link StartPosition#LATEST} ignores both persisted tokens and starts from now.
+     * {@link StartPosition#LATEST} ignores both persisted anchors and starts from now.
      */
     StartPosition startPosition() default StartPosition.RESUME;
 
     /**
-     * Strategy when <strong>both</strong> persisted tokens have aged out of the
-     * MongoDB oplog (cascade level 3). With the dual-token cascade in place,
+     * Strategy when <strong>both</strong> persisted anchors have aged out of the
+     * MongoDB oplog (cascade level 3). With the dual-anchor cascade in place,
      * reaching this level signals a genuine anomaly (downtime longer than the
-     * oplog window combined with timer not running).
+     * oplog window combined with the heartbeat not running).
      */
     OnHistoryLost onHistoryLost() default OnHistoryLost.FAIL;
-
-    /**
-     * Order in which the two persisted tokens are tried by the resume cascade.
-     *
-     * <p>{@link ResumeStrategy#PROCESSED_FIRST} (default) preserves strict
-     * at-least-once delivery: in-flight events at crash time are re-delivered,
-     * at the cost of a potentially long oplog scan on low-volume or
-     * filter-heavy streams. {@link ResumeStrategy#SEEN_FIRST} restarts fast
-     * from the heartbeat-fresh {@code lastSeenToken} and falls back to
-     * {@code lastProcessedToken} as the safety net before escalating to
-     * {@link #onHistoryLost()}.</p>
-     */
-    ResumeStrategy resumeStrategy() default ResumeStrategy.PROCESSED_FIRST;
 }

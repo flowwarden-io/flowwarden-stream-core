@@ -153,17 +153,15 @@ class ReactiveCursorDeathIntegrationTest {
         streamManager.startStream(POISON_STREAM);
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning(POISON_STREAM));
-        BsonDocument bootstrapSeen = checkpointStore.findByStreamName(POISON_STREAM)
-                .orElseThrow().lastSeenToken();
         reactiveMongoTemplate.insert(new Document("seq", 1), POISON_COLLECTION).block();
         await().atMost(Duration.ofSeconds(10))
                 .untilAsserted(() -> assertThat(poisonHandler.count()).isEqualTo(1));
-        // Wait for the flush to persist the settled event token: a pending
-        // dirty flush after the poison write would overwrite it with a valid
+        // Wait for the settled event to be anchored: a pending dirty anchor
+        // write after the poison write would overwrite it with a valid
         // position and mask the level-3 scenario.
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
                 assertThat(checkpointStore.findByStreamName(POISON_STREAM)
-                        .orElseThrow().lastSeenToken()).isNotEqualTo(bootstrapSeen));
+                        .orElseThrow().lastProcessedToken()).isNotNull());
 
         // Poison the checkpoint (the running stream never re-reads it), then
         // kill the cursor: the resubscribe cascade finds both tokens dead and

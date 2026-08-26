@@ -108,6 +108,22 @@ public class MongoCheckpointStore implements CheckpointStore {
     }
 
     @Override
+    public void saveProcessed(String streamName, BsonDocument token, Instant timestamp,
+                              Instant heartbeatTimestamp) {
+        // Single atomic update: anchor and its confirmation are never
+        // observable in an intermediate state.
+        Update update = new Update()
+                .set("lastProcessedToken", bsonToDocument(token))
+                .set("lastProcessedTimestamp", timestamp)
+                .set("lastHeartbeatTimestamp", heartbeatTimestamp);
+        mongoTemplate.upsert(
+                Query.query(Criteria.where("_id").is(streamName)),
+                update,
+                COLLECTION
+        );
+    }
+
+    @Override
     public void resetAfterHistoryLost(String streamName, BsonDocument freshSeenToken,
                                       BsonDocument expectedDeadProcessed, Instant timestamp) {
         // Single atomic reset with the at-least-once guard IN the update

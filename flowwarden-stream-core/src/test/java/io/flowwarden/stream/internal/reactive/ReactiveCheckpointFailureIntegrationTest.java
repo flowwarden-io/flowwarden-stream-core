@@ -147,33 +147,49 @@ class ReactiveCheckpointFailureIntegrationTest {
     }
 
     @Test
-    void streamContinuesWhenManualSaveCheckpointFails() {
+    void failedManualSave_isNotDeclaredDurable_theFlushRetriesTheToken() {
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning("rea-cp-fail-manual"));
 
-        failingStore.failNextNCalls("save:rea-cp-fail-manual", 1);
+        // saveCheckpointNow() routes through the targeted saveProcessed
+        // write. A SINGLE event whose manual save fails: the failure must
+        // not be recorded as a manual save — the anchor stays dirty and a
+        // later flush genuinely retries the token.
+        failingStore.failNextNCalls("saveProcessed:rea-cp-fail-manual", 1);
 
         reactiveMongoTemplate.insert(new Document("item", "M1"), "rea_cp_fail_manual").block();
-        reactiveMongoTemplate.insert(new Document("item", "M2"), "rea_cp_fail_manual").block();
 
         await().atMost(Duration.ofSeconds(15))
                 .untilAsserted(() ->
-                        assertThat(manualSaveStream.getEvents()).hasSize(2));
-
+                        assertThat(manualSaveStream.getEvents()).hasSize(1));
         await().atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> {
                     List<Throwable> failures = metrics.checkpointFailures("rea-cp-fail-manual");
                     assertThat(failures).hasSize(1);
                     assertThat(failures.get(0)).isInstanceOf(MongoWriteConcernException.class);
                 });
+
+        // The count threshold is out of reach (saveEveryN=100): only the
+        // time threshold can repair the anchor — and it must.
+        await().atMost(Duration.ofSeconds(15))
+                .untilAsserted(() -> {
+                    var cp = failingStore.findByStreamName("rea-cp-fail-manual");
+                    assertThat(cp).isPresent();
+                    assertThat(cp.get().lastProcessedToken())
+                            .as("the flush must retry the token the manual save failed to persist")
+                            .isNotNull();
+                });
     }
 
     @Test
-    void timerKeepsSchedulingWhenSaveSeenFails() {
+    void timerKeepsSchedulingWhenSaveProcessedFails() {
         await().atMost(Duration.ofSeconds(5))
                 .until(() -> streamManager.isRunning("rea-cp-fail-timer"));
 
-        failingStore.failNextNCalls("saveSeen:rea-cp-fail-timer", 100);
+        // The timer anchors the processed token (the count threshold is out
+        // of reach): every write throws for a long stretch — the scheduler
+        // must not give up on the first error.
+        failingStore.failNextNCalls("saveProcessed:rea-cp-fail-timer", 100);
 
         reactiveMongoTemplate.insert(new Document("item", "T1"), "rea_cp_fail_timer").block();
 
@@ -244,7 +260,10 @@ class ReactiveCheckpointFailureIntegrationTest {
     }
 
     @ChangeStream(name = "rea-cp-fail-timer", collection = "rea_cp_fail_timer")
-    @Checkpoint(saveEveryN = 100, saveIntervalSeconds = 1)
+    // saveEveryN high so only the timer path triggers; idle probing opted
+    // out so no startup diagnostic probe can hold the heartbeat lock under
+    // full-suite load (the flush would tryLock-skip for its whole duration).
+    @Checkpoint(saveEveryN = 100, saveIntervalSeconds = 1, idleHeartbeatIntervalSeconds = 0)
     static class TimerStream {
         private final List<ChangeStreamContext<?>> events = new CopyOnWriteArrayList<>();
 
@@ -295,6 +314,15 @@ class ReactiveCheckpointFailureIntegrationTest {
         public void saveProcessed(String streamName, BsonDocument token, Instant timestamp) {
             maybeThrow("saveProcessed:" + streamName);
             delegate.saveProcessed(streamName, token, timestamp);
+            confirmedSaveProcessed.computeIfAbsent(streamName, k -> new AtomicInteger())
+                    .incrementAndGet();
+        }
+
+        @Override
+        public void saveProcessed(String streamName, BsonDocument token, Instant timestamp,
+                                  Instant heartbeatTimestamp) {
+            maybeThrow("saveProcessed:" + streamName);
+            delegate.saveProcessed(streamName, token, timestamp, heartbeatTimestamp);
             confirmedSaveProcessed.computeIfAbsent(streamName, k -> new AtomicInteger())
                     .incrementAndGet();
         }

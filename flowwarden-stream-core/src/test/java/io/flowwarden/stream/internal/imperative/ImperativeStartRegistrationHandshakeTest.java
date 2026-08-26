@@ -487,10 +487,11 @@ class ImperativeStartRegistrationHandshakeTest {
                 ((org.springframework.data.mongodb.core.messaging.SubscriptionRequest) capturedRequest.get())
                         .getMessageListener();
 
-        // A data event: the manual save goes through.
+        // A data event: the manual save goes through — a targeted processed
+        // write (a delivered token is an anchor, never a seen position).
         listener.onMessage(message(com.mongodb.client.model.changestream.OperationType.INSERT));
         org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.atLeastOnce())
-                .save(any());
+                .saveProcessed(anyString(), any(), any(), any());
         org.mockito.Mockito.clearInvocations(checkpointStore);
 
         // Lifecycle events: the manual save is refused — no store write of
@@ -500,6 +501,8 @@ class ImperativeStartRegistrationHandshakeTest {
         org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.never()).save(any());
         org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.never())
                 .saveProcessed(anyString(), any(), any());
+        org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.never())
+                .saveProcessed(anyString(), any(), any(), any());
         org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.never())
                 .saveSeen(anyString(), any(), any());
         org.mockito.Mockito.verify(checkpointStore, org.mockito.Mockito.never())

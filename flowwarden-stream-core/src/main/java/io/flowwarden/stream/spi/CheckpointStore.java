@@ -27,6 +27,23 @@ import java.util.Optional;
  * <p>The Core ships with a {@linkplain #noOp() no-op} implementation and a
  * MongoDB-backed implementation registered via auto-configuration.
  * Users may provide their own implementation as a Spring bean.</p>
+ *
+ * <h2>Concurrency contract of the partial updates</h2>
+ *
+ * <p>The two anchors have independent writers running on different threads:
+ * the processed-anchor policy writes {@code lastProcessedToken} while the
+ * heartbeat probe writes {@code lastSeenToken}. Every partial operation
+ * ({@code saveSeen}, {@code saveProcessed}, {@code saveHeartbeat},
+ * {@code resetAfterHistoryLost}) MUST therefore preserve the fields it does
+ * not target <em>atomically with respect to concurrent writers</em> — a
+ * targeted update (partial {@code $set}), not a read-modify-write. The
+ * {@code default} implementations below are read-modify-write fallbacks
+ * kept for source compatibility only: under concurrent anchor writers they
+ * can resurrect a stale value of the other anchor (a {@code saveSeen} based
+ * on an old read re-installing an old processed token, or vice versa), and
+ * a Java-level synchronization cannot fix this for a store shared between
+ * instances. Production implementations MUST override them with targeted
+ * writes — the shipped Mongo stores do.</p>
  */
 public interface CheckpointStore {
 
@@ -49,10 +66,10 @@ public interface CheckpointStore {
      * Updates only the {@code lastSeenToken} pair for the given stream, leaving
      * {@code lastProcessedToken} and {@code lastProcessedTimestamp} untouched.
      *
-     * <p>Intended for hot-path writes that advance the "last event received"
-     * cursor independently of handler success, for example the
-     * {@code saveIntervalSeconds} timer or any path that tracks events
-     * filtered out before the handler runs.</p>
+     * <p>Written exclusively with server-certified positions: the idle
+     * heartbeat's certified PBRTs, and the bootstrap/recovery establishment
+     * writes. Delivered event tokens never go through this method — they
+     * anchor {@code lastProcessedToken} instead.</p>
      *
      * <p>Implementations are encouraged to use a targeted update (e.g. a
      * partial {@code $set}) to avoid a round-trip read. The default
@@ -141,9 +158,12 @@ public interface CheckpointStore {
      * Updates only the {@code lastProcessedToken} pair for the given stream,
      * leaving {@code lastSeenToken} and {@code lastSeenTimestamp} untouched.
      *
-     * <p>Intended for hot-path writes after a handler has successfully
-     * acknowledged an event. {@code lastProcessedToken} must only advance on
-     * confirmed handler success to preserve at-least-once delivery semantics.</p>
+     * <p>Intended for hot-path writes after an event settled terminally —
+     * handler success, {@code @Filter} rejection, no matching handler, or a
+     * terminal skip/DLQ decision. {@code lastProcessedToken} must only
+     * advance on terminal settlement to preserve at-least-once delivery
+     * semantics: an event still retrying (or whose backoff was interrupted)
+     * is not settled and must be re-delivered on restart.</p>
      *
      * <p>Implementations are encouraged to use a targeted update (e.g. a
      * partial {@code $set}) to avoid a round-trip read. The default
@@ -168,6 +188,32 @@ public interface CheckpointStore {
                 current.lastHeartbeatTimestamp(),
                 current.metadata()
         ));
+    }
+
+    /**
+     * Updates the {@code lastProcessedToken} pair together with
+     * {@code lastHeartbeatTimestamp} for the given stream, leaving
+     * {@code lastSeenToken} and {@code lastSeenTimestamp} untouched.
+     *
+     * <p>Used by the periodic checkpoint policy when a settled token is
+     * persisted: a token that was just delivered from the oplog re-confirms
+     * the stream's recoverable position, so the write doubles as the health
+     * confirmation. The default implementation delegates to
+     * {@link #saveProcessed(String, BsonDocument, Instant)} followed by
+     * {@link #saveHeartbeat(String, Instant)} — <strong>two writes, not
+     * atomic</strong>. Implementations backed by a store supporting
+     * multi-field updates (the shipped Mongo stores do) should override with
+     * a single atomic write.</p>
+     *
+     * @param streamName         the stream identifier (must not be null)
+     * @param token              the new {@code lastProcessedToken} value (must not be null)
+     * @param timestamp          the new {@code lastProcessedTimestamp} value (must not be null)
+     * @param heartbeatTimestamp the new {@code lastHeartbeatTimestamp} value (must not be null)
+     */
+    default void saveProcessed(String streamName, BsonDocument token, Instant timestamp,
+                               Instant heartbeatTimestamp) {
+        saveProcessed(streamName, token, timestamp);
+        saveHeartbeat(streamName, heartbeatTimestamp);
     }
 
     /**

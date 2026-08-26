@@ -51,7 +51,14 @@ public class DefaultChangeStreamContext<T> implements ChangeStreamContext<T> {
      */
     public interface ContextActions {
         void sendToDlq(String reason);
-        void saveCheckpointNow();
+
+        /**
+         * Persists the current token as the processed anchor immediately.
+         * Returns whether the write was <em>confirmed</em> — the context
+         * only records a manual save that is actually durable, so a store
+         * failure leaves the anchor dirty for the automatic policy to retry.
+         */
+        boolean saveCheckpointNow();
     }
 
     /** No-op actions for use when DLQ/checkpoint are not yet available. */
@@ -60,7 +67,9 @@ public class DefaultChangeStreamContext<T> implements ChangeStreamContext<T> {
         public void sendToDlq(String reason) { /* no-op */ }
 
         @Override
-        public void saveCheckpointNow() { /* no-op */ }
+        public boolean saveCheckpointNow() {
+            return false; // nothing was persisted
+        }
     };
 
     private final String eventId;
@@ -216,8 +225,12 @@ public class DefaultChangeStreamContext<T> implements ChangeStreamContext<T> {
 
     @Override
     public void saveCheckpointNow() {
-        actions.saveCheckpointNow();
-        this.checkpointSavedManually = true;
+        if (actions.saveCheckpointNow()) {
+            // Only a CONFIRMED write counts as a manual save: a failed
+            // write must leave the anchor dirty so the automatic policy
+            // (count or time threshold) retries it.
+            this.checkpointSavedManually = true;
+        }
     }
 
     /**
