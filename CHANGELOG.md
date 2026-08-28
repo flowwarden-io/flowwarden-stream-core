@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.4] — 2026-08-28
+
 ### Added
+- `flowwarden-bom` now pins the satellite backends validated against this core version: `flowwarden-javers`, `flowwarden-redis` and `flowwarden-amqp` at `1.0.0-rc.2`, each behind its own version property.
 - `DlqStore.count(streamName)` — the standing DLQ backlog (entries with status `PENDING` waiting to be reprocessed). New SPI `default` method returning `-1` ("this backend cannot count" — publish-only backends), overridden with a real filtered count by the shipped Mongo stores (`streamName + status`, covered by a new compound index provisioned alongside the TTL index) and with a truthful `0` by the no-op store. In the testkit, counting is its own opt-in capability (`supportsCount()`, default `false`) independent of `supportsReplay()` — a replay-capable backend that cannot count stays green, all four capability combinations remain expressible.
 - `StreamMetricsProvider.onDlqBacklog(streamName, pendingCount)` — new SPI callback (default no-op) carrying the standing backlog gauge: emitted periodically (same 60s cadence as `onOplogStats`) for every stream with a DLQ configured, and refreshed right after each successful DLQ write. All collection runs on a dedicated single-threaded stats executor (`fw-stats`) — never on the checkpoint flush scheduler or the event-processing path, so a slow or blocked `count` delays nothing but its own gauge (the periodic oplog stats collection moves to the same thread, off the flush scheduler it previously rode). Complements `onEventSentToDlq` (write activity only) with the backlog itself, drain included. Never emitted when the configured store cannot count, so a publish-only backend produces no lying zero-gauge.
 - Every change stream cursor is now stamped with an identifying `comment` for attribution: `flowwarden:<streamName>` on a stream's main cursor (both modes), `flowwarden:resume-validation:<streamName>` on the ephemeral resume-token validation cursors of the resume cascade, alongside the existing `flowwarden:heartbeat:<streamName>` on probe cursors. The comment surfaces in `$currentOp` (`cursor.originatingCommand.comment`, `idleCursors: true`), server logs and the profiler, and is propagated to `getMore`s (server ≥ 4.4) — a cursor on a deployment is attributable to its declaring stream at a glance, and FlowWarden cursors are distinguishable from any other change stream consumer. The prefix is exposed as `FlowWarden.CURSOR_COMMENT_PREFIX` for downstream tooling. Metadata only — no behavioral change.
@@ -171,7 +174,8 @@ First release candidate of FlowWarden Stream Core.
 - `DeploymentMode.PARTITIONED` — defined in the enum but not yet implemented, reserved for a future release
 - Watchdog / zombie stream detection — planned for a future release
 
-[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.3...HEAD
+[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.4...HEAD
+[1.0.0-rc.4]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.4
 [1.0.0-rc.3]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.1

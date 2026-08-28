@@ -42,16 +42,16 @@ The library automatically handles **checkpoint/resume**, **retry with exponentia
 <dependency>
     <groupId>io.flowwarden</groupId>
     <artifactId>flowwarden-stream-core</artifactId>
-    <version>1.0.0-rc.3</version>
+    <version>1.0.0-rc.4</version>
 </dependency>
 ```
 
 **Gradle**
 ```groovy
-implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.3'
+implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.4'
 ```
 
-**Optional — using the FlowWarden BOM** *(available from `1.0.0-rc.3` onward)*. Handy if you also pull `flowwarden-stream-core-testkit` or future satellite backends, so versions stay aligned:
+**Optional — using the FlowWarden BOM** *(available from `1.0.0-rc.3` onward)*. Handy if you also pull `flowwarden-stream-core-testkit` or a satellite backend (`flowwarden-javers`, `flowwarden-redis`, `flowwarden-amqp`), so versions stay aligned:
 
 ```xml
 <dependencyManagement>
@@ -59,7 +59,7 @@ implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.3'
     <dependency>
       <groupId>io.flowwarden</groupId>
       <artifactId>flowwarden-bom</artifactId>
-      <version>1.0.0-rc.3</version>
+      <version>1.0.0-rc.4</version>
       <type>pom</type>
       <scope>import</scope>
     </dependency>
@@ -218,7 +218,7 @@ All stream-level settings are configured via annotations on your `@ChangeStream`
 
 | Annotation | Purpose | Key defaults |
 |------------|---------|--------------|
-| `@Checkpoint` | Resume token persistence | `saveEveryN = 1`, `saveIntervalSeconds = 5`, `idleHeartbeatIntervalSeconds = 300` (idle-stream oplog-rollover protection, `0` opts out), `startPosition = RESUME` |
+| `@Checkpoint` | Durable anchor persistence (at-least-once resume) | `saveEveryN = 1` (persist after N settled events), `saveIntervalSeconds = 5` (max age of an unpersisted anchor — whichever threshold is hit first), `idleHeartbeatIntervalSeconds = 300` (idle-stream oplog-rollover protection, `0` opts out), `startPosition = RESUME` |
 | `@RetryPolicy` | Exponential backoff on failure | `maxAttempts = 3`, `initialDelay = "500ms"`, `multiplier = 2.0`, `maxDelay = "30s"`, `jitter = true` |
 | `@DeadLetterQueue` | Route failed events to a DLQ (backend-agnostic) | `enabled = true`, `retentionDays = 30` |
 | `@MongoDlqOptions` | MongoDB-specific DLQ tuning (collection override) | `collection = "_fw_dlq"` (overrides `flowwarden.dlq.mongo.collection`) |
