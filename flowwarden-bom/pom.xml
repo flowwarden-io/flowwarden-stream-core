@@ -7,7 +7,7 @@
     <parent>
         <groupId>io.flowwarden</groupId>
         <artifactId>flowwarden-stream-core-parent</artifactId>
-        <version>1.0.0-rc.4-SNAPSHOT</version>
+        <version>1.0.0-rc.4</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -15,7 +15,14 @@
     <packaging>pom</packaging>
 
     <name>FlowWarden BOM</name>
-    <description>Dependency Bill of Materials pinning compatible versions of the FlowWarden ecosystem artifacts (stream-core, testkit, and future satellite backends). Import in your dependencyManagement to omit per-dependency versions.</description>
+    <description>Dependency Bill of Materials pinning compatible versions of the FlowWarden ecosystem artifacts (stream-core, testkit, and satellite backends). Import in your dependencyManagement to omit per-dependency versions.</description>
+
+    <properties>
+        <!-- Satellites release on their own cadence; these pins define the set validated against this core version. -->
+        <flowwarden-javers.version>1.0.0-rc.2</flowwarden-javers.version>
+        <flowwarden-redis.version>1.0.0-rc.2</flowwarden-redis.version>
+        <flowwarden-amqp.version>1.0.0-rc.2</flowwarden-amqp.version>
+    </properties>
 
     <dependencyManagement>
         <dependencies>
@@ -28,6 +35,21 @@
                 <groupId>io.flowwarden</groupId>
                 <artifactId>flowwarden-stream-core-testkit</artifactId>
                 <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.flowwarden</groupId>
+                <artifactId>flowwarden-javers</artifactId>
+                <version>${flowwarden-javers.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.flowwarden</groupId>
+                <artifactId>flowwarden-redis</artifactId>
+                <version>${flowwarden-redis.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.flowwarden</groupId>
+                <artifactId>flowwarden-amqp</artifactId>
+                <version>${flowwarden-amqp.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>
