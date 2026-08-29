@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Reactive streams could wedge permanently under load when the synchronous part of event dispatch triggered a checkpoint persistence — a `@Filter`-rejected or handler-less settlement, or a `ctx.saveCheckpointNow()` issued from inside a handler: the blocking store write ran on the driver thread that delivered the event, and when the write's own reply needed that thread the change-stream cursor froze with it, silently. The whole per-event dispatch — every handler attempt (initial or retried after backoff), the `@OnError` resolution, and the off-pipeline settlements — is now fenced onto a blocking-safe scheduler, with per-stream ordering preserved. (#80)
+
 ## [1.0.0-rc.4] — 2026-08-28
 
 ### Added
