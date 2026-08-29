@@ -336,13 +336,25 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
         Disposable disposable = stampedForStream(streamTemplate, streamName)
                 .changeStream(def.collection(), options, Document.class)
-                .concatMap(event -> {
+                // Single off-loop boundary around the whole synchronous
+                // dispatch: @Filter evaluation, handler resolution and
+                // invocation, ctx.saveCheckpointNow() and the off-pipeline
+                // settlements can all reach a BLOCKING checkpoint write, and
+                // none of it may run on the driver thread that delivered the
+                // event — a block() there can wait on a reply that needs the
+                // very thread it is blocking, wedging the cursor permanently.
+                // concatMap still awaits each inner Mono, so per-stream
+                // ordering is preserved. The terminal publishOn inside
+                // handleEventReactive stays: a user-returned Mono may complete
+                // on any scheduler, and the settlement side-effects on its
+                // completion need the same blocking-safe discipline.
+                .concatMap(event -> Mono.defer(() -> {
                     ChangeStreamDocument<Document> raw = event.getRaw();
                     if (raw != null) {
                         return handleEventReactive(raw, def, state);
                     }
                     return Mono.empty();
-                })
+                }).subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic()))
                 .doOnError(e -> {
                     lastError.set(e);
                     log.error("Error in reactive Change Stream '{}': {}",
@@ -835,6 +847,8 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         HandlerMethod handler = def.resolveHandler(opType);
         if (handler == null) {
             log.debug("No handler for {} in stream '{}'", opType, def.streamName());
+            // Safe to settle inline: the concatMap dispatch boundary already
+            // runs this whole method on the blocking-safe scheduler.
             publishSettledToken(def, raw, opType, ctx);
             return Mono.empty();
         }
@@ -869,12 +883,26 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             } catch (IllegalAccessException e) {
                 return Mono.<Void>error(e);
             }
-        });
+        })
+                // This source is ONE handler attempt, and retryWhen
+                // re-subscribes it after each backoff from the parallel timer
+                // thread — the outer dispatch boundary only covers the first
+                // subscription. Carrying the hop on the attempt source itself
+                // puts every invocation, initial or retried, on the
+                // blocking-safe scheduler: a handler may legitimately call
+                // ctx.saveCheckpointNow() (a blocking store write) on any
+                // attempt.
+                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic());
 
         // REQ-015: wrap retryWhen to consult @OnError before standard retry
         if (retryConfig != null || !def.errorHandlerResolver().isEmpty()) {
             RetryPolicyConfig rc = retryConfig;
-            pipeline = pipeline.retryWhen(Retry.from(signals -> signals.flatMap(signal -> {
+            pipeline = pipeline
+                    // Signal boundary: a user Mono may emit its error on any
+                    // scheduler; the @OnError resolution below is synchronous
+                    // user code and must not run on that emitting thread.
+                    .publishOn(reactor.core.scheduler.Schedulers.boundedElastic())
+                    .retryWhen(Retry.from(signals -> signals.flatMap(signal -> {
                 Throwable ex = signal.failure();
 
                 // Consult @OnError handler
