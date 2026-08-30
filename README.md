@@ -42,13 +42,13 @@ The library automatically handles **checkpoint/resume**, **retry with exponentia
 <dependency>
     <groupId>io.flowwarden</groupId>
     <artifactId>flowwarden-stream-core</artifactId>
-    <version>1.0.0-rc.4</version>
+    <version>1.0.0-rc.5</version>
 </dependency>
 ```
 
 **Gradle**
 ```groovy
-implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.4'
+implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.5'
 ```
 
 **Optional — using the FlowWarden BOM** *(available from `1.0.0-rc.3` onward)*. Handy if you also pull `flowwarden-stream-core-testkit` or a satellite backend (`flowwarden-javers`, `flowwarden-redis`, `flowwarden-amqp`), so versions stay aligned:
@@ -59,7 +59,7 @@ implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.4'
     <dependency>
       <groupId>io.flowwarden</groupId>
       <artifactId>flowwarden-bom</artifactId>
-      <version>1.0.0-rc.4</version>
+      <version>1.0.0-rc.5</version>
       <type>pom</type>
       <scope>import</scope>
     </dependency>

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.5] — 2026-08-29
+
 ### Fixed
 - Reactive streams could wedge permanently under load when the synchronous part of event dispatch triggered a checkpoint persistence — a `@Filter`-rejected or handler-less settlement, or a `ctx.saveCheckpointNow()` issued from inside a handler: the blocking store write ran on the driver thread that delivered the event, and when the write's own reply needed that thread the change-stream cursor froze with it, silently. The whole per-event dispatch — every handler attempt (initial or retried after backoff), the `@OnError` resolution, and the off-pipeline settlements — is now fenced onto a blocking-safe scheduler, with per-stream ordering preserved. (#80)
 
@@ -177,7 +179,8 @@ First release candidate of FlowWarden Stream Core.
 - `DeploymentMode.PARTITIONED` — defined in the enum but not yet implemented, reserved for a future release
 - Watchdog / zombie stream detection — planned for a future release
 
-[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.4...HEAD
+[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.5...HEAD
+[1.0.0-rc.5]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.4
 [1.0.0-rc.3]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.2
