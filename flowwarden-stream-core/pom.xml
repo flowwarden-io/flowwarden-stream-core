@@ -7,7 +7,7 @@
     <parent>
         <groupId>io.flowwarden</groupId>
         <artifactId>flowwarden-stream-core-parent</artifactId>
-        <version>1.0.0-rc.5</version>
+        <version>1.0.0-rc.6-SNAPSHOT</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
