@@ -69,6 +69,20 @@ class ChangeStreamBeanPostProcessorValidationTest {
                 .run(context -> assertThat(context).hasNotFailed());
     }
 
+    @Test
+    void failsWhenNamedBeanExistsButIsNotAMongoTemplate() {
+        // Regression: a bean of ANY type sharing the ref's name, combined with an unrelated
+        // MongoTemplate bean existing elsewhere in the context, must not pass validation.
+        contextRunner
+                .withUserConfiguration(MissingRefHandlerConfig.class, NonMongoTemplateBeanNamedMissingTemplateConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("mongoTemplateRef='missingTemplate'")
+                            .hasMessageContaining("no bean");
+                });
+    }
+
     // --- Test configurations ---
 
     @Configuration(proxyBeanMethods = false)
@@ -84,6 +98,14 @@ class ChangeStreamBeanPostProcessorValidationTest {
         @Bean
         MongoTemplate myTemplate() {
             return mock(MongoTemplate.class);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class NonMongoTemplateBeanNamedMissingTemplateConfig {
+        @Bean
+        String missingTemplate() {
+            return "not-a-mongo-template";
         }
     }
 

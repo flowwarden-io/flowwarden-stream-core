@@ -226,6 +226,26 @@ class ChangeStreamBeanPostProcessorTest {
     }
 
     @Test
+    void throwsWhenTypedHandlerParameterTypeMismatchesDocumentType() {
+        // Regression test for #86: the parameter type must be validated against
+        // @ChangeStream.documentType() at bean creation, not left to fail at the first event.
+        MismatchedTypedParamBean bean = new MismatchedTypedParamBean();
+        assertThrows(BeanCreationException.class,
+                () -> processor.postProcessAfterInitialization(bean, "mismatchedTypedParam"));
+    }
+
+    @Test
+    void allowsTypedHandlerParameterSupertypeOfDocumentType() {
+        // A handler parameter that is a supertype of documentType() (or Object) is valid:
+        // the converted document is always assignable to it.
+        SupertypeTypedParamBean bean = new SupertypeTypedParamBean();
+        processor.postProcessAfterInitialization(bean, "supertypeTypedParam");
+
+        ChangeStreamDefinition def = processor.getDefinitions().get(0);
+        assertNotNull(def.typedHandlers().get(OperationType.INSERT));
+    }
+
+    @Test
     void resolveHandlerReturnsTypedFirst() {
         MixedHandlersBean bean = new MixedHandlersBean();
         processor.postProcessAfterInitialization(bean, "mixed2");
@@ -411,6 +431,20 @@ class ChangeStreamBeanPostProcessorTest {
     static class InvalidTypedSignatureBean {
         @OnInsert
         void onInsert(String a, String b, String c) { // 3 params = invalid
+        }
+    }
+
+    @ChangeStream(collection = "orders", documentType = Order.class)
+    static class MismatchedTypedParamBean {
+        @OnInsert
+        void onInsert(String s) { // wrong type: documentType is Order, not String
+        }
+    }
+
+    @ChangeStream(collection = "orders", documentType = Order.class)
+    static class SupertypeTypedParamBean {
+        @OnInsert
+        void onInsert(Object doc) { // supertype of Order: always assignable, valid
         }
     }
 
