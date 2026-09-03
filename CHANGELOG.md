@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- New `io.flowwarden.stream.registration` package: a bootstrap-only, annotation-free way to declare Change Stream definitions programmatically via `StreamDefinitionContributor` beans — for streams whose configuration lives outside the JVM (YAML, a database, a feature-flag service). `StreamSpec`/`StreamSpec.Builder` cover a deliberate subset of the annotation model: typed functional handlers (`@OnInsert`/`@OnUpdate`/`@OnDelete`/`@OnReplace`/`@OnChange`) and `CheckpointSpec`/`RetryPolicySpec`/`DeadLetterQueueSpec`/`MongoDlqOptionsSpec` (builder-based, same defaults as their annotation counterparts) — **not yet covered**: `@Pipeline`, `@Filter`, `@OnError`, and `zone`. What is covered goes through the same fail-fast validation as `@ChangeStream` classes, and a duplicate stream name — annotated or contributed — fails startup. Contribution happens once, after all singleton beans are created and before the stream managers start reading the catalog; there is no support yet for registering a stream on an already-running instance. (#87)
+
+### Fixed
+- `@OnInsert`/`@OnUpdate`/`@OnDelete`/`@OnReplace` methods with a document-typed parameter now validate that parameter's type against `@ChangeStream.documentType()` at bean-creation time. Previously a mismatched parameter type (e.g. `void onInsert(String s)` on a stream configured with `documentType = Order.class`) compiled and started up fine, then threw a raw `IllegalArgumentException` from `Method.invoke` on the first matching event. (#86)
+- `mongoTemplateRef` (on `@ChangeStream` and the equivalent `StreamSpec`) now verifies that the named bean actually **is** a `MongoTemplate`/`ReactiveMongoTemplate`, instead of independently checking "some bean of that type exists somewhere" and "some bean has that name" — a same-named bean of an unrelated type (e.g. a `String`) alongside an unrelated `MongoTemplate` elsewhere in the context used to pass validation. (#87)
+- A `StreamSpec` with the raw `Document.class` documentType and no explicit collection now fails fast with the same "must specify a collection or a documentType with @Document" error as the equivalent `@ChangeStream` misconfiguration, instead of silently resolving to a collection literally named `document`. (#87)
+
 ## [1.0.0-rc.5] — 2026-08-29
 
 ### Fixed

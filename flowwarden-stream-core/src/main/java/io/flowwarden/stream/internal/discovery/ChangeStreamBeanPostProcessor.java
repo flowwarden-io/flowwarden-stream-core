@@ -25,7 +25,6 @@ import io.flowwarden.stream.annotation.DeadLetterQueue;
 import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.annotation.OnChange;
 import io.flowwarden.stream.annotation.RetryPolicy;
-import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
 import io.flowwarden.stream.annotation.OnDelete;
 import io.flowwarden.stream.annotation.OnError;
 import io.flowwarden.stream.annotation.OnInsert;
@@ -48,8 +47,6 @@ import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationContextAware;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.AnnotationUtils;
-import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
 
 import reactor.core.publisher.Mono;
 
@@ -116,56 +113,27 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
 
         Checkpoint cpAnnotation = AnnotationUtils.findAnnotation(targetClass, Checkpoint.class);
         if (cpAnnotation != null) {
-            if (cpAnnotation.saveIntervalSeconds() < 0) {
-                throw new BeanCreationException(beanName,
-                        "@Checkpoint on " + targetClass.getName()
-                                + " has negative saveIntervalSeconds: " + cpAnnotation.saveIntervalSeconds());
-            }
-            if (cpAnnotation.saveEveryN() < 1) {
-                throw new BeanCreationException(beanName,
-                        "@Checkpoint on " + targetClass.getName()
-                                + " has saveEveryN=" + cpAnnotation.saveEveryN()
-                                + " (must be >= 1; saveEveryN controls how often lastProcessedToken is persisted)");
-            }
-            if (cpAnnotation.idleHeartbeatIntervalSeconds() < 0) {
-                throw new BeanCreationException(beanName,
-                        "@Checkpoint on " + targetClass.getName()
-                                + " has negative idleHeartbeatIntervalSeconds: "
-                                + cpAnnotation.idleHeartbeatIntervalSeconds());
-            }
-            if (cpAnnotation.idleHeartbeatIntervalSeconds() == 0) {
-                log.warn("@Checkpoint on {} has idleHeartbeatIntervalSeconds=0 — idle probing is "
-                                + "disabled, so a stream that stays idle longer than the oplog window "
-                                + "loses its resume point (ChangeStreamHistoryLost on restart). "
-                                + "Only disable this if the collection is guaranteed to receive "
-                                + "regular traffic.",
-                        targetClass.getName());
-            }
-            if (cpAnnotation.saveIntervalSeconds() == 0 && cpAnnotation.saveEveryN() > 1
-                    && cpAnnotation.idleHeartbeatIntervalSeconds() == 0) {
-                log.warn("@Checkpoint on {} has saveIntervalSeconds=0, idleHeartbeatIntervalSeconds=0 "
-                                + "and saveEveryN={} — lastSeenToken never advances, so the resume "
-                                + "cascade level-2 safety net (fallback to lastSeenToken when "
-                                + "lastProcessedToken ages out) will not work.",
-                        targetClass.getName(), cpAnnotation.saveEveryN());
-            }
+            StreamDefinitionValidator.validateCheckpoint(beanName, targetClass.getName(),
+                    cpAnnotation.saveEveryN(), cpAnnotation.saveIntervalSeconds(),
+                    cpAnnotation.idleHeartbeatIntervalSeconds());
         }
 
         RetryPolicy retryAnnotation = AnnotationUtils.findAnnotation(targetClass, RetryPolicy.class);
         if (retryAnnotation != null) {
-            validateRetryPolicy(retryAnnotation, targetClass, beanName);
+            StreamDefinitionValidator.validateRetryPolicy(beanName, targetClass.getName(),
+                    retryAnnotation.maxAttempts(), retryAnnotation.multiplier(),
+                    retryAnnotation.initialDelay(), retryAnnotation.maxDelay());
         }
 
         DeadLetterQueue dlqAnnotation = AnnotationUtils.findAnnotation(targetClass, DeadLetterQueue.class);
         if (dlqAnnotation != null) {
-            validateDeadLetterQueue(dlqAnnotation, targetClass, beanName);
+            StreamDefinitionValidator.validateDeadLetterQueue(beanName, targetClass.getName(),
+                    dlqAnnotation.retentionDays());
         }
         MongoDlqOptions mongoDlqOptionsAnnotation = AnnotationUtils.findAnnotation(
                 targetClass, MongoDlqOptions.class);
-        if (mongoDlqOptionsAnnotation != null && dlqAnnotation == null) {
-            log.warn("@MongoDlqOptions on {} has no effect without @DeadLetterQueue on the same class.",
-                    targetClass.getName());
-        }
+        StreamDefinitionValidator.warnMongoDlqOptionsWithoutDlq(targetClass.getName(),
+                mongoDlqOptionsAnnotation != null, dlqAnnotation != null);
 
         HandlerMethod onChangeHandler = findOnChangeHandler(targetClass, beanName, annotation);
         Map<OperationType, HandlerMethod> typedHandlers = findTypedHandlers(targetClass, beanName, annotation);
@@ -177,15 +145,13 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         warnMixedFullDocumentAnnotations(typedHandlers, targetClass);
 
         // Validate: at least one handler required
-        if (onChangeHandler == null && typedHandlers.isEmpty()) {
-            throw new BeanCreationException(beanName,
-                    "@ChangeStream class " + targetClass.getName()
-                            + " must have at least one handler method (@OnChange, @OnInsert, @OnUpdate, @OnDelete, or @OnReplace)");
-        }
+        StreamDefinitionValidator.validateAtLeastOneHandler(beanName, targetClass.getName(),
+                onChangeHandler != null, !typedHandlers.isEmpty());
 
         // Validate: @Filter is incompatible with typed handlers that cover operations without fullDocument
         if (filterMethod != null) {
-            validateFilterCompatibility(typedHandlers, targetClass, beanName);
+            StreamDefinitionValidator.validateFilterCompatibility(beanName, targetClass.getName(),
+                    typedHandlers.keySet());
         }
 
         // Validate: fullDocument = DEFAULT with typed @OnUpdate handler
@@ -340,7 +306,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
 
             Method method = methods.get(0);
             HandlerMethod.SignatureStyle style = resolveTypedSignatureStyle(method, targetClass, beanName,
-                    annotationType);
+                    annotationType, csAnnotation.documentType());
 
             // Validate documentType for document-typed signatures
             if (style != HandlerMethod.SignatureStyle.CONTEXT_ONLY
@@ -600,7 +566,8 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
 
     private HandlerMethod.SignatureStyle resolveTypedSignatureStyle(Method method, Class<?> targetClass,
                                                                     String beanName,
-                                                                    Class<? extends Annotation> annotationType) {
+                                                                    Class<? extends Annotation> annotationType,
+                                                                    Class<?> documentType) {
         Class<?>[] params = method.getParameterTypes();
         String annName = "@" + annotationType.getSimpleName();
 
@@ -608,7 +575,9 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
             if (ChangeStreamContext.class.isAssignableFrom(params[0])) {
                 return HandlerMethod.SignatureStyle.CONTEXT_ONLY;
             }
-            // Assume it's a document type parameter
+            // Document-typed signature: validate against @ChangeStream.documentType() (fixes #86 —
+            // this used to be accepted unconditionally and only fail at runtime on the first event).
+            validateTypedParameterType(method, targetClass, beanName, annotationType, params[0], documentType);
             return HandlerMethod.SignatureStyle.DOCUMENT_ONLY;
         }
         if (params.length == 2) {
@@ -617,12 +586,29 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                         annName + " method " + targetClass.getName() + "#" + method.getName()
                                 + " has invalid signature. Expected: void method(T doc, ChangeStreamContext ctx)");
             }
+            validateTypedParameterType(method, targetClass, beanName, annotationType, params[0], documentType);
             return HandlerMethod.SignatureStyle.DOCUMENT_AND_CONTEXT;
         }
 
         throw new BeanCreationException(beanName,
                 annName + " method " + targetClass.getName() + "#" + method.getName()
                         + " has invalid signature. Supported: (ChangeStreamContext), (T doc), or (T doc, ChangeStreamContext)");
+    }
+
+    /**
+     * Validates a document-typed handler parameter against the stream's configured
+     * {@code documentType}. Skipped when {@code documentType} is still the default
+     * {@code Document.class} — {@link #findTypedHandlers} already rejects a document-typed
+     * signature in that case with a clearer, more specific message.
+     */
+    private void validateTypedParameterType(Method method, Class<?> targetClass, String beanName,
+                                             Class<? extends Annotation> annotationType, Class<?> parameterType,
+                                             Class<?> documentType) {
+        if (documentType == Document.class) {
+            return;
+        }
+        StreamDefinitionValidator.validateTypedHandlerParameterType(beanName, targetClass.getName(),
+                annotationType.getSimpleName(), method.getName(), parameterType, documentType);
     }
 
     // --- Return type detection and mode validation ---
@@ -644,9 +630,6 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
     private void validateHandlerReturnTypes(String mode, String beanName, Class<?> targetClass,
                                              HandlerMethod onChangeHandler,
                                              Map<OperationType, HandlerMethod> typedHandlers) {
-        if (mode.isEmpty()) {
-            return;
-        }
         List<HandlerMethod> allHandlers = new ArrayList<>();
         if (onChangeHandler != null) {
             allHandlers.add(onChangeHandler);
@@ -654,18 +637,8 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         allHandlers.addAll(typedHandlers.values());
 
         for (HandlerMethod handler : allHandlers) {
-            if ("IMPERATIVE".equals(mode) && handler.isReactiveReturn()) {
-                throw new BeanCreationException(beanName,
-                        "Handler method " + targetClass.getName() + "#" + handler.method().getName()
-                                + " returns Mono<Void> but flowwarden.default-mode is IMPERATIVE. "
-                                + "Mono<Void> signatures are not allowed in IMPERATIVE mode.");
-            }
-            if ("REACTIVE".equals(mode) && !handler.isReactiveReturn()) {
-                throw new BeanCreationException(beanName,
-                        "Handler method " + targetClass.getName() + "#" + handler.method().getName()
-                                + " returns void but flowwarden.default-mode is REACTIVE. "
-                                + "Use Mono<Void> return type in REACTIVE mode.");
-            }
+            StreamDefinitionValidator.validateHandlerReturnMode(beanName, targetClass.getName(),
+                    handler.method().getName(), mode, handler.isReactiveReturn());
         }
     }
 
@@ -684,39 +657,14 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
      * are expected to handle {@code Optional.empty()} in their filter predicate, or rely on
      * a server-side {@code @Pipeline}.</p>
      */
-    private void validateFilterCompatibility(Map<OperationType, HandlerMethod> typedHandlers,
-                                              Class<?> targetClass, String beanName) {
-        for (OperationType opType : NO_FULL_DOCUMENT_OPS) {
-            if (typedHandlers.containsKey(opType)) {
-                throw new BeanCreationException(beanName,
-                        "@ChangeStream class " + targetClass.getName()
-                                + " declares @Filter and @On" + capitalize(opType.name())
-                                + ", which is not allowed. "
-                                + opType + " events have no fullDocument, so the @Filter predicate "
-                                + "cannot safely access the document. "
-                                + "Use a server-side @Pipeline to filter these events, "
-                                + "or move the filtering logic into the handler method.");
-            }
-        }
-    }
-
     private void validateFullDocumentCompatibility(ChangeStream annotation,
                                                    Map<OperationType, HandlerMethod> typedHandlers,
                                                    Class<?> targetClass, String beanName) {
-        if (annotation.fullDocument() != FullDocumentMode.DEFAULT) {
-            return; // UPDATE_LOOKUP, WHEN_AVAILABLE, REQUIRED all provide fullDocument
-        }
-
         HandlerMethod updateHandler = typedHandlers.get(OperationType.UPDATE);
-        if (updateHandler != null
-                && updateHandler.signatureStyle() != HandlerMethod.SignatureStyle.CONTEXT_ONLY) {
-            log.warn("@ChangeStream '{}' ({}) uses fullDocument = DEFAULT with an @OnUpdate handler "
-                    + "that expects a typed document parameter. UPDATE events with DEFAULT mode do not include "
-                    + "the fullDocument — the parameter will be null. "
-                    + "Set fullDocument = FullDocumentMode.UPDATE_LOOKUP on @ChangeStream, "
-                    + "or change the @OnUpdate handler to use ChangeStreamContext.",
-                    beanName, targetClass.getName());
-        }
+        boolean updateHandlerExpectsDocument = updateHandler != null
+                && updateHandler.signatureStyle() != HandlerMethod.SignatureStyle.CONTEXT_ONLY;
+        StreamDefinitionValidator.warnFullDocumentDefaultWithTypedUpdate(targetClass.getName(),
+                annotation.fullDocument() == FullDocumentMode.DEFAULT, updateHandlerExpectsDocument);
     }
 
     private void validateFullDocumentBeforeChangeCompatibility(ChangeStream annotation,
@@ -729,53 +677,20 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         boolean hasOnlyInsertHandlers = !typedHandlers.isEmpty()
                 && typedHandlers.keySet().stream().allMatch(op -> op == OperationType.INSERT);
 
-        if (hasOnlyInsertHandlers) {
-            log.warn("@ChangeStream '{}' ({}) sets fullDocumentBeforeChange = {} "
-                    + "but only has @OnInsert handlers. INSERT events have no pre-image — "
-                    + "the fullDocumentBeforeChange value will always be null. "
-                    + "Consider removing fullDocumentBeforeChange or adding @OnUpdate/@OnDelete/@OnReplace handlers.",
-                    beanName, targetClass.getName(), annotation.fullDocumentBeforeChange());
-        }
+        StreamDefinitionValidator.warnFullDocumentBeforeChangeWithInsertOnly(targetClass.getName(),
+                annotation.fullDocumentBeforeChange().toString(), hasOnlyInsertHandlers);
     }
 
     private void validateMongoTemplateRef(ChangeStream annotation, Class<?> targetClass, String beanName) {
-        String ref = annotation.mongoTemplateRef();
-        if (ref.isEmpty() || applicationContext == null) {
-            return;
-        }
-        boolean existsAsBlocking = applicationContext.getBeanNamesForType(MongoTemplate.class).length > 0
-                && applicationContext.containsBean(ref);
-        boolean existsAsReactive = applicationContext.getBeanNamesForType(ReactiveMongoTemplate.class).length > 0
-                && applicationContext.containsBean(ref);
-        if (!existsAsBlocking && !existsAsReactive) {
-            throw new BeanCreationException(beanName,
-                    "@ChangeStream on '" + targetClass.getSimpleName()
-                            + "' references mongoTemplateRef='" + ref
-                            + "' but no bean of type MongoTemplate or ReactiveMongoTemplate"
-                            + " with this name was found.");
-        }
+        StreamDefinitionValidator.validateMongoTemplateRef(beanName, targetClass.getName(),
+                annotation.mongoTemplateRef(), applicationContext);
     }
 
     // --- Name/collection resolution ---
 
     static String resolveCollection(ChangeStream annotation, Class<?> targetClass, String beanName) {
-        String collection = annotation.collection();
-        if (!collection.isEmpty()) {
-            return collection;
-        }
-
-        // Infer from documentType
-        Class<?> docType = annotation.documentType();
-        if (docType != Document.class) {
-            collection = resolveCollectionFromDocumentType(docType);
-        }
-
-        if (collection.isEmpty()) {
-            throw new BeanCreationException(beanName,
-                    "@ChangeStream on " + targetClass.getName()
-                            + " must specify a collection or a documentType with @Document");
-        }
-        return collection;
+        return StreamDefinitionValidator.resolveCollection(beanName, "@ChangeStream on " + targetClass.getName(),
+                annotation.collection(), annotation.documentType());
     }
 
     static String resolveCollectionFromDocumentType(Class<?> docType) {
@@ -814,44 +729,6 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
             }
         }
         return sb.toString();
-    }
-
-    private void validateDeadLetterQueue(DeadLetterQueue dlqAnnotation, Class<?> targetClass, String beanName) {
-        if (dlqAnnotation.retentionDays() < 0) {
-            throw new BeanCreationException(beanName,
-                    "@DeadLetterQueue on " + targetClass.getName()
-                            + " has negative retentionDays: " + dlqAnnotation.retentionDays()
-                            + ". Must be >= 0.");
-        }
-    }
-
-    private void validateRetryPolicy(RetryPolicy retryAnnotation, Class<?> targetClass, String beanName) {
-        if (retryAnnotation.maxAttempts() < 1) {
-            throw new BeanCreationException(beanName,
-                    "@RetryPolicy on " + targetClass.getName()
-                            + " has invalid maxAttempts: " + retryAnnotation.maxAttempts()
-                            + ". Must be >= 1.");
-        }
-        if (retryAnnotation.multiplier() <= 0) {
-            throw new BeanCreationException(beanName,
-                    "@RetryPolicy on " + targetClass.getName()
-                            + " has invalid multiplier: " + retryAnnotation.multiplier()
-                            + ". Must be > 0.");
-        }
-        try {
-            RetryPolicyConfig.parseDuration(retryAnnotation.initialDelay());
-        } catch (IllegalArgumentException e) {
-            throw new BeanCreationException(beanName,
-                    "@RetryPolicy on " + targetClass.getName()
-                            + " has invalid initialDelay: " + retryAnnotation.initialDelay());
-        }
-        try {
-            RetryPolicyConfig.parseDuration(retryAnnotation.maxDelay());
-        } catch (IllegalArgumentException e) {
-            throw new BeanCreationException(beanName,
-                    "@RetryPolicy on " + targetClass.getName()
-                            + " has invalid maxDelay: " + retryAnnotation.maxDelay());
-        }
     }
 
     private static String capitalize(String name) {
