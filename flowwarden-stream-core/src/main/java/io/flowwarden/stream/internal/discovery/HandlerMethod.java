@@ -157,14 +157,27 @@ public final class HandlerMethod {
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private Object invokeFunctional(ChangeStreamContext<?> ctx, Document rawDoc,
-                                     MongoConverter converter, Class<?> docType) {
+                                     MongoConverter converter, Class<?> docType)
+            throws InvocationTargetException {
         if (handlerFunction instanceof DocumentHandler handler) {
             Object converted = convertDocument(rawDoc, converter, docType);
-            handler.handle(converted, ctx);
+            // Wrapped to match reflective dispatch: Method.invoke() auto-wraps ANY Throwable
+            // thrown by the invoked method into InvocationTargetException, and callers
+            // (imperative dispatch's @OnError resolution in particular) rely on that single
+            // catch shape regardless of whether the handler is reflective or functional.
+            try {
+                handler.handle(converted, ctx);
+            } catch (Throwable e) {
+                throw new InvocationTargetException(e);
+            }
             return null;
         }
         if (handlerFunction instanceof ContextHandler handler) {
-            handler.handle(ctx);
+            try {
+                handler.handle(ctx);
+            } catch (Throwable e) {
+                throw new InvocationTargetException(e);
+            }
             return null;
         }
         if (handlerFunction instanceof ReactiveDocumentHandler handler) {

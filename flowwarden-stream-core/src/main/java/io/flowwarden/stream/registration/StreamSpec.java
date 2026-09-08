@@ -15,19 +15,29 @@
  */
 package io.flowwarden.stream.registration;
 
+import io.flowwarden.stream.ChangeStreamContext;
 import io.flowwarden.stream.DeploymentMode;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.FullDocumentMode;
 import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.core.ContextHandler;
 import io.flowwarden.stream.core.DocumentHandler;
+import io.flowwarden.stream.core.ErrorHandler;
 import io.flowwarden.stream.core.ReactiveContextHandler;
 import io.flowwarden.stream.core.ReactiveDocumentHandler;
+import org.bson.conversions.Bson;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.EnumMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 /**
  * Declarative specification of a Change Stream, contributed programmatically instead of
@@ -42,11 +52,11 @@ import java.util.Optional;
  *   <li>Covered, with the same defaults and handler shapes as the corresponding annotation:
  *       {@code @Checkpoint} ({@link CheckpointSpec}), {@code @RetryPolicy}
  *       ({@link RetryPolicySpec}), {@code @DeadLetterQueue} ({@link DeadLetterQueueSpec}),
- *       {@code @MongoDlqOptions} ({@link MongoDlqOptionsSpec}), and the typed handlers
- *       ({@code @OnInsert}/{@code @OnUpdate}/{@code @OnDelete}/{@code @OnReplace}/{@code @OnChange}).</li>
- *   <li><strong>Not covered</strong> (no equivalent on {@code StreamSpec} yet): a
- *       {@code @Pipeline}, a {@code @Filter}, {@code @OnError} handlers, or a {@code zone}.
- *       A stream declared with any of these can only be expressed via annotations.</li>
+ *       {@code @MongoDlqOptions} ({@link MongoDlqOptionsSpec}), the typed handlers
+ *       ({@code @OnInsert}/{@code @OnUpdate}/{@code @OnDelete}/{@code @OnReplace}/{@code @OnChange}),
+ *       {@code @Pipeline}, {@code @Filter}, and {@code @OnError}.</li>
+ *   <li><strong>Not covered</strong> (no equivalent on {@code StreamSpec} yet): a {@code zone}.
+ *       A stream needing one can only be expressed via annotations.</li>
  * </ul>
  *
  * <p>What is covered goes through the exact same validation once contributed — see
@@ -72,6 +82,9 @@ public final class StreamSpec<T> {
     private final MongoDlqOptionsSpec mongoDlqOptions;
     private final Map<OperationType, TypedHandler<T>> typedHandlers;
     private final TypedHandler<T> onChangeHandler;
+    private final Supplier<List<Bson>> pipeline;
+    private final Predicate<ChangeStreamContext<T>> filter;
+    private final List<ErrorHandlerBinding> errorHandlers;
 
     private StreamSpec(Builder<T> builder) {
         this.name = builder.name;
@@ -90,6 +103,9 @@ public final class StreamSpec<T> {
         this.mongoDlqOptions = builder.mongoDlqOptions;
         this.typedHandlers = new EnumMap<>(builder.typedHandlers);
         this.onChangeHandler = builder.onChangeHandler;
+        this.pipeline = builder.pipeline;
+        this.filter = builder.filter;
+        this.errorHandlers = List.copyOf(builder.errorHandlers);
     }
 
     public String name() {
@@ -163,6 +179,21 @@ public final class StreamSpec<T> {
         return Optional.ofNullable(onChangeHandler);
     }
 
+    /** Server-side aggregation pipeline supplier, if any — equivalent of {@code @Pipeline}. */
+    public Optional<Supplier<List<Bson>>> pipeline() {
+        return Optional.ofNullable(pipeline);
+    }
+
+    /** Client-side event predicate, if any — equivalent of {@code @Filter}. */
+    public Optional<Predicate<ChangeStreamContext<T>>> filter() {
+        return Optional.ofNullable(filter);
+    }
+
+    /** All {@code onError} registrations (unmodifiable, possibly empty) — equivalent of {@code @OnError}. */
+    public List<ErrorHandlerBinding> errorHandlers() {
+        return errorHandlers;
+    }
+
     /**
      * Starts building a {@link StreamSpec}. Prefer {@link StreamRegistration#stream(String, Class)}
      * over calling this directly — it tracks the built spec for you.
@@ -190,6 +221,9 @@ public final class StreamSpec<T> {
         private MongoDlqOptionsSpec mongoDlqOptions;
         private final Map<OperationType, TypedHandler<T>> typedHandlers = new EnumMap<>(OperationType.class);
         private TypedHandler<T> onChangeHandler;
+        private Supplier<List<Bson>> pipeline;
+        private Predicate<ChangeStreamContext<T>> filter;
+        private final List<ErrorHandlerBinding> errorHandlers = new ArrayList<>();
 
         Builder(String name, Class<T> documentType) {
             this.name = Objects.requireNonNull(name, "name must not be null");
@@ -336,6 +370,47 @@ public final class StreamSpec<T> {
             requireOnChangeUnset();
             this.onChangeHandler = new TypedHandler.ReactiveContext<>(
                     Objects.requireNonNull(handler, "handler must not be null"));
+            return this;
+        }
+
+        /**
+         * Server-side aggregation pipeline, evaluated once at stream start — equivalent of
+         * {@code @Pipeline}. Only one is allowed per stream.
+         */
+        public Builder<T> pipeline(Supplier<List<Bson>> pipeline) {
+            if (this.pipeline != null) {
+                throw new IllegalStateException("A pipeline is already registered on stream '" + name + "'");
+            }
+            this.pipeline = Objects.requireNonNull(pipeline, "pipeline must not be null");
+            return this;
+        }
+
+        /**
+         * Client-side predicate evaluated for every event before dispatch — equivalent of
+         * {@code @Filter}. Only one is allowed per stream. Rejected at validation time if
+         * combined with a typed handler on an operation without a fullDocument
+         * (DELETE/DROP/INVALIDATE), same as the annotation.
+         */
+        public Builder<T> filter(Predicate<ChangeStreamContext<T>> filter) {
+            if (this.filter != null) {
+                throw new IllegalStateException("A filter is already registered on stream '" + name + "'");
+            }
+            this.filter = Objects.requireNonNull(filter, "filter must not be null");
+            return this;
+        }
+
+        /**
+         * Registers an error handler — equivalent of {@code @OnError}. Repeatable; call with no
+         * {@code exceptionTypes} for a catch-all (at most one allowed per stream), or with one or
+         * more types to scope it (each type claimable by at most one handler per stream).
+         */
+        @SafeVarargs
+        public final Builder<T> onError(ErrorHandler handler, Class<? extends Throwable>... exceptionTypes) {
+            Objects.requireNonNull(handler, "handler must not be null");
+            Set<Class<? extends Throwable>> types = exceptionTypes.length == 0
+                    ? Set.of()
+                    : new LinkedHashSet<>(Arrays.asList(exceptionTypes));
+            errorHandlers.add(new ErrorHandlerBinding(types, handler));
             return this;
         }
 

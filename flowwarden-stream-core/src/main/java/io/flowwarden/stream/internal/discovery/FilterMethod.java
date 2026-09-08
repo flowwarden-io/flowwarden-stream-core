@@ -50,10 +50,23 @@ public final class FilterMethod {
 
     private final Method method;
     private final ReturnStyle returnStyle;
+    private final Predicate<ChangeStreamContext<?>> filterPredicate;
 
     public FilterMethod(Method method, ReturnStyle returnStyle) {
         this.method = Objects.requireNonNull(method, "method must not be null");
         this.returnStyle = Objects.requireNonNull(returnStyle, "returnStyle must not be null");
+        this.filterPredicate = null;
+    }
+
+    private FilterMethod(Predicate<ChangeStreamContext<?>> filterPredicate) {
+        this.method = null;
+        this.returnStyle = null;
+        this.filterPredicate = Objects.requireNonNull(filterPredicate, "filterPredicate must not be null");
+    }
+
+    /** Creates a {@link FilterMethod} backed by a functional predicate (no reflection). */
+    public static FilterMethod fromPredicate(Predicate<ChangeStreamContext<?>> filterPredicate) {
+        return new FilterMethod(filterPredicate);
     }
 
     public Method method() {
@@ -65,9 +78,9 @@ public final class FilterMethod {
     }
 
     /**
-     * Evaluates the filter for the given event context.
+     * Evaluates the filter (or functional predicate) for the given event context.
      *
-     * @param bean the target bean instance
+     * @param bean the target bean instance (ignored for a functional predicate)
      * @param ctx  the change stream context for the current event
      * @return {@code true} if the event passes the filter and should be processed,
      *         {@code false} if it should be skipped
@@ -75,6 +88,9 @@ public final class FilterMethod {
      */
     @SuppressWarnings("unchecked")
     public boolean evaluate(Object bean, ChangeStreamContext<?> ctx) {
+        if (filterPredicate != null) {
+            return filterPredicate.test(ctx);
+        }
         try {
             return switch (returnStyle) {
                 case PREDICATE -> {
@@ -103,6 +119,9 @@ public final class FilterMethod {
 
     @Override
     public String toString() {
+        if (filterPredicate != null) {
+            return "functional(filter)";
+        }
         return method.getDeclaringClass().getSimpleName() + "#" + method.getName()
                 + "(" + returnStyle + ")";
     }

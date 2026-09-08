@@ -25,6 +25,7 @@ import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -272,6 +273,36 @@ final class StreamDefinitionValidator {
                     subject + " must specify a collection or a documentType with @Document");
         }
         return inferred;
+    }
+
+    /**
+     * Validates a batch of {@code @OnError}-style declarations: at most one catch-all
+     * (empty exception-type set), and no exception type declared by more than one handler.
+     * Order-independent — pass every declaration for the stream in one call.
+     */
+    static void validateErrorHandlerRegistrations(String beanName, String subject,
+                                                   List<Set<Class<? extends Throwable>>> declaredExceptionTypeSets) {
+        Set<Class<? extends Throwable>> seenExactTypes = new java.util.HashSet<>();
+        boolean hasCatchAll = false;
+        for (Set<Class<? extends Throwable>> exceptionTypes : declaredExceptionTypeSets) {
+            if (exceptionTypes.isEmpty()) {
+                if (hasCatchAll) {
+                    throw new BeanCreationException(beanName,
+                            "Change Stream " + subject
+                                    + " has multiple catch-all @OnError handlers. At most one is allowed.");
+                }
+                hasCatchAll = true;
+            } else {
+                for (Class<? extends Throwable> exceptionType : exceptionTypes) {
+                    if (!seenExactTypes.add(exceptionType)) {
+                        throw new BeanCreationException(beanName,
+                                "Change Stream " + subject
+                                        + " has duplicate @OnError handlers for exception type: "
+                                        + exceptionType.getName());
+                    }
+                }
+            }
+        }
     }
 
     static String capitalize(String name) {

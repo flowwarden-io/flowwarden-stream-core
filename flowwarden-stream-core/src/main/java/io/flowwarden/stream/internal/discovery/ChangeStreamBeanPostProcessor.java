@@ -495,8 +495,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
 
     private ErrorHandlerResolver findErrorHandlers(Class<?> targetClass, String beanName) {
         List<ErrorHandlerMethod> handlers = new ArrayList<>();
-        Set<Class<? extends Throwable>> seenExactTypes = new HashSet<>();
-        boolean hasCatchAll = false;
+        List<Set<Class<? extends Throwable>>> declaredExceptionTypeSets = new ArrayList<>();
 
         for (Method method : targetClass.getDeclaredMethods()) {
             OnError onError = AnnotationUtils.findAnnotation(method, OnError.class);
@@ -508,28 +507,14 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
             validateOnErrorSignature(method, targetClass, beanName);
 
             Set<Class<? extends Throwable>> exTypes = new LinkedHashSet<>(List.of(onError.value()));
-            boolean isCatchAll = exTypes.isEmpty();
-
-            if (isCatchAll) {
-                if (hasCatchAll) {
-                    throw new BeanCreationException(beanName,
-                            "@ChangeStream class " + targetClass.getName()
-                                    + " has multiple catch-all @OnError methods. At most one is allowed.");
-                }
-                hasCatchAll = true;
-            } else {
-                for (Class<? extends Throwable> exType : exTypes) {
-                    if (!seenExactTypes.add(exType)) {
-                        throw new BeanCreationException(beanName,
-                                "@ChangeStream class " + targetClass.getName()
-                                        + " has duplicate @OnError for exception type: " + exType.getName());
-                    }
-                }
-            }
+            declaredExceptionTypeSets.add(exTypes);
 
             method.setAccessible(true);
             handlers.add(new ErrorHandlerMethod(method, exTypes));
         }
+
+        StreamDefinitionValidator.validateErrorHandlerRegistrations(beanName, targetClass.getName(),
+                declaredExceptionTypeSets);
 
         return new ErrorHandlerResolver(handlers);
     }
