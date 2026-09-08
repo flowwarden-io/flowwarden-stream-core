@@ -17,6 +17,8 @@ package io.flowwarden.stream.autoconfigure;
 
 import io.flowwarden.stream.config.FlowWardenProperties;
 import io.flowwarden.stream.internal.discovery.ChangeStreamBeanPostProcessor;
+import io.flowwarden.stream.internal.discovery.StreamContributorProcessor;
+import io.flowwarden.stream.internal.discovery.StreamRegistry;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.ApplicationContext;
@@ -43,5 +45,12 @@ public class FlowWardenAutoConfiguration {
             FlowWardenProperties properties,
             ApplicationContext applicationContext) {
         return new FlowWardenConfigurationValidator(properties, applicationContext);
+    }
+
+    @Bean
+    public StreamContributorProcessor streamContributorProcessor(
+            ApplicationContext applicationContext,
+            StreamRegistry registry) {
+        return new StreamContributorProcessor(applicationContext, registry);
     }
 }
