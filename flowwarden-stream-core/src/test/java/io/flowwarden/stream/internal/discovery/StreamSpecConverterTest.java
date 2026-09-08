@@ -16,6 +16,7 @@
 package io.flowwarden.stream.internal.discovery;
 
 import io.flowwarden.stream.ChangeStreamContext;
+import io.flowwarden.stream.ErrorAction;
 import io.flowwarden.stream.OnHistoryLost;
 import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.StartPosition;
@@ -30,12 +31,16 @@ import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.mongodb.core.convert.MongoConverter;
 
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -161,6 +166,72 @@ class StreamSpecConverterTest {
                 () -> StreamSpecConverter.convert(spec, new Object(), "testBean"));
         org.junit.jupiter.api.Assertions.assertTrue(
                 ex.getMessage().contains("must specify a collection or a documentType with @Document"));
+    }
+
+    @Test
+    void convertsPipelineAndResolvesItThroughPipelineMethod() {
+        StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
+                .collection("orders")
+                .pipeline(() -> List.of(new Document("$match", new Document("operationType", "insert"))))
+                .onChange(ctx -> { })
+                .build();
+
+        ChangeStreamDefinition definition = StreamSpecConverter.convert(spec, new Object(), "testBean");
+
+        assertNotNull(definition.pipelineMethod());
+        List<Document> resolved = definition.pipelineMethod().resolve(definition.bean());
+        assertEquals(1, resolved.size());
+    }
+
+    @Test
+    void convertsFilterAndEvaluatesItThroughFilterMethod() {
+        StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
+                .collection("orders")
+                .filter(ctx -> ctx.getFullDocument(Order.class).isPresent())
+                .onChange(ctx -> { })
+                .build();
+
+        ChangeStreamDefinition definition = StreamSpecConverter.convert(spec, new Object(), "testBean");
+
+        assertNotNull(definition.filterMethod());
+
+        ChangeStreamContext<Order> ctxWithDoc = mock(ChangeStreamContext.class);
+        when(ctxWithDoc.getFullDocument(Order.class)).thenReturn(Optional.of(new Order()));
+        assertTrue(definition.filterMethod().evaluate(definition.bean(), ctxWithDoc));
+
+        ChangeStreamContext<Order> ctxWithoutDoc = mock(ChangeStreamContext.class);
+        when(ctxWithoutDoc.getFullDocument(Order.class)).thenReturn(Optional.empty());
+        assertFalse(definition.filterMethod().evaluate(definition.bean(), ctxWithoutDoc));
+    }
+
+    @Test
+    void convertsOnErrorAndResolvesCorrectHandlerByExceptionType() {
+        AtomicReference<Throwable> caught = new AtomicReference<>();
+        StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
+                .collection("orders")
+                .onChange(ctx -> { })
+                .onError((ex, ctx) -> {
+                    caught.set(ex);
+                    return ErrorAction.SKIP;
+                }, IllegalStateException.class)
+                .onError((ex, ctx) -> ErrorAction.RETRY)
+                .build();
+
+        ChangeStreamDefinition definition = StreamSpecConverter.convert(spec, new Object(), "testBean");
+
+        assertFalse(definition.errorHandlerResolver().isEmpty());
+        ChangeStreamContext<?> ctx = mock(ChangeStreamContext.class);
+
+        IllegalStateException typed = new IllegalStateException("boom");
+        ErrorAction typedAction = definition.errorHandlerResolver()
+                .resolveAndInvoke(definition.bean(), typed, ctx).orElseThrow();
+        assertEquals(ErrorAction.SKIP, typedAction);
+        assertSame(typed, caught.get());
+
+        // Untyped exception falls through to the catch-all.
+        ErrorAction catchAllAction = definition.errorHandlerResolver()
+                .resolveAndInvoke(definition.bean(), new RuntimeException("other"), ctx).orElseThrow();
+        assertEquals(ErrorAction.RETRY, catchAllAction);
     }
 
     @Test

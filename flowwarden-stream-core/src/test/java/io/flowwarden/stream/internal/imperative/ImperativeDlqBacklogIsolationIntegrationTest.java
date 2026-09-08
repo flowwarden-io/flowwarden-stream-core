@@ -138,9 +138,13 @@ class ImperativeDlqBacklogIsolationIntegrationTest {
                         .isNotNull()
                         .isNotEqualTo(initialProcessed));
 
-        // No gauge was emitted while blocked; once unblocked, the LAST state
-        // (all 5 entries) is published.
-        assertThat(metrics.backlogs).isEmpty();
+        // No gauge was emitted for THIS stream while blocked; once unblocked, the
+        // LAST state (all 5 entries) is published. Scoped to STREAM: the metrics
+        // provider is a JVM-wide static, and Spring's test context cache keeps
+        // earlier test apps alive — their reactive manager's periodic
+        // collectDlqBacklogs() pushes standing gauges for *their* DLQ-enabled
+        // streams through the same provider, at a timing we do not control.
+        assertThat(metrics.backlogs).noneMatch(b -> b.streamName().equals(STREAM));
         blockingStore.gate.countDown();
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
                 assertThat(metrics.backlogs)

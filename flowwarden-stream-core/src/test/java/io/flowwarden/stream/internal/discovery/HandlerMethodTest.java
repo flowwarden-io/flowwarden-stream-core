@@ -25,6 +25,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.data.mongodb.core.convert.MongoConverter;
 import reactor.core.publisher.Mono;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -328,6 +329,63 @@ class HandlerMethodTest {
         assertSame(ctx, receivedCtx.get());
         assertTrue(hm.isReactiveReturn());
         assertEquals(HandlerMethod.SignatureStyle.CONTEXT_ONLY, hm.signatureStyle());
+    }
+
+    @Test
+    void invokeFromDocumentHandlerWrapsThrownExceptionLikeReflectiveDispatch() {
+        // Regression: HandlerMethod#invoke's callers (ImperativeStreamManager's @OnError
+        // resolution in particular) key their catch on InvocationTargetException — the
+        // shape Method.invoke() auto-wraps a thrown RuntimeException into. A functional
+        // handler that throws directly must be wrapped the same way, or @OnError silently
+        // never runs for it.
+        DocumentHandler<String> handler = (doc, ctx) -> {
+            throw new IllegalStateException("boom");
+        };
+        HandlerMethod hm = HandlerMethod.fromDocumentHandler(handler);
+
+        MongoConverter converter = mock(MongoConverter.class);
+        when(converter.read(eq(String.class), any(Document.class))).thenReturn("converted");
+        ChangeStreamContext<?> ctx = mock(ChangeStreamContext.class);
+
+        InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
+                () -> hm.invoke(null, ctx, new Document("k", "v"), converter, String.class));
+        assertInstanceOf(IllegalStateException.class, thrown.getCause());
+        assertEquals("boom", thrown.getCause().getMessage());
+    }
+
+    @Test
+    void invokeFromDocumentHandlerWrapsAssertionErrorTooNotJustRuntimeException() {
+        // Method.invoke() wraps ANY Throwable thrown by the invoked method into
+        // InvocationTargetException, not just RuntimeException — an AssertionError from a
+        // functional handler must reach @OnError/retry/DLQ resolution the same way a
+        // reflective handler's AssertionError always did.
+        DocumentHandler<String> handler = (doc, ctx) -> {
+            throw new AssertionError("assertion failed");
+        };
+        HandlerMethod hm = HandlerMethod.fromDocumentHandler(handler);
+
+        MongoConverter converter = mock(MongoConverter.class);
+        when(converter.read(eq(String.class), any(Document.class))).thenReturn("converted");
+        ChangeStreamContext<?> ctx = mock(ChangeStreamContext.class);
+
+        InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
+                () -> hm.invoke(null, ctx, new Document("k", "v"), converter, String.class));
+        assertInstanceOf(AssertionError.class, thrown.getCause());
+    }
+
+    @Test
+    void invokeFromContextHandlerWrapsThrownExceptionLikeReflectiveDispatch() {
+        ContextHandler<String> handler = ctx -> {
+            throw new IllegalStateException("boom");
+        };
+        HandlerMethod hm = HandlerMethod.fromContextHandler(handler);
+
+        ChangeStreamContext<?> ctx = mock(ChangeStreamContext.class);
+        MongoConverter converter = mock(MongoConverter.class);
+
+        InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
+                () -> hm.invoke(null, ctx, new Document("k", "v"), converter, Document.class));
+        assertInstanceOf(IllegalStateException.class, thrown.getCause());
     }
 
     @Test

@@ -27,6 +27,7 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Supplier;
 
 /**
  * Encapsulates a {@code @Pipeline}-annotated method and its invocation strategy.
@@ -52,10 +53,23 @@ public final class PipelineMethod {
 
     private final Method method;
     private final ReturnStyle returnStyle;
+    private final Supplier<List<Bson>> pipelineSupplier;
 
     public PipelineMethod(Method method, ReturnStyle returnStyle) {
         this.method = Objects.requireNonNull(method, "method must not be null");
         this.returnStyle = Objects.requireNonNull(returnStyle, "returnStyle must not be null");
+        this.pipelineSupplier = null;
+    }
+
+    private PipelineMethod(Supplier<List<Bson>> pipelineSupplier) {
+        this.method = null;
+        this.returnStyle = null;
+        this.pipelineSupplier = Objects.requireNonNull(pipelineSupplier, "pipelineSupplier must not be null");
+    }
+
+    /** Creates a {@link PipelineMethod} backed by a functional supplier (no reflection). */
+    public static PipelineMethod fromSupplier(Supplier<List<Bson>> pipelineSupplier) {
+        return new PipelineMethod(pipelineSupplier);
     }
 
     public Method method() {
@@ -67,16 +81,28 @@ public final class PipelineMethod {
     }
 
     /**
-     * Invokes the pipeline method on the given bean and returns the pipeline
+     * Invokes the pipeline method (or functional supplier) and returns the pipeline
      * as a {@code List<Document>} suitable for Spring Data MongoDB's
      * {@code ChangeStreamRequest.filter()} and {@code ChangeStreamOptions.filter()}.
      *
-     * @param bean the target bean instance
+     * @param bean the target bean instance (ignored for a functional supplier)
      * @return the aggregation pipeline as a list of BSON documents, never null
-     * @throws IllegalStateException if the pipeline method fails or returns null
+     * @throws IllegalStateException if the pipeline method/supplier fails or returns null
      */
     @SuppressWarnings("unchecked")
     public List<Document> resolve(Object bean) {
+        if (pipelineSupplier != null) {
+            List<Bson> result;
+            try {
+                result = pipelineSupplier.get();
+            } catch (RuntimeException e) {
+                throw new IllegalStateException("Pipeline supplier threw an exception", e);
+            }
+            if (result == null) {
+                throw new IllegalStateException("Pipeline supplier returned null");
+            }
+            return toBsonDocumentList(result);
+        }
         try {
             Object result = method.invoke(bean);
             if (result == null) {
@@ -126,6 +152,9 @@ public final class PipelineMethod {
 
     @Override
     public String toString() {
+        if (pipelineSupplier != null) {
+            return "functional(pipeline)";
+        }
         return method.getDeclaringClass().getSimpleName() + "#" + method.getName()
                 + "(" + returnStyle + ")";
     }

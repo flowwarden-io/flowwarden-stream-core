@@ -120,4 +120,17 @@ class ErrorHandlerMethodTest {
         ErrorAction action = handler.invoke(new Handlers(), new RuntimeException(), null);
         assertEquals(ErrorAction.RETHROW, action);
     }
+
+    @Test
+    void functionalHandlerReturnsRethrowWhenItThrowsAssertionError() {
+        // Parity with the reflective path: method.invoke() wraps ANY Throwable a handler
+        // throws (AssertionError included) into a RETHROW fallback, not just RuntimeException.
+        ErrorHandlerMethod handler = ErrorHandlerMethod.fromFunction(Set.of(), (ex, ctx) -> {
+            throw new AssertionError("boom");
+        });
+
+        ErrorAction action = handler.invoke(new Object(), new RuntimeException(), null);
+
+        assertEquals(ErrorAction.RETHROW, action);
+    }
 }

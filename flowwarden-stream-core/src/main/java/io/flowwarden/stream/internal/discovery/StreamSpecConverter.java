@@ -22,12 +22,14 @@ import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.annotation.RetryPolicy;
 import io.flowwarden.stream.registration.CheckpointSpec;
 import io.flowwarden.stream.registration.DeadLetterQueueSpec;
+import io.flowwarden.stream.registration.ErrorHandlerBinding;
 import io.flowwarden.stream.registration.MongoDlqOptionsSpec;
 import io.flowwarden.stream.registration.RetryPolicySpec;
 import io.flowwarden.stream.registration.StreamSpec;
 import io.flowwarden.stream.registration.TypedHandler;
 import org.springframework.core.annotation.AnnotationUtils;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.List;
@@ -70,6 +72,14 @@ final class StreamSpecConverter {
         MongoDlqOptions mongoDlqOptions = spec.mongoDlqOptions()
                 .map(StreamSpecConverter::synthesizeMongoDlqOptions).orElse(null);
 
+        PipelineMethod pipelineMethod = spec.pipeline().map(PipelineMethod::fromSupplier).orElse(null);
+        FilterMethod filterMethod = toFilterMethod(spec);
+
+        List<ErrorHandlerMethod> errorHandlerMethods = new ArrayList<>();
+        for (ErrorHandlerBinding binding : spec.errorHandlers()) {
+            errorHandlerMethods.add(ErrorHandlerMethod.fromFunction(binding.exceptionTypes(), binding.handler()));
+        }
+
         return new ChangeStreamDefinition(
                 spec.name(),
                 collection,
@@ -79,14 +89,22 @@ final class StreamSpecConverter {
                 onChangeHandler,
                 Collections.unmodifiableMap(typedHandlers),
                 config,
-                null,
-                null,
+                pipelineMethod,
+                filterMethod,
                 checkpoint,
                 retryPolicy,
                 deadLetterQueue,
                 mongoDlqOptions,
-                new ErrorHandlerResolver(List.of()),
+                new ErrorHandlerResolver(errorHandlerMethods),
                 Collections.emptyMap());
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static FilterMethod toFilterMethod(StreamSpec<?> spec) {
+        return spec.filter()
+                .<FilterMethod>map(predicate -> FilterMethod.fromPredicate(
+                        (java.util.function.Predicate) predicate))
+                .orElse(null);
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
