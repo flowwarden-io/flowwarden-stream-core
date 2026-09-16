@@ -16,11 +16,15 @@
 package io.flowwarden.stream.registration;
 
 import io.flowwarden.stream.DeploymentMode;
+import io.flowwarden.stream.ErrorAction;
 import io.flowwarden.stream.FullDocumentMode;
 import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.core.DocumentHandler;
 import io.flowwarden.stream.core.ReactiveContextHandler;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -160,6 +164,75 @@ class StreamSpecTest {
         // as the equivalent annotation misconfiguration.
         StreamSpec<Order> spec = StreamSpec.builder("orders-stream", Order.class).build();
         assertFalse(spec.onChangeHandler().isPresent());
+    }
+
+    @Test
+    void pipelineIsStoredAndResolvable() {
+        StreamSpec<Order> spec = StreamSpec.builder("orders-stream", Order.class)
+                .pipeline(() -> List.of(new Document("$match", new Document("operationType", "insert"))))
+                .onChange(ctx -> { })
+                .build();
+
+        assertTrue(spec.pipeline().isPresent());
+        assertEquals(1, spec.pipeline().get().get().size());
+    }
+
+    @Test
+    void throwsWhenPipelineRegisteredTwice() {
+        StreamSpec.Builder<Order> builder = StreamSpec.builder("orders-stream", Order.class)
+                .pipeline(() -> List.of());
+        assertThrows(IllegalStateException.class, () -> builder.pipeline(() -> List.of()));
+    }
+
+    @Test
+    void filterIsStoredAndEvaluable() {
+        StreamSpec<Order> spec = StreamSpec.builder("orders-stream", Order.class)
+                .filter(ctx -> true)
+                .onChange(ctx -> { })
+                .build();
+
+        assertTrue(spec.filter().isPresent());
+    }
+
+    @Test
+    void throwsWhenFilterRegisteredTwice() {
+        StreamSpec.Builder<Order> builder = StreamSpec.builder("orders-stream", Order.class)
+                .filter(ctx -> true);
+        assertThrows(IllegalStateException.class, () -> builder.filter(ctx -> false));
+    }
+
+    @Test
+    void onErrorWithNoExceptionTypesIsCatchAll() {
+        StreamSpec<Order> spec = StreamSpec.builder("orders-stream", Order.class)
+                .onChange(ctx -> { })
+                .onError((ex, ctx) -> ErrorAction.SKIP)
+                .build();
+
+        assertEquals(1, spec.errorHandlers().size());
+        assertTrue(spec.errorHandlers().get(0).isCatchAll());
+    }
+
+    @Test
+    void onErrorWithExceptionTypesIsScoped() {
+        StreamSpec<Order> spec = StreamSpec.builder("orders-stream", Order.class)
+                .onChange(ctx -> { })
+                .onError((ex, ctx) -> ErrorAction.RETRY, IllegalStateException.class, IllegalArgumentException.class)
+                .build();
+
+        assertEquals(1, spec.errorHandlers().size());
+        assertFalse(spec.errorHandlers().get(0).isCatchAll());
+        assertEquals(2, spec.errorHandlers().get(0).exceptionTypes().size());
+    }
+
+    @Test
+    void onErrorIsRepeatable() {
+        StreamSpec<Order> spec = StreamSpec.builder("orders-stream", Order.class)
+                .onChange(ctx -> { })
+                .onError((ex, ctx) -> ErrorAction.SKIP, IllegalStateException.class)
+                .onError((ex, ctx) -> ErrorAction.RETRY)
+                .build();
+
+        assertEquals(2, spec.errorHandlers().size());
     }
 
     private static class Order {

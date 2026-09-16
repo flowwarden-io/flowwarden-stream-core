@@ -18,6 +18,7 @@ package io.flowwarden.stream.internal.discovery;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.FullDocumentMode;
 import io.flowwarden.stream.OperationType;
+import io.flowwarden.stream.registration.ErrorHandlerBinding;
 import io.flowwarden.stream.registration.StreamDefinitionContributor;
 import io.flowwarden.stream.registration.StreamRegistration;
 import io.flowwarden.stream.registration.StreamSpec;
@@ -124,6 +125,13 @@ public class StreamContributorProcessor implements SmartInitializingSingleton {
 
         StreamDefinitionValidator.validateMongoTemplateRef(beanName, subject, spec.mongoTemplateRef(),
                 applicationContext);
+
+        if (spec.filter().isPresent()) {
+            StreamDefinitionValidator.validateFilterCompatibility(beanName, subject, spec.typedHandlers().keySet());
+        }
+
+        StreamDefinitionValidator.validateErrorHandlerRegistrations(beanName, subject,
+                spec.errorHandlers().stream().map(ErrorHandlerBinding::exceptionTypes).toList());
 
         spec.typedHandlers().forEach((opType, handler) -> StreamDefinitionValidator.validateHandlerReturnMode(
                 beanName, subject, "on" + StreamDefinitionValidator.capitalize(opType.name()), mode,

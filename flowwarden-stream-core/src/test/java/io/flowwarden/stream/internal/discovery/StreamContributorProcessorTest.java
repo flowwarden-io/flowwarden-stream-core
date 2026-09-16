@@ -125,6 +125,52 @@ class StreamContributorProcessorTest {
     }
 
     @Test
+    void failsWhenFilterCombinedWithOnDeleteSameAsAnnotationPath() {
+        contextRunner
+                .withUserConfiguration(FilterWithOnDeleteContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("filter")
+                            .hasMessageContaining("DELETE");
+                });
+    }
+
+    @Test
+    void failsOnDuplicateCatchAllOnError() {
+        contextRunner
+                .withUserConfiguration(DuplicateCatchAllOnErrorContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("multiple catch-all @OnError");
+                });
+    }
+
+    @Test
+    void failsOnDuplicateExceptionTypeOnError() {
+        contextRunner
+                .withUserConfiguration(DuplicateExceptionTypeOnErrorContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("duplicate @OnError")
+                            .hasMessageContaining("IllegalStateException");
+                });
+    }
+
+    @Test
+    void registersPipelineFilterAndOnErrorSuccessfully() {
+        contextRunner
+                .withUserConfiguration(FullFeaturedContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    StreamRegistry registry = context.getBean(StreamRegistry.class);
+                    assertThat(registry.findByName("full-featured-stream")).isPresent();
+                });
+    }
+
+    @Test
     void failsOnHandlerModeMismatch() {
         contextRunner
                 .withUserConfiguration(ReactiveHandlerInImperativeModeContributorConfig.class)
@@ -248,6 +294,55 @@ class StreamContributorProcessorTest {
             return registration -> registration.stream("reactive-in-imperative-stream", Order.class)
                     .collection("orders")
                     .onChangeReactive(ctx -> reactor.core.publisher.Mono.empty());
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class FilterWithOnDeleteContributorConfig {
+        @Bean
+        StreamDefinitionContributor filterWithOnDeleteContributor() {
+            return registration -> registration.stream("filter-with-delete-stream", Order.class)
+                    .collection("orders")
+                    .filter(ctx -> true)
+                    .onDelete(ctx -> { });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class DuplicateCatchAllOnErrorContributorConfig {
+        @Bean
+        StreamDefinitionContributor duplicateCatchAllOnErrorContributor() {
+            return registration -> registration.stream("duplicate-catch-all-stream", Order.class)
+                    .collection("orders")
+                    .onChange(ctx -> { })
+                    .onError((ex, ctx) -> io.flowwarden.stream.ErrorAction.SKIP)
+                    .onError((ex, ctx) -> io.flowwarden.stream.ErrorAction.RETRY);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class DuplicateExceptionTypeOnErrorContributorConfig {
+        @Bean
+        StreamDefinitionContributor duplicateExceptionTypeOnErrorContributor() {
+            return registration -> registration.stream("duplicate-exception-type-stream", Order.class)
+                    .collection("orders")
+                    .onChange(ctx -> { })
+                    .onError((ex, ctx) -> io.flowwarden.stream.ErrorAction.SKIP, IllegalStateException.class)
+                    .onError((ex, ctx) -> io.flowwarden.stream.ErrorAction.RETRY, IllegalStateException.class);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class FullFeaturedContributorConfig {
+        @Bean
+        StreamDefinitionContributor fullFeaturedContributor() {
+            return registration -> registration.stream("full-featured-stream", Order.class)
+                    .collection("orders")
+                    .pipeline(() -> java.util.List.of(new org.bson.Document("$match",
+                            new org.bson.Document("operationType", "insert"))))
+                    .filter(ctx -> true)
+                    .onInsert((order, ctx) -> { })
+                    .onError((ex, ctx) -> io.flowwarden.stream.ErrorAction.RETRY);
         }
     }
 

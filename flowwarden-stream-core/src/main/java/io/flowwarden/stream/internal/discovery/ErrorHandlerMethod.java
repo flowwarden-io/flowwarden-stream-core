@@ -17,6 +17,7 @@ package io.flowwarden.stream.internal.discovery;
 
 import io.flowwarden.stream.ChangeStreamContext;
 import io.flowwarden.stream.ErrorAction;
+import io.flowwarden.stream.core.ErrorHandler;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -40,10 +41,24 @@ public final class ErrorHandlerMethod {
 
     private final Method method;
     private final Set<Class<? extends Throwable>> exceptionTypes;
+    private final ErrorHandler handlerFunction;
 
     public ErrorHandlerMethod(Method method, Set<Class<? extends Throwable>> exceptionTypes) {
         this.method = Objects.requireNonNull(method, "method must not be null");
         this.exceptionTypes = Objects.requireNonNull(exceptionTypes, "exceptionTypes must not be null");
+        this.handlerFunction = null;
+    }
+
+    private ErrorHandlerMethod(Set<Class<? extends Throwable>> exceptionTypes, ErrorHandler handlerFunction) {
+        this.method = null;
+        this.exceptionTypes = Objects.requireNonNull(exceptionTypes, "exceptionTypes must not be null");
+        this.handlerFunction = Objects.requireNonNull(handlerFunction, "handlerFunction must not be null");
+    }
+
+    /** Creates an {@link ErrorHandlerMethod} backed by a functional {@link ErrorHandler} (no reflection). */
+    public static ErrorHandlerMethod fromFunction(Set<Class<? extends Throwable>> exceptionTypes,
+                                                   ErrorHandler handlerFunction) {
+        return new ErrorHandlerMethod(exceptionTypes, handlerFunction);
     }
 
     public Method method() {
@@ -99,6 +114,14 @@ public final class ErrorHandlerMethod {
      * If the handler itself throws, logs the error and returns {@link ErrorAction#RETHROW} as safe fallback.
      */
     public ErrorAction invoke(Object bean, Throwable ex, ChangeStreamContext<?> ctx) {
+        if (handlerFunction != null) {
+            try {
+                return handlerFunction.handle(ex, ctx);
+            } catch (Throwable e) {
+                log.error("Functional @OnError handler threw an exception — falling back to RETHROW", e);
+                return ErrorAction.RETHROW;
+            }
+        }
         try {
             return (ErrorAction) method.invoke(bean, ex, ctx);
         } catch (InvocationTargetException e) {
@@ -129,7 +152,11 @@ public final class ErrorHandlerMethod {
 
     @Override
     public String toString() {
+        String exceptions = exceptionTypes.isEmpty() ? "catch-all" : exceptionTypes.toString();
+        if (handlerFunction != null) {
+            return "functional(exceptions=" + exceptions + ")";
+        }
         return method.getDeclaringClass().getSimpleName() + "#" + method.getName()
-                + "(exceptions=" + (exceptionTypes.isEmpty() ? "catch-all" : exceptionTypes) + ")";
+                + "(exceptions=" + exceptions + ")";
     }
 }

@@ -16,6 +16,7 @@
 package io.flowwarden.stream.internal.imperative;
 
 import io.flowwarden.stream.ChangeStreamContext;
+import io.flowwarden.stream.ErrorAction;
 import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.EnableFlowWarden;
 import io.flowwarden.stream.registration.StreamDefinitionContributor;
@@ -110,6 +111,65 @@ class ImperativeContributedStreamIntegrationTest {
         assertThat(ctx.getOperationType()).isEqualTo(OperationType.UPDATE);
     }
 
+    @Test
+    void contributedPipelineRestrictsToInsertsAndFilterRestrictsToHighAmounts() {
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning("contributed-pipeline-filter-watcher"));
+
+        mongoTemplate.insert(new Document("amount", 50), "contributed_pf_orders");
+
+        int beforeHighAmount = testHandler.pipelineFilteredEvents.size();
+        Document highAmountDoc = new Document("amount", 200);
+        mongoTemplate.insert(highAmountDoc, "contributed_pf_orders");
+
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(testHandler.pipelineFilteredEvents).hasSizeGreaterThan(beforeHighAmount));
+
+        // The low-amount insert never reached the handler (client-side @Filter equivalent).
+        assertThat(testHandler.pipelineFilteredEvents).allSatisfy(ctx ->
+                assertThat(fullDocumentAmount(ctx)).hasValue(200));
+
+        // An update on the high-amount doc never reaches the handler either — the
+        // server-side pipeline equivalent restricts this stream to insert events only.
+        mongoTemplate.updateFirst(
+                Query.query(Criteria.where("_id").is(highAmountDoc.get("_id"))),
+                Update.update("amount", 300),
+                "contributed_pf_orders");
+
+        // Insert a second high-amount doc to get a synchronization point after the update.
+        mongoTemplate.insert(new Document("amount", 250), "contributed_pf_orders");
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(testHandler.pipelineFilteredEvents).hasSizeGreaterThan(beforeHighAmount + 1));
+
+        assertThat(testHandler.pipelineFilteredEvents)
+                .allSatisfy(ctx -> assertThat(ctx.getOperationType()).isEqualTo(OperationType.INSERT));
+    }
+
+    @Test
+    void contributedOnErrorHandlerCatchesHandlerExceptionAndStreamSurvives() {
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning("contributed-onerror-watcher"));
+
+        int beforeErrors = testHandler.caughtErrors.size();
+        mongoTemplate.insert(new Document("amount", 999), "contributed_error_orders");
+
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(testHandler.caughtErrors).hasSizeGreaterThan(beforeErrors));
+
+        // The stream survived the handler exception: a subsequent normal event still processes.
+        int beforeProcessed = testHandler.processedEvents.size();
+        mongoTemplate.insert(new Document("amount", 10), "contributed_error_orders");
+
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(testHandler.processedEvents).hasSizeGreaterThan(beforeProcessed));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.Optional<Integer> fullDocumentAmount(ChangeStreamContext<?> ctx) {
+        return ((ChangeStreamContext<Document>) ctx).getFullDocument(Document.class)
+                .map(d -> d.getInteger("amount"));
+    }
+
     @SpringBootApplication
     @EnableFlowWarden
     @Import(ImperativeContributedStreamIntegrationTest.ContributedOrderHandler.class)
@@ -122,10 +182,41 @@ class ImperativeContributedStreamIntegrationTest {
                     .onInsert((order, ctx) -> handler.insertEvents.add(ctx))
                     .onUpdate((order, ctx) -> handler.updateEvents.add(ctx));
         }
+
+        @Bean
+        StreamDefinitionContributor pipelineFilterContributor(ContributedOrderHandler handler) {
+            return registration -> registration.stream("contributed-pipeline-filter-watcher", Document.class)
+                    .collection("contributed_pf_orders")
+                    .pipeline(() -> List.of(new Document("$match",
+                            new Document("operationType", "insert"))))
+                    .filter(ctx -> ctx.getFullDocument(Document.class)
+                            .map(d -> d.getInteger("amount", 0) > 100)
+                            .orElse(false))
+                    .onInsert((order, ctx) -> handler.pipelineFilteredEvents.add(ctx));
+        }
+
+        @Bean
+        StreamDefinitionContributor onErrorContributor(ContributedOrderHandler handler) {
+            return registration -> registration.stream("contributed-onerror-watcher", Document.class)
+                    .collection("contributed_error_orders")
+                    .onInsert((order, ctx) -> {
+                        if (order.getInteger("amount", 0) == 999) {
+                            throw new IllegalStateException("poison amount");
+                        }
+                        handler.processedEvents.add(ctx);
+                    })
+                    .onError((ex, ctx) -> {
+                        handler.caughtErrors.add(ex);
+                        return ErrorAction.SKIP;
+                    }, IllegalStateException.class);
+        }
     }
 
     static class ContributedOrderHandler {
         final List<ChangeStreamContext<?>> insertEvents = new CopyOnWriteArrayList<>();
         final List<ChangeStreamContext<?>> updateEvents = new CopyOnWriteArrayList<>();
+        final List<ChangeStreamContext<?>> pipelineFilteredEvents = new CopyOnWriteArrayList<>();
+        final List<ChangeStreamContext<?>> processedEvents = new CopyOnWriteArrayList<>();
+        final List<Throwable> caughtErrors = new CopyOnWriteArrayList<>();
     }
 }

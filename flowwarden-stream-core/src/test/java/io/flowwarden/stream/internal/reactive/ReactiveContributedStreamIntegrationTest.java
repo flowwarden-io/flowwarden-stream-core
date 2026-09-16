@@ -16,6 +16,7 @@
 package io.flowwarden.stream.internal.reactive;
 
 import io.flowwarden.stream.ChangeStreamContext;
+import io.flowwarden.stream.ErrorAction;
 import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.EnableFlowWarden;
 import io.flowwarden.stream.registration.StreamDefinitionContributor;
@@ -80,6 +81,49 @@ class ReactiveContributedStreamIntegrationTest {
         assertThat(ctx.getOperationType()).isEqualTo(OperationType.INSERT);
     }
 
+    @Test
+    void contributedPipelineRestrictsToInsertsAndFilterRestrictsToHighAmounts() {
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning("reactive-contributed-pipeline-filter-watcher"));
+
+        reactiveMongoTemplate.insert(new Document("amount", 50), "reactive_contributed_pf_orders").block();
+
+        int beforeHighAmount = testHandler.pipelineFilteredEvents.size();
+        reactiveMongoTemplate.insert(new Document("amount", 200), "reactive_contributed_pf_orders").block();
+
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(testHandler.pipelineFilteredEvents).hasSizeGreaterThan(beforeHighAmount));
+
+        assertThat(testHandler.pipelineFilteredEvents).allSatisfy(ctx ->
+                assertThat(fullDocumentAmount(ctx)).hasValue(200));
+        assertThat(testHandler.pipelineFilteredEvents)
+                .allSatisfy(ctx -> assertThat(ctx.getOperationType()).isEqualTo(OperationType.INSERT));
+    }
+
+    @Test
+    void contributedOnErrorHandlerCatchesHandlerExceptionAndStreamSurvives() {
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> streamManager.isRunning("reactive-contributed-onerror-watcher"));
+
+        int beforeErrors = testHandler.caughtErrors.size();
+        reactiveMongoTemplate.insert(new Document("amount", 999), "reactive_contributed_error_orders").block();
+
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(testHandler.caughtErrors).hasSizeGreaterThan(beforeErrors));
+
+        int beforeProcessed = testHandler.processedEvents.size();
+        reactiveMongoTemplate.insert(new Document("amount", 10), "reactive_contributed_error_orders").block();
+
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(testHandler.processedEvents).hasSizeGreaterThan(beforeProcessed));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.Optional<Integer> fullDocumentAmount(ChangeStreamContext<?> ctx) {
+        return ((ChangeStreamContext<Document>) ctx).getFullDocument(Document.class)
+                .map(d -> d.getInteger("amount"));
+    }
+
     @SpringBootApplication
     @EnableFlowWarden
     @Import(ReactiveContributedStreamIntegrationTest.ContributedOrderHandler.class)
@@ -94,9 +138,44 @@ class ReactiveContributedStreamIntegrationTest {
                         return Mono.empty();
                     });
         }
+
+        @Bean
+        StreamDefinitionContributor pipelineFilterContributor(ContributedOrderHandler handler) {
+            return registration -> registration.stream("reactive-contributed-pipeline-filter-watcher", Document.class)
+                    .collection("reactive_contributed_pf_orders")
+                    .pipeline(() -> List.of(new Document("$match",
+                            new Document("operationType", "insert"))))
+                    .filter(ctx -> ctx.getFullDocument(Document.class)
+                            .map(d -> d.getInteger("amount", 0) > 100)
+                            .orElse(false))
+                    .onInsertReactive((order, ctx) -> {
+                        handler.pipelineFilteredEvents.add(ctx);
+                        return Mono.empty();
+                    });
+        }
+
+        @Bean
+        StreamDefinitionContributor onErrorContributor(ContributedOrderHandler handler) {
+            return registration -> registration.stream("reactive-contributed-onerror-watcher", Document.class)
+                    .collection("reactive_contributed_error_orders")
+                    .onInsertReactive((order, ctx) -> {
+                        if (order.getInteger("amount", 0) == 999) {
+                            return Mono.error(new IllegalStateException("poison amount"));
+                        }
+                        handler.processedEvents.add(ctx);
+                        return Mono.empty();
+                    })
+                    .onError((ex, ctx) -> {
+                        handler.caughtErrors.add(ex);
+                        return ErrorAction.SKIP;
+                    }, IllegalStateException.class);
+        }
     }
 
     static class ContributedOrderHandler {
         final List<ChangeStreamContext<?>> insertEvents = new CopyOnWriteArrayList<>();
+        final List<ChangeStreamContext<?>> pipelineFilteredEvents = new CopyOnWriteArrayList<>();
+        final List<ChangeStreamContext<?>> processedEvents = new CopyOnWriteArrayList<>();
+        final List<Throwable> caughtErrors = new CopyOnWriteArrayList<>();
     }
 }
