@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.6] — 2026-09-18
+
 ### Added
 - New `io.flowwarden.stream.registration` package: a bootstrap-only, annotation-free way to declare Change Stream definitions programmatically via `StreamDefinitionContributor` beans — for streams whose configuration lives outside the JVM (YAML, a database, a feature-flag service). `StreamSpec`/`StreamSpec.Builder` cover typed functional handlers (`@OnInsert`/`@OnUpdate`/`@OnDelete`/`@OnReplace`/`@OnChange`), `CheckpointSpec`/`RetryPolicySpec`/`DeadLetterQueueSpec`/`MongoDlqOptionsSpec` (builder-based, same defaults as their annotation counterparts), a `.pipeline(Supplier<List<Bson>>)` (equivalent of `@Pipeline`), a `.filter(Predicate<ChangeStreamContext<T>>)` (equivalent of `@Filter`, same DELETE/DROP/INVALIDATE incompatibility rule), and a repeatable `.onError(ErrorHandler, Class<? extends Throwable>...)` (equivalent of `@OnError`, no-args = catch-all) — **not yet covered**: a `zone`. What is covered goes through the same fail-fast validation as `@ChangeStream` classes, and a duplicate stream name — annotated or contributed — fails startup. Contribution happens once, after all singleton beans are created and before the stream managers start reading the catalog; there is no support yet for registering a stream on an already-running instance. (#87, #89)
 - New public `io.flowwarden.stream.core.ErrorHandler` functional interface (`ErrorAction handle(Throwable ex, ChangeStreamContext<?> ctx)`), the `StreamSpec` equivalent of an `@OnError` method. (#89)
@@ -191,7 +193,8 @@ First release candidate of FlowWarden Stream Core.
 - `DeploymentMode.PARTITIONED` — defined in the enum but not yet implemented, reserved for a future release
 - Watchdog / zombie stream detection — planned for a future release
 
-[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.5...HEAD
+[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.6...HEAD
+[1.0.0-rc.6]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.6
 [1.0.0-rc.5]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.4
 [1.0.0-rc.3]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.3
