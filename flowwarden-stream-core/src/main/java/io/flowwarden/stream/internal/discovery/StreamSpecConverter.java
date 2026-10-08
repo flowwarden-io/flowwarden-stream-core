@@ -19,11 +19,13 @@ import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
 import io.flowwarden.stream.annotation.MongoDlqOptions;
+import io.flowwarden.stream.annotation.RestartPolicy;
 import io.flowwarden.stream.annotation.RetryPolicy;
 import io.flowwarden.stream.registration.CheckpointSpec;
 import io.flowwarden.stream.registration.DeadLetterQueueSpec;
 import io.flowwarden.stream.registration.ErrorHandlerBinding;
 import io.flowwarden.stream.registration.MongoDlqOptionsSpec;
+import io.flowwarden.stream.registration.RestartPolicySpec;
 import io.flowwarden.stream.registration.RetryPolicySpec;
 import io.flowwarden.stream.registration.StreamSpec;
 import io.flowwarden.stream.registration.TypedHandler;
@@ -67,6 +69,8 @@ final class StreamSpecConverter {
 
         Checkpoint checkpoint = spec.checkpoint().map(StreamSpecConverter::synthesizeCheckpoint).orElse(null);
         RetryPolicy retryPolicy = spec.retryPolicy().map(StreamSpecConverter::synthesizeRetryPolicy).orElse(null);
+        RestartPolicy restartPolicy = spec.restartPolicy()
+                .map(StreamSpecConverter::synthesizeRestartPolicy).orElse(null);
         DeadLetterQueue deadLetterQueue = spec.deadLetterQueue()
                 .map(StreamSpecConverter::synthesizeDeadLetterQueue).orElse(null);
         MongoDlqOptions mongoDlqOptions = spec.mongoDlqOptions()
@@ -93,6 +97,7 @@ final class StreamSpecConverter {
                 filterMethod,
                 checkpoint,
                 retryPolicy,
+                restartPolicy,
                 deadLetterQueue,
                 mongoDlqOptions,
                 new ErrorHandlerResolver(errorHandlerMethods),
@@ -148,6 +153,16 @@ final class StreamSpecConverter {
                 "noRetryOn", noRetryOn,
                 "jitter", spec.jitter()
         ), RetryPolicy.class, null);
+    }
+
+    private static RestartPolicy synthesizeRestartPolicy(RestartPolicySpec spec) {
+        return AnnotationUtils.synthesizeAnnotation(Map.of(
+                "maxAttempts", spec.maxAttempts(),
+                "initialDelay", spec.initialDelay(),
+                "maxDelay", spec.maxDelay(),
+                "multiplier", spec.multiplier(),
+                "jitter", spec.jitter()
+        ), RestartPolicy.class, null);
     }
 
     private static DeadLetterQueue synthesizeDeadLetterQueue(DeadLetterQueueSpec spec) {

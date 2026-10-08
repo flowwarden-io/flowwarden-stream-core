@@ -27,6 +27,7 @@ import io.flowwarden.stream.annotation.OnDelete;
 import io.flowwarden.stream.annotation.OnInsert;
 import io.flowwarden.stream.annotation.OnReplace;
 import io.flowwarden.stream.annotation.OnUpdate;
+import io.flowwarden.stream.annotation.RestartPolicy;
 import io.flowwarden.stream.annotation.RetryPolicy;
 import io.flowwarden.stream.autoconfigure.FlowWardenAutoConfiguration;
 import org.junit.jupiter.api.Test;
@@ -430,6 +431,91 @@ class ChangeStreamBeanPostProcessorValidationTest {
                 .run(context -> assertThat(context).hasNotFailed());
     }
 
+    // --- @RestartPolicy validation tests ---
+
+    @Test
+    void failsWhenRestartPolicyMaxAttemptsNegative() {
+        contextRunner
+                .withUserConfiguration(InvalidRestartMaxAttemptsConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RestartPolicy")
+                            .hasMessageContaining("maxAttempts");
+                });
+    }
+
+    @Test
+    void failsWhenRestartPolicyMultiplierBelowOne() {
+        // Stricter than @RetryPolicy (> 0): a shrinking cadence would
+        // degenerate into a hot loop against a down server.
+        contextRunner
+                .withUserConfiguration(InvalidRestartMultiplierConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RestartPolicy")
+                            .hasMessageContaining("multiplier");
+                });
+    }
+
+    @Test
+    void failsWhenRestartPolicyMultiplierIsNaN() {
+        // NaN compares false against everything: a plain `< 1.0` check lets it through.
+        contextRunner
+                .withUserConfiguration(InvalidRestartNaNMultiplierConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RestartPolicy")
+                            .hasMessageContaining("multiplier: NaN");
+                });
+    }
+
+    @Test
+    void failsWhenRestartPolicyMultiplierIsInfinite() {
+        contextRunner
+                .withUserConfiguration(InvalidRestartInfiniteMultiplierConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RestartPolicy")
+                            .hasMessageContaining("multiplier: Infinity");
+                });
+    }
+
+    @Test
+    void failsWhenRestartPolicyHasInvalidDelay() {
+        contextRunner
+                .withUserConfiguration(InvalidRestartDelayConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RestartPolicy")
+                            .hasMessageContaining("maxDelay");
+                });
+    }
+
+    @Test
+    void failsWhenRestartPolicyHasZeroDelay() {
+        contextRunner
+                .withUserConfiguration(InvalidRestartZeroDelayConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RestartPolicy")
+                            .hasMessageContaining("initialDelay")
+                            .hasMessageContaining("hot-loop");
+                });
+    }
+
+    @Test
+    void succeedsWithValidRestartPolicy() {
+        contextRunner
+                .withUserConfiguration(ValidRestartHandlerConfig.class)
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
     @Configuration(proxyBeanMethods = false)
     static class InvalidRetryMaxAttemptsConfig {
         @Bean
@@ -489,6 +575,118 @@ class ChangeStreamBeanPostProcessorValidationTest {
     @ChangeStream(collection = "orders")
     @RetryPolicy(maxAttempts = 5, initialDelay = "1s", maxDelay = "30s")
     static class ValidRetryHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidRestartMaxAttemptsConfig {
+        @Bean
+        InvalidRestartMaxAttemptsHandler invalidRestartMaxAttemptsHandler() {
+            return new InvalidRestartMaxAttemptsHandler();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidRestartMultiplierConfig {
+        @Bean
+        InvalidRestartMultiplierHandler invalidRestartMultiplierHandler() {
+            return new InvalidRestartMultiplierHandler();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidRestartNaNMultiplierConfig {
+        @Bean
+        InvalidRestartNaNMultiplierHandler invalidRestartNaNMultiplierHandler() {
+            return new InvalidRestartNaNMultiplierHandler();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidRestartInfiniteMultiplierConfig {
+        @Bean
+        InvalidRestartInfiniteMultiplierHandler invalidRestartInfiniteMultiplierHandler() {
+            return new InvalidRestartInfiniteMultiplierHandler();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidRestartDelayConfig {
+        @Bean
+        InvalidRestartDelayHandler invalidRestartDelayHandler() {
+            return new InvalidRestartDelayHandler();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidRestartZeroDelayConfig {
+        @Bean
+        InvalidRestartZeroDelayHandler invalidRestartZeroDelayHandler() {
+            return new InvalidRestartZeroDelayHandler();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ValidRestartHandlerConfig {
+        @Bean
+        ValidRestartHandler validRestartHandler() {
+            return new ValidRestartHandler();
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @RestartPolicy(maxAttempts = -1)
+    static class InvalidRestartMaxAttemptsHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @RestartPolicy(multiplier = 0.5)
+    static class InvalidRestartMultiplierHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @RestartPolicy(multiplier = Double.NaN)
+    static class InvalidRestartNaNMultiplierHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @RestartPolicy(multiplier = Double.POSITIVE_INFINITY)
+    static class InvalidRestartInfiniteMultiplierHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @RestartPolicy(maxDelay = "soon")
+    static class InvalidRestartDelayHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @RestartPolicy(initialDelay = "0ms")
+    static class InvalidRestartZeroDelayHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @RestartPolicy(maxAttempts = 10, initialDelay = "500ms", maxDelay = "5m", jitter = true)
+    static class ValidRestartHandler {
         @OnChange
         void handle(ChangeStreamContext<?> ctx) {
         }

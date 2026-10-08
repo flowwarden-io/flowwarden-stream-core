@@ -119,6 +119,51 @@ final class StreamDefinitionValidator {
         }
     }
 
+    /**
+     * The restart loop exists to guard against hot-looping on a hard-down
+     * server, so on top of the {@code @RetryPolicy}-shaped rules it rejects a
+     * cadence that could degenerate into one: a zero initial delay, a zero
+     * cap, or a multiplier below 1 (delays shrinking towards zero).
+     */
+    static void validateRestartPolicy(String beanName, String subject, int maxAttempts,
+                                       double multiplier, String initialDelay, String maxDelay) {
+        if (maxAttempts < 0) {
+            throw new BeanCreationException(beanName,
+                    "@RestartPolicy on " + subject
+                            + " has invalid maxAttempts: " + maxAttempts
+                            + ". Must be >= 0 (0 = unlimited).");
+        }
+        // NaN compares false against everything, so a plain `< 1.0` would let
+        // it through — and an infinite multiplier would silently collapse to
+        // maxDelay from the second attempt on. Both are rejected explicitly.
+        if (!Double.isFinite(multiplier) || multiplier < 1.0) {
+            throw new BeanCreationException(beanName,
+                    "@RestartPolicy on " + subject
+                            + " has invalid multiplier: " + multiplier
+                            + ". Must be a finite number >= 1 (the restart loop never speeds up).");
+        }
+        validatePositiveDuration(beanName, subject, "initialDelay", initialDelay);
+        validatePositiveDuration(beanName, subject, "maxDelay", maxDelay);
+    }
+
+    private static void validatePositiveDuration(String beanName, String subject,
+                                                 String attribute, String value) {
+        java.time.Duration parsed;
+        try {
+            parsed = RetryPolicyConfig.parseDuration(value);
+        } catch (IllegalArgumentException e) {
+            throw new BeanCreationException(beanName,
+                    "@RestartPolicy on " + subject
+                            + " has invalid " + attribute + ": " + value);
+        }
+        if (parsed.isZero()) {
+            throw new BeanCreationException(beanName,
+                    "@RestartPolicy on " + subject
+                            + " has invalid " + attribute + ": " + value
+                            + ". Must be > 0 (a zero delay would hot-loop against a down server).");
+        }
+    }
+
     static void validateDeadLetterQueue(String beanName, String subject, int retentionDays) {
         if (retentionDays < 0) {
             throw new BeanCreationException(beanName,

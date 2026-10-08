@@ -22,9 +22,11 @@ import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.StartPosition;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
+import io.flowwarden.stream.annotation.RestartPolicy;
 import io.flowwarden.stream.annotation.RetryPolicy;
 import io.flowwarden.stream.registration.CheckpointSpec;
 import io.flowwarden.stream.registration.DeadLetterQueueSpec;
+import io.flowwarden.stream.registration.RestartPolicySpec;
 import io.flowwarden.stream.registration.RetryPolicySpec;
 import io.flowwarden.stream.registration.StreamSpec;
 import org.bson.Document;
@@ -153,6 +155,31 @@ class StreamSpecConverterTest {
     }
 
     @Test
+    void synthesizesRestartPolicyAnnotationFromSpec() {
+        StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
+                .collection("orders")
+                .restartPolicy(RestartPolicySpec.builder()
+                        .maxAttempts(5)
+                        .initialDelay("500ms")
+                        .maxDelay("5m")
+                        .multiplier(1.5)
+                        .jitter(true)
+                        .build())
+                .onChange(ctx -> { })
+                .build();
+
+        ChangeStreamDefinition definition = StreamSpecConverter.convert(spec, new Object(), "testBean");
+
+        RestartPolicy restartPolicy = definition.restartPolicyAnnotation();
+        assertNotNull(restartPolicy);
+        assertEquals(5, restartPolicy.maxAttempts());
+        assertEquals("500ms", restartPolicy.initialDelay());
+        assertEquals("5m", restartPolicy.maxDelay());
+        assertEquals(1.5, restartPolicy.multiplier());
+        assertTrue(restartPolicy.jitter());
+    }
+
+    @Test
     void throwsWhenDocumentTypeIsRawDocumentAndNoCollectionGiven() {
         // Parity with the annotation path (ChangeStreamBeanPostProcessor#resolveCollection):
         // Document.class with no explicit collection must fail fast, not silently resolve
@@ -245,6 +272,7 @@ class StreamSpecConverterTest {
 
         assertNull(definition.checkpointAnnotation());
         assertNull(definition.retryPolicyAnnotation());
+        assertNull(definition.restartPolicyAnnotation());
         assertNull(definition.deadLetterQueueAnnotation());
         assertNull(definition.mongoDlqOptionsAnnotation());
     }
