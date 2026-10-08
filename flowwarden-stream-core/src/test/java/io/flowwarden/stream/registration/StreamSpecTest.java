@@ -70,6 +70,29 @@ class StreamSpecTest {
     }
 
     @Test
+    void restartPolicyDefaultsMatchRestartPolicyAnnotation() {
+        RestartPolicySpec defaults = RestartPolicySpec.defaults();
+        assertEquals(0, defaults.maxAttempts());
+        assertEquals("1s", defaults.initialDelay());
+        assertEquals("60s", defaults.maxDelay());
+        assertEquals(2.0, defaults.multiplier());
+        assertFalse(defaults.jitter());
+    }
+
+    @Test
+    void restartPolicySpecRejectsNullDelay() {
+        assertThrows(NullPointerException.class, () -> RestartPolicySpec.builder().initialDelay(null));
+        assertThrows(NullPointerException.class, () -> RestartPolicySpec.builder().maxDelay(null));
+    }
+
+    @Test
+    void restartPolicyIsAbsentUnlessSet() {
+        StreamSpec<Object> spec = StreamSpec.builder("s", Object.class).collection("c").onChange(ctx -> { }).build();
+        assertTrue(spec.restartPolicy().isEmpty());
+        assertThrows(NullPointerException.class, () -> StreamSpec.builder("s", Object.class).restartPolicy(null));
+    }
+
+    @Test
     void deadLetterQueueDefaultsMatchDeadLetterQueueAnnotation() {
         DeadLetterQueueSpec defaults = DeadLetterQueueSpec.defaults();
         assertTrue(defaults.enabled());

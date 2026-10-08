@@ -253,7 +253,7 @@ class ReactiveInvalidateHarnessTest {
                 bean, onChange, Map.of(), config, null, null,
                 CheckpointAnnotationCarrier.class.getAnnotation(
                         io.flowwarden.stream.annotation.Checkpoint.class),
-                null, null, null,
+                null, null, null, null,
                 new ErrorHandlerResolver(List.of()), Map.of());
     }
 

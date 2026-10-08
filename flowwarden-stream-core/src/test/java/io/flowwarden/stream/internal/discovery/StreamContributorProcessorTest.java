@@ -20,6 +20,7 @@ import io.flowwarden.stream.annotation.ChangeStream;
 import io.flowwarden.stream.annotation.OnChange;
 import io.flowwarden.stream.autoconfigure.FlowWardenAutoConfiguration;
 import io.flowwarden.stream.registration.CheckpointSpec;
+import io.flowwarden.stream.registration.RestartPolicySpec;
 import io.flowwarden.stream.registration.RetryPolicySpec;
 import io.flowwarden.stream.registration.StreamDefinitionContributor;
 import io.flowwarden.stream.registration.StreamRegistration;
@@ -97,6 +98,44 @@ class StreamContributorProcessorTest {
                     assertThat(context.getStartupFailure())
                             .hasMessageContaining("@RetryPolicy")
                             .hasMessageContaining("invalid multiplier");
+                });
+    }
+
+    @Test
+    void failsOnInvalidRestartPolicySameAsAnnotationPath() {
+        // Parity check: an invalid RestartPolicySpec fails for the same reason as the
+        // equivalent invalid @RestartPolicy (see ChangeStreamBeanPostProcessorValidationTest).
+        contextRunner
+                .withUserConfiguration(InvalidRestartContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RestartPolicy")
+                            .hasMessageContaining("invalid multiplier");
+                });
+    }
+
+    @Test
+    void failsOnNaNRestartMultiplierSameAsAnnotationPath() {
+        contextRunner
+                .withUserConfiguration(NaNRestartContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RestartPolicy")
+                            .hasMessageContaining("multiplier: NaN");
+                });
+    }
+
+    @Test
+    void failsOnInfiniteRestartMultiplierSameAsAnnotationPath() {
+        contextRunner
+                .withUserConfiguration(InfiniteRestartContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RestartPolicy")
+                            .hasMessageContaining("multiplier: Infinity");
                 });
     }
 
@@ -255,6 +294,39 @@ class StreamContributorProcessorTest {
             return registration -> registration.stream("invalid-retry-stream", Order.class)
                     .collection("orders")
                     .retryPolicy(RetryPolicySpec.builder().multiplier(-1.0).build())
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidRestartContributorConfig {
+        @Bean
+        StreamDefinitionContributor invalidRestartContributor() {
+            return registration -> registration.stream("invalid-restart-stream", Order.class)
+                    .collection("orders")
+                    .restartPolicy(RestartPolicySpec.builder().multiplier(0.5).build())
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class NaNRestartContributorConfig {
+        @Bean
+        StreamDefinitionContributor nanRestartContributor() {
+            return registration -> registration.stream("nan-restart-stream", Order.class)
+                    .collection("orders")
+                    .restartPolicy(RestartPolicySpec.builder().multiplier(Double.NaN).build())
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InfiniteRestartContributorConfig {
+        @Bean
+        StreamDefinitionContributor infiniteRestartContributor() {
+            return registration -> registration.stream("infinite-restart-stream", Order.class)
+                    .collection("orders")
+                    .restartPolicy(RestartPolicySpec.builder().multiplier(Double.POSITIVE_INFINITY).build())
                     .onChange(ctx -> { });
         }
     }

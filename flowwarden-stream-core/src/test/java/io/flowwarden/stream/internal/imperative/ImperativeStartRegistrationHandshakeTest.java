@@ -689,7 +689,7 @@ class ImperativeStartRegistrationHandshakeTest {
                 new ManualSaverBean(), onChange, Map.of(), config, null, null,
                 CheckpointAnnotationCarrier.class.getAnnotation(
                         io.flowwarden.stream.annotation.Checkpoint.class),
-                null, null, null,
+                null, null, null, null,
                 new ErrorHandlerResolver(List.of()), Map.of());
     }
 
@@ -701,7 +701,7 @@ class ImperativeStartRegistrationHandshakeTest {
                 new Object(), null, Map.of(), config, null, null,
                 CheckpointAnnotationCarrier.class.getAnnotation(
                         io.flowwarden.stream.annotation.Checkpoint.class),
-                null, null, null,
+                null, null, null, null,
                 new ErrorHandlerResolver(List.of()), Map.of());
     }
 
@@ -711,7 +711,7 @@ class ImperativeStartRegistrationHandshakeTest {
                 DeploymentMode.ALL_INSTANCES);
         return new ChangeStreamDefinition(STREAM, "handshake_test", "", "",
                 new Object(), null, Map.of(), config, null, null,
-                null, null, null, null,
+                null, null, null, null, null,
                 new ErrorHandlerResolver(List.of()), Map.of());
     }
 

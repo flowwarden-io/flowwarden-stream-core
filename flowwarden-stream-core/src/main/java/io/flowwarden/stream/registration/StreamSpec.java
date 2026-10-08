@@ -51,7 +51,8 @@ import java.util.function.Supplier;
  * <ul>
  *   <li>Covered, with the same defaults and handler shapes as the corresponding annotation:
  *       {@code @Checkpoint} ({@link CheckpointSpec}), {@code @RetryPolicy}
- *       ({@link RetryPolicySpec}), {@code @DeadLetterQueue} ({@link DeadLetterQueueSpec}),
+ *       ({@link RetryPolicySpec}), {@code @RestartPolicy} ({@link RestartPolicySpec}),
+ *       {@code @DeadLetterQueue} ({@link DeadLetterQueueSpec}),
  *       {@code @MongoDlqOptions} ({@link MongoDlqOptionsSpec}), the typed handlers
  *       ({@code @OnInsert}/{@code @OnUpdate}/{@code @OnDelete}/{@code @OnReplace}/{@code @OnChange}),
  *       {@code @Pipeline}, {@code @Filter}, and {@code @OnError}.</li>
@@ -78,6 +79,7 @@ public final class StreamSpec<T> {
     private final String mongoTemplateRef;
     private final CheckpointSpec checkpoint;
     private final RetryPolicySpec retryPolicy;
+    private final RestartPolicySpec restartPolicy;
     private final DeadLetterQueueSpec deadLetterQueue;
     private final MongoDlqOptionsSpec mongoDlqOptions;
     private final Map<OperationType, TypedHandler<T>> typedHandlers;
@@ -99,6 +101,7 @@ public final class StreamSpec<T> {
         this.mongoTemplateRef = builder.mongoTemplateRef;
         this.checkpoint = builder.checkpoint;
         this.retryPolicy = builder.retryPolicy;
+        this.restartPolicy = builder.restartPolicy;
         this.deadLetterQueue = builder.deadLetterQueue;
         this.mongoDlqOptions = builder.mongoDlqOptions;
         this.typedHandlers = new EnumMap<>(builder.typedHandlers);
@@ -154,6 +157,11 @@ public final class StreamSpec<T> {
 
     public Optional<RetryPolicySpec> retryPolicy() {
         return Optional.ofNullable(retryPolicy);
+    }
+
+    /** The managed-restart policy, if any — equivalent of {@code @RestartPolicy}. */
+    public Optional<RestartPolicySpec> restartPolicy() {
+        return Optional.ofNullable(restartPolicy);
     }
 
     public Optional<DeadLetterQueueSpec> deadLetterQueue() {
@@ -217,6 +225,7 @@ public final class StreamSpec<T> {
         private String mongoTemplateRef = "";
         private CheckpointSpec checkpoint;
         private RetryPolicySpec retryPolicy;
+        private RestartPolicySpec restartPolicy;
         private DeadLetterQueueSpec deadLetterQueue;
         private MongoDlqOptionsSpec mongoDlqOptions;
         private final Map<OperationType, TypedHandler<T>> typedHandlers = new EnumMap<>(OperationType.class);
@@ -281,6 +290,12 @@ public final class StreamSpec<T> {
 
         public Builder<T> retryPolicy(RetryPolicySpec retryPolicy) {
             this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy must not be null");
+            return this;
+        }
+
+        /** Managed-restart cadence and ceiling — equivalent of {@code @RestartPolicy}. */
+        public Builder<T> restartPolicy(RestartPolicySpec restartPolicy) {
+            this.restartPolicy = Objects.requireNonNull(restartPolicy, "restartPolicy must not be null");
             return this;
         }
 
