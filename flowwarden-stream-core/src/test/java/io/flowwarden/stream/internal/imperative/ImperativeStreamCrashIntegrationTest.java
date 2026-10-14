@@ -22,6 +22,7 @@ import io.flowwarden.stream.annotation.EnableFlowWarden;
 import io.flowwarden.stream.annotation.OnInsert;
 import io.flowwarden.stream.spi.StopReason;
 import io.flowwarden.stream.spi.StreamMetricsProvider;
+import io.flowwarden.stream.test.RecordingMetricsProvider;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
@@ -39,13 +40,6 @@ import org.springframework.test.context.DynamicPropertySource;
 import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.isNull;
-import static org.mockito.ArgumentMatchers.same;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
 import static org.awaitility.Awaitility.await;
 
 @SpringBootTest(classes = ImperativeStreamCrashIntegrationTest.TestApp.class)
@@ -63,11 +57,14 @@ class ImperativeStreamCrashIntegrationTest {
     @Autowired
     ImperativeStreamManager streamManager;
 
-    private StreamMetricsProvider metrics;
+    // A hand-written provider, not a Mockito mock: the provider is global and the
+    // probe/stats/flush schedulers call it concurrently — stubbing a mock while
+    // they run is an UnfinishedStubbing race (seen on CI, reactive twin).
+    private RecordingMetricsProvider metrics;
 
     @BeforeEach
     void setUp() {
-        metrics = mock(StreamMetricsProvider.class);
+        metrics = new RecordingMetricsProvider();
         FlowWardenMetrics.setProvider(metrics);
     }
 
@@ -85,16 +82,13 @@ class ImperativeStreamCrashIntegrationTest {
         // try/catch that covers handler InvocationTargetException. A throw here is
         // the simplest way to simulate any uncaught exception escaping handleMessage.
         RuntimeException injectedCause = new RuntimeException("simulated internal crash");
-        doThrow(injectedCause).when(metrics)
-                .onEventReceived(eq("imp-crash-test"), any());
+        metrics.failOnEventReceived("imp-crash-test", injectedCause);
 
         mongoTemplate.insert(new Document("item", "boom"), "imp_crash_test");
 
         await().atMost(Duration.ofSeconds(15))
-                .untilAsserted(() -> verify(metrics).onStreamStopped(
-                        eq("imp-crash-test"),
-                        eq(StopReason.CRASHED),
-                        same(injectedCause)));
+                .untilAsserted(() -> assertThat(metrics.stops()).contains(
+                        new RecordingMetricsProvider.Stop("imp-crash-test", StopReason.CRASHED, injectedCause)));
 
         // Per-stream state must be cleared so the public APIs stop lying
         // once the container thread is dead.
@@ -113,10 +107,8 @@ class ImperativeStreamCrashIntegrationTest {
         streamManager.stopStream("imp-graceful-test");
 
         await().atMost(Duration.ofSeconds(5))
-                .untilAsserted(() -> verify(metrics).onStreamStopped(
-                        eq("imp-graceful-test"),
-                        eq(StopReason.GRACEFUL),
-                        isNull()));
+                .untilAsserted(() -> assertThat(metrics.stops()).contains(
+                        new RecordingMetricsProvider.Stop("imp-graceful-test", StopReason.GRACEFUL, null)));
 
         assertThat(streamManager.isRunning("imp-graceful-test")).isFalse();
         assertThat(streamManager.getLastEventTime("imp-graceful-test")).isNull();
