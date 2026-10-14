@@ -22,6 +22,7 @@ import io.flowwarden.stream.annotation.EnableFlowWarden;
 import io.flowwarden.stream.annotation.OnInsert;
 import io.flowwarden.stream.spi.StopReason;
 import io.flowwarden.stream.spi.StreamMetricsProvider;
+import io.flowwarden.stream.test.RecordingMetricsProvider;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
@@ -40,13 +41,6 @@ import reactor.core.publisher.Mono;
 import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.isNull;
-import static org.mockito.ArgumentMatchers.same;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
 import static org.awaitility.Awaitility.await;
 
 @SpringBootTest(classes = ReactiveStreamCrashIntegrationTest.TestApp.class)
@@ -64,11 +58,14 @@ class ReactiveStreamCrashIntegrationTest {
     @Autowired
     ReactiveStreamManager streamManager;
 
-    private StreamMetricsProvider metrics;
+    // A hand-written provider, not a Mockito mock: the provider is global and the
+    // probe/stats/flush schedulers call it concurrently — stubbing a mock while
+    // they run is an UnfinishedStubbing race (seen on CI).
+    private RecordingMetricsProvider metrics;
 
     @BeforeEach
     void setUp() {
-        metrics = mock(StreamMetricsProvider.class);
+        metrics = new RecordingMetricsProvider();
         FlowWardenMetrics.setProvider(metrics);
     }
 
@@ -88,16 +85,13 @@ class ReactiveStreamCrashIntegrationTest {
         // into Mono.empty() which terminates the source Flux. .doFinally then
         // sees gracefulStop==false and emits CRASHED.
         RuntimeException injectedCause = new RuntimeException("simulated internal crash");
-        doThrow(injectedCause).when(metrics)
-                .onEventReceived(eq("rea-crash-test"), any());
+        metrics.failOnEventReceived("rea-crash-test", injectedCause);
 
         reactiveMongoTemplate.insert(new Document("item", "boom"), "rea_crash_test").block();
 
         await().atMost(Duration.ofSeconds(15))
-                .untilAsserted(() -> verify(metrics).onStreamStopped(
-                        eq("rea-crash-test"),
-                        eq(StopReason.CRASHED),
-                        same(injectedCause)));
+                .untilAsserted(() -> assertThat(metrics.stops()).contains(
+                        new RecordingMetricsProvider.Stop("rea-crash-test", StopReason.CRASHED, injectedCause)));
 
         // Per-stream state must be cleared so the public APIs stop lying
         // once the pipeline has terminated unexpectedly.
@@ -116,10 +110,8 @@ class ReactiveStreamCrashIntegrationTest {
         streamManager.stopStream("rea-graceful-test");
 
         await().atMost(Duration.ofSeconds(5))
-                .untilAsserted(() -> verify(metrics).onStreamStopped(
-                        eq("rea-graceful-test"),
-                        eq(StopReason.GRACEFUL),
-                        isNull()));
+                .untilAsserted(() -> assertThat(metrics.stops()).contains(
+                        new RecordingMetricsProvider.Stop("rea-graceful-test", StopReason.GRACEFUL, null)));
 
         assertThat(streamManager.isRunning("rea-graceful-test")).isFalse();
         assertThat(streamManager.getLastEventTime("rea-graceful-test")).isNull();
