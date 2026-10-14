@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - The restart loop's log lines now report the delay before the next attempt in milliseconds instead of seconds.
 
+### Fixed
+- `@RetryPolicy` validation now rejects a `NaN` or infinite `multiplier` on both discovery paths (`NaN` slipped through the `<= 0` check, since every ordered comparison with `NaN` is false; `+∞` silently collapsed every retry after the first onto `maxDelay`). A multiplier below 1 — a shrinking cadence — remains a legitimate retry policy. (#97)
+- A positive retry delay can no longer be truncated to `0 ms`: neither by a multiplier below 1 (`1ms × 0.5` used to become `0`) nor by the jitter factor on a `1ms` delay. The computed delay is floored at 1 ms. An **explicit** `"0ms"` `initialDelay` or `maxDelay` keeps its meaning — immediate retries, every delay zero — so no currently valid configuration changes behaviour. (#97)
+
 ## [1.0.0-rc.6] — 2026-09-18
 
 ### Added
