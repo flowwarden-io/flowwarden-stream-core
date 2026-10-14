@@ -36,6 +36,18 @@ import java.lang.annotation.Target;
  * if jitter: finalDelay = cappedDelay +/- random(20%)
  * else: finalDelay = cappedDelay
  * </pre>
+ *
+ * <p><strong>Head-of-line blocking.</strong> Retries run on the stream's single
+ * processing thread: the stream does not advance to the next event until the
+ * current one has succeeded, exhausted its attempts, or been settled by an
+ * {@link OnError} handler ({@code SKIP} / {@code DLQ}). A retry sequence
+ * therefore holds the stream for the <em>sum</em> of its backoff delays —
+ * about 15 seconds for {@code maxAttempts = 5, initialDelay = "1s",
+ * multiplier = 2.0} — while later events queue in the MongoDB cursor. This is
+ * the price of strict oplog-order delivery, and the only retry strategy in
+ * 1.x. Keep {@code maxAttempts} and {@code maxDelay} proportionate to the
+ * latency the stream can afford, retry only transient failures
+ * ({@link #retryOn()}), and route the rest to {@code @OnError} or the DLQ.</p>
  */
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)
