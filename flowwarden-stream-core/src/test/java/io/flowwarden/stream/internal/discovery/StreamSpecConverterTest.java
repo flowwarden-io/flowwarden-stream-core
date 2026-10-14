@@ -124,6 +124,19 @@ class StreamSpecConverterTest {
     }
 
     @Test
+    void passesTheZoneThrough() {
+        StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
+                .collection("orders")
+                .zone("eu-west")
+                .onChange(ctx -> { })
+                .build();
+
+        ChangeStreamDefinition definition = StreamSpecConverter.convert(spec, new Object(), "testBean");
+
+        assertEquals("eu-west", definition.zone());
+    }
+
+    @Test
     void synthesizesRetryPolicyAndDeadLetterQueueAnnotationsFromSpec() {
         StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
                 .collection("orders")

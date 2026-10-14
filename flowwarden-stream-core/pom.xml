@@ -78,4 +78,14 @@
         </dependency>
     </dependencies>
 
+    <build>
+        <plugins>
+            <!-- Public API compatibility gate against ${japicmp.baseline} — see the parent pom. -->
+            <plugin>
+                <groupId>com.github.siom79.japicmp</groupId>
+                <artifactId>japicmp-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
 </project>
