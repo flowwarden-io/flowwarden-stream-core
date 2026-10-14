@@ -90,7 +90,7 @@
             carries no guarantee and is excluded from the comparison.
         -->
         <japicmp.version>0.23.1</japicmp.version>
-        <japicmp.groovy.version>4.0.27</japicmp.groovy.version>
+        <japicmp.groovy.version>6.0.0</japicmp.groovy.version>
         <japicmp.baseline>1.0.0-rc.6</japicmp.baseline>
     </properties>
 
