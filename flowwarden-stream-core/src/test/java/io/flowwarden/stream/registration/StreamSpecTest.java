@@ -120,6 +120,15 @@ class StreamSpecTest {
     }
 
     @Test
+    void zoneDefaultsToEmptyAndRejectsNull() {
+        StreamSpec<Object> spec = StreamSpec.builder("s", Object.class).collection("c").onChange(ctx -> { }).build();
+        assertEquals("", spec.zone());
+        assertEquals("eu-west", StreamSpec.builder("s", Object.class).collection("c").zone("eu-west")
+                .onChange(ctx -> { }).build().zone());
+        assertThrows(NullPointerException.class, () -> StreamSpec.builder("s", Object.class).zone(null));
+    }
+
+    @Test
     void checkpointSpecRejectsNullStartPosition() {
         assertThrows(NullPointerException.class, () -> CheckpointSpec.builder().startPosition(null));
     }

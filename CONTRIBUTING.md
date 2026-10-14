@@ -39,6 +39,28 @@ Before writing code, please be aware of the following architectural decisions:
 - **Dual mode:** All code must work in both IMPERATIVE and REACTIVE modes.
 - **Package structure:** All classes belong under `io.flowwarden.stream.*`.
 
+## Public API Compatibility
+
+The public surface is everything outside `io.flowwarden.stream.internal.*`: the
+top-level package, `annotation`, `core`, `registration`, `spi`, and the testkit's
+`spi.testkit`. From `1.0.0` on, every `1.x` release is **additive only** on that
+surface:
+
+- Add, never remove or rename: a public class, method, annotation attribute or
+  record component.
+- New annotation attributes carry a default; new SPI interface methods are
+  `default` methods — a new abstract method breaks every custom backend.
+- A record that gains a component keeps its previous canonical constructor as a
+  compatibility constructor (see `StreamConfiguration.CheckpointConfig`).
+- `internal.*` carries no guarantee and may change in any release.
+
+The build enforces it: `japicmp-maven-plugin` runs at `verify` on
+`flowwarden-stream-core` and `flowwarden-stream-core-testkit`, comparing the
+built jar against the previous release (`japicmp.baseline` in the parent pom)
+and failing on any binary- or source-incompatible change. A PR that trips it
+either restores compatibility or is a `2.0` conversation — not a config tweak.
+The baseline is bumped in each release PR, right after the version flip.
+
 ## Coding Guidelines
 
 - Code and comments in **English**.

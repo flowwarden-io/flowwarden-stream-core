@@ -82,6 +82,16 @@
         <mockito.version>5.24.0</mockito.version>
         <byte-buddy.version>1.17.5</byte-buddy.version>
         <license.year>2026</license.year>
+        <!--
+            Public API compatibility gate (japicmp). The baseline is the
+            previous release on Maven Central; bump it in the release PR,
+            right after the version flip. From 1.0.0 on, 1.x releases are
+            additive only on the public packages — io.flowwarden.stream.internal.*
+            carries no guarantee and is excluded from the comparison.
+        -->
+        <japicmp.version>0.23.1</japicmp.version>
+        <japicmp.groovy.version>4.0.27</japicmp.groovy.version>
+        <japicmp.baseline>1.0.0-rc.6</japicmp.baseline>
     </properties>
 
     <dependencyManagement>
@@ -123,6 +133,68 @@
                             <license.year>${license.year}</license.year>
                         </properties>
                     </configuration>
+                </plugin>
+                <plugin>
+                    <groupId>com.github.siom79.japicmp</groupId>
+                    <artifactId>japicmp-maven-plugin</artifactId>
+                    <version>${japicmp.version}</version>
+                    <configuration>
+                        <oldVersion>
+                            <dependency>
+                                <groupId>${project.groupId}</groupId>
+                                <artifactId>${project.artifactId}</artifactId>
+                                <version>${japicmp.baseline}</version>
+                                <type>jar</type>
+                            </dependency>
+                        </oldVersion>
+                        <newVersion>
+                            <file>
+                                <path>${project.build.directory}/${project.build.finalName}.jar</path>
+                            </file>
+                        </newVersion>
+                        <parameter>
+                            <breakBuildOnBinaryIncompatibleModifications>true</breakBuildOnBinaryIncompatibleModifications>
+                            <breakBuildOnSourceIncompatibleModifications>true</breakBuildOnSourceIncompatibleModifications>
+                            <onlyModified>true</onlyModified>
+                            <ignoreMissingClasses>true</ignoreMissingClasses>
+                            <!--
+                                An annotation element added WITH a default, and a method
+                                added to a public class, are the additive changes 1.x
+                                promises; japicmp's defaults treat them as compatible.
+                                Additions to the SPI interfaces must stay `default` — a
+                                new abstract method is exactly what this check catches.
+                            -->
+                            <excludes>
+                                <exclude>io.flowwarden.stream.internal.*</exclude>
+                            </excludes>
+                            <postAnalysisScript>${maven.multiModuleProjectDirectory}/.japicmp-post-analysis.groovy</postAnalysisScript>
+                        </parameter>
+                    </configuration>
+                    <executions>
+                        <execution>
+                            <phase>verify</phase>
+                            <goals>
+                                <goal>cmp</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                    <dependencies>
+                        <!--
+                            The plugin bundles Groovy 4.0.15, which cannot parse the
+                            post-analysis script on a JDK newer than 21 (class file
+                            version). Newer Groovy 4 keeps the same API.
+                        -->
+                        <dependency>
+                            <groupId>org.apache.groovy</groupId>
+                            <artifactId>groovy</artifactId>
+                            <version>${japicmp.groovy.version}</version>
+                        </dependency>
+                        <dependency>
+                            <groupId>org.apache.groovy</groupId>
+                            <artifactId>groovy-jsr223</artifactId>
+                            <version>${japicmp.groovy.version}</version>
+                        </dependency>
+                    </dependencies>
                 </plugin>
             </plugins>
         </pluginManagement>

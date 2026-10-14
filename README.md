@@ -246,7 +246,7 @@ class OrderStreamContributor implements StreamDefinitionContributor {
 }
 ```
 
-Registration is bootstrap-only (no hot registration on a running instance) and does not cover `zone` yet. See the [Programmatic Registration guide](https://docs.flowwarden.io/guides/programmatic-registration) and sample `12-registration` in [flowwarden-examples](https://github.com/flowwarden-io/flowwarden-examples).
+Registration is bootstrap-only (no hot registration on a running instance). See the [Programmatic Registration guide](https://docs.flowwarden.io/guides/programmatic-registration) and sample `12-registration` in [flowwarden-examples](https://github.com/flowwarden-io/flowwarden-examples).
 
 ### When history is lost
 

@@ -88,7 +88,7 @@ final class StreamSpecConverter {
                 spec.name(),
                 collection,
                 spec.database(),
-                "",
+                spec.zone(),
                 contributorBean,
                 onChangeHandler,
                 Collections.unmodifiableMap(typedHandlers),

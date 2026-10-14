@@ -56,8 +56,9 @@ import java.util.function.Supplier;
  *       {@code @MongoDlqOptions} ({@link MongoDlqOptionsSpec}), the typed handlers
  *       ({@code @OnInsert}/{@code @OnUpdate}/{@code @OnDelete}/{@code @OnReplace}/{@code @OnChange}),
  *       {@code @Pipeline}, {@code @Filter}, and {@code @OnError}.</li>
- *   <li><strong>Not covered</strong> (no equivalent on {@code StreamSpec} yet): a {@code zone}.
- *       A stream needing one can only be expressed via annotations.</li>
+ *   <li>The {@code @ChangeStream} attributes themselves — {@code collection}, {@code database},
+ *       {@code mongoTemplateRef}, {@code enabled}, {@code autoStart}, {@code fullDocument},
+ *       {@code fullDocumentBeforeChange}, {@code deploymentMode} and {@code zone}.</li>
  * </ul>
  *
  * <p>What is covered goes through the exact same validation once contributed — see
@@ -71,6 +72,7 @@ public final class StreamSpec<T> {
     private final Class<T> documentType;
     private final String collection;
     private final String database;
+    private final String zone;
     private final boolean enabled;
     private final boolean autoStart;
     private final FullDocumentMode fullDocument;
@@ -93,6 +95,7 @@ public final class StreamSpec<T> {
         this.documentType = builder.documentType;
         this.collection = builder.collection;
         this.database = builder.database;
+        this.zone = builder.zone;
         this.enabled = builder.enabled;
         this.autoStart = builder.autoStart;
         this.fullDocument = builder.fullDocument;
@@ -125,6 +128,11 @@ public final class StreamSpec<T> {
 
     public String database() {
         return database;
+    }
+
+    /** Grouping zone (discovered by Console) — equivalent of {@code @ChangeStream.zone}. Empty = none. */
+    public String zone() {
+        return zone;
     }
 
     public boolean enabled() {
@@ -217,6 +225,7 @@ public final class StreamSpec<T> {
         private final Class<T> documentType;
         private String collection = "";
         private String database = "";
+        private String zone = "";
         private boolean enabled = true;
         private boolean autoStart = true;
         private FullDocumentMode fullDocument = FullDocumentMode.DEFAULT;
@@ -249,6 +258,12 @@ public final class StreamSpec<T> {
 
         public Builder<T> database(String database) {
             this.database = Objects.requireNonNull(database, "database must not be null");
+            return this;
+        }
+
+        /** Grouping zone (discovered by Console) — equivalent of {@code @ChangeStream.zone}. */
+        public Builder<T> zone(String zone) {
+            this.zone = Objects.requireNonNull(zone, "zone must not be null");
             return this;
         }
 
