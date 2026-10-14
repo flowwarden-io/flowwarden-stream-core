@@ -17,6 +17,7 @@ package io.flowwarden.stream.internal;
 
 import io.flowwarden.stream.FlowWardenMetrics;
 import io.flowwarden.stream.HistoryLostException;
+import io.flowwarden.stream.internal.restart.RestartPolicyConfig;
 import io.flowwarden.stream.spi.StopReason;
 import io.flowwarden.stream.spi.StreamMetricsProvider;
 import org.junit.jupiter.api.AfterEach;
@@ -34,14 +35,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 /**
- * Unit tests for the managed resubscription loop: capped exponential
- * backoff, indefinite retry on transient failures, terminal give-up on
- * {@link HistoryLostException}, stand-down when the stream was restarted
+ * Unit tests for the managed resubscription loop: per-stream policy
+ * (backoff cadence and attempt ceiling), indefinite retry on transient
+ * failures by default, terminal give-up on {@link HistoryLostException} or
+ * on an exhausted ceiling, stand-down when the stream was restarted
  * manually, and cancellation by a graceful stop.
  */
 class StreamRestarterTest {
 
     private static final String STREAM = "restart-test";
+
+    /** Default cadence compressed 10x so the tests stay quick: 100ms, 200ms, 400ms … capped at 6s. */
+    private static final RestartPolicyConfig FAST_UNBOUNDED = new RestartPolicyConfig(
+            0, Duration.ofMillis(100), Duration.ofSeconds(6), 2.0, false);
 
     private RecordingMetrics metrics;
     private StreamRestarter restarter;
@@ -61,13 +67,100 @@ class StreamRestarterTest {
     }
 
     @Test
-    void backoff_isExponentialAndCapped() {
-        assertThat(StreamRestarter.delaySeconds(1)).isEqualTo(1);
-        assertThat(StreamRestarter.delaySeconds(2)).isEqualTo(2);
-        assertThat(StreamRestarter.delaySeconds(3)).isEqualTo(4);
-        assertThat(StreamRestarter.delaySeconds(6)).isEqualTo(32);
-        assertThat(StreamRestarter.delaySeconds(7)).isEqualTo(60);
-        assertThat(StreamRestarter.delaySeconds(50)).isEqualTo(60);
+    void policy_isResolvedPerStream_andDrivesTheCadence() {
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = FAST_UNBOUNDED;
+        callbacks.failStartsUntilAttempt = 2;
+        restarter = new StreamRestarter("fw-restart-test", callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
+
+        // attempt 1 at +100ms (fails), attempt 2 at +200ms — far faster than
+        // the 1s/2s a default-policy stream would wait.
+        await().atMost(Duration.ofSeconds(2))
+                .untilAsserted(() -> assertThat(metrics.restarts).containsExactly(STREAM + ":2:cursor died"));
+        assertThat(callbacks.policyLookups)
+                .as("the policy is resolved by stream name, at the death notification")
+                .containsExactly(STREAM);
+    }
+
+    @Test
+    void boundedPolicy_exhaustedByTransientFailures_isTerminal_givesUpAndSurfacesCrash() {
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = new RestartPolicyConfig(2, Duration.ofMillis(100), Duration.ofSeconds(1), 2.0, false);
+        callbacks.failStartsUntilAttempt = Integer.MAX_VALUE; // the server never comes back
+        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        RuntimeException death = new RuntimeException("cursor died");
+
+        restarter.onRuntimeDeath(STREAM, death);
+
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(callbacks.terminalGiveUps).containsExactly(STREAM));
+        assertThat(callbacks.startCalls.get())
+                .as("exactly maxAttempts resubscriptions were tried")
+                .isEqualTo(2);
+        assertThat(restarter.isRestartPending(STREAM)).isFalse();
+        assertThat(metrics.stops)
+                .as("same terminal path as a history loss — CRASHED with the death cause")
+                .containsExactly(STREAM + ":CRASHED:RuntimeException");
+        assertThat(metrics.restarts).isEmpty();
+    }
+
+    @Test
+    void boundedPolicy_exhaustedByRepeatedDeaths_givesUpWithoutWaitingForBackoff() {
+        // Each death notification is an attempt consumed (a reactive
+        // subscription that terminates synchronously re-arms the loop this
+        // way). Once the ceiling is crossed the give-up is immediate, not
+        // after another backoff.
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = new RestartPolicyConfig(1, Duration.ofSeconds(30), Duration.ofSeconds(30), 2.0, false);
+        restarter = new StreamRestarter("fw-restart-test", callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("second death"));
+
+        await().atMost(Duration.ofSeconds(2))
+                .untilAsserted(() -> assertThat(callbacks.terminalGiveUps).containsExactly(STREAM));
+        assertThat(callbacks.startCalls.get()).isZero();
+        assertThat(metrics.stops).containsExactly(STREAM + ":CRASHED:RuntimeException");
+    }
+
+    @Test
+    void boundedPolicy_installedStreamWinsOverExhaustion_leaseIsNotReleased() {
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = new RestartPolicyConfig(1, Duration.ofSeconds(30), Duration.ofSeconds(30), 2.0, false);
+        callbacks.installed.set(true); // the operator restarted it in the meantime
+        restarter = new StreamRestarter("fw-restart-test", callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("second death"));
+
+        await().atMost(Duration.ofSeconds(2))
+                .until(() -> !restarter.isRestartPending(STREAM));
+        assertThat(callbacks.terminalGiveUps)
+                .as("giving up on a running stream would release its lease")
+                .isEmpty();
+        assertThat(metrics.stops).isEmpty();
+    }
+
+    @Test
+    void boundedPolicy_counterResetsOnSuccess_nextLifecycleStartsFresh() {
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = new RestartPolicyConfig(2, Duration.ofMillis(100), Duration.ofSeconds(1), 2.0, false);
+        callbacks.failStartsUntilAttempt = 2; // first lifecycle: fail once, then succeed
+        restarter = new StreamRestarter("fw-restart-test", callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(metrics.restarts).containsExactly(STREAM + ":2:first death"));
+
+        // Second lifecycle: a fresh state, a fresh counter — attempt 1 again.
+        callbacks.installed.set(false);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("second death"));
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(metrics.restarts)
+                        .containsExactly(STREAM + ":2:first death", STREAM + ":1:second death"));
+        assertThat(callbacks.terminalGiveUps).isEmpty();
     }
 
     @Test
@@ -239,10 +332,18 @@ class StreamRestarterTest {
         final AtomicInteger startCalls = new AtomicInteger();
         final AtomicBoolean installed = new AtomicBoolean(false);
         final List<String> terminalGiveUps = new CopyOnWriteArrayList<>();
+        final List<String> policyLookups = new CopyOnWriteArrayList<>();
+        volatile RestartPolicyConfig policy = RestartPolicyConfig.DEFAULTS;
         volatile RuntimeException startFailure;
         volatile int failStartsUntilAttempt;
         volatile java.util.concurrent.CountDownLatch startEntered;
         volatile java.util.concurrent.CountDownLatch startGate;
+
+        @Override
+        public RestartPolicyConfig policyFor(String streamName) {
+            policyLookups.add(streamName);
+            return policy;
+        }
 
         @Override
         public void startStream(String streamName) {

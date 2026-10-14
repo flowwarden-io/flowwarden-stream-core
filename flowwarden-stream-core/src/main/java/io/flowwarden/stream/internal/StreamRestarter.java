@@ -17,6 +17,7 @@ package io.flowwarden.stream.internal;
 
 import io.flowwarden.stream.FlowWardenMetrics;
 import io.flowwarden.stream.HistoryLostException;
+import io.flowwarden.stream.internal.restart.RestartPolicyConfig;
 import io.flowwarden.stream.spi.StopReason;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,14 +38,20 @@ import java.util.concurrent.TimeUnit;
  * which re-enters the full startup path (resume cascade included) with capped
  * exponential backoff.
  *
- * <p><strong>Semantics.</strong> Transient failures are retried indefinitely
- * — a database down for two hours must not leave every stream dead once it
- * comes back. The backoff attempt counter resets on the first successful
- * resubscription. A {@link HistoryLostException} escaping the restart (the
- * resume cascade escalated to {@code OnHistoryLost.FAIL}) is terminal: the
- * loop stops for that stream, the crash is surfaced, and the manager's
- * terminal callback runs (under {@code SINGLE_LEADER} it releases the lock
- * so the lease is not renewed for a corpse).</p>
+ * <p><strong>Semantics.</strong> The cadence and the attempt ceiling are a
+ * per-stream {@link RestartPolicyConfig}, resolved through
+ * {@link Callbacks#policyFor(String)} when a stream's lifecycle is created
+ * ({@code @RestartPolicy}, or {@link RestartPolicyConfig#DEFAULTS} without
+ * it). By default transient failures are retried indefinitely — a database
+ * down for two hours must not leave every stream dead once it comes back.
+ * The backoff attempt counter resets on the first successful resubscription.
+ * A {@link HistoryLostException} escaping the restart (the resume cascade
+ * escalated to {@code OnHistoryLost.FAIL}) is terminal: the loop stops for
+ * that stream, the crash is surfaced, and the manager's terminal callback
+ * runs (under {@code SINGLE_LEADER} it releases the lock so the lease is not
+ * renewed for a corpse). Exhausting a bounded policy's {@code maxAttempts}
+ * takes exactly the same path, with the last death cause as the crash
+ * cause.</p>
  *
  * <p><strong>Lifecycle.</strong> Each stream owns a single
  * {@link RestartState} guarded by this instance's monitor, carrying a
@@ -68,11 +75,17 @@ public final class StreamRestarter {
 
     private static final Logger log = LoggerFactory.getLogger(StreamRestarter.class);
 
-    static final long BASE_DELAY_SECONDS = 1;
-    static final long MAX_DELAY_SECONDS = 60;
-
     /** Manager-side operations the restart loop drives. */
     public interface Callbacks {
+
+        /**
+         * The restart policy of the stream — from its {@code @RestartPolicy}
+         * (annotated or contributed), or {@link RestartPolicyConfig#DEFAULTS}
+         * when it has none. Consulted on each death notification, never under
+         * the restarter's monitor; the value captured when the stream's
+         * lifecycle is created is the one the loop uses until it ends.
+         */
+        RestartPolicyConfig policyFor(String streamName);
 
         /**
          * Full startup path — resume cascade, heartbeat setup, subscription.
@@ -103,12 +116,14 @@ public final class StreamRestarter {
     /** Per-stream lifecycle state. All fields guarded by the restarter's monitor. */
     private static final class RestartState {
         final long generation;
+        final RestartPolicyConfig policy;
         int attempt;
         Throwable cause;
         ScheduledFuture<?> future;
 
-        RestartState(long generation) {
+        RestartState(long generation, RestartPolicyConfig policy) {
             this.generation = generation;
+            this.policy = policy;
         }
     }
 
@@ -140,12 +155,14 @@ public final class StreamRestarter {
      * and replaced — one valid future per stream, always.
      */
     public void onRuntimeDeath(String streamName, Throwable cause) {
+        // Resolved outside the monitor: the manager consults its registry.
+        RestartPolicyConfig policy = callbacks.policyFor(streamName);
         int attempt;
         long delay;
-        long generation;
+        int maxAttempts;
         synchronized (this) {
             RestartState state = states.computeIfAbsent(streamName,
-                    k -> new RestartState(generations.incrementAndGet()));
+                    k -> new RestartState(generations.incrementAndGet(), policy));
             if (state.future != null) {
                 state.future.cancel(false);
                 state.future = null;
@@ -155,12 +172,16 @@ public final class StreamRestarter {
             }
             state.attempt++;
             attempt = state.attempt;
-            generation = state.generation;
-            delay = delaySeconds(attempt);
-            scheduleLocked(streamName, state, generation, delay);
+            maxAttempts = state.policy.maxAttempts();
+            delay = scheduleNextLocked(streamName, state);
         }
-        log.warn("Stream '{}' died at runtime — resubscription attempt {} in {}s",
-                streamName, attempt, delay);
+        if (delay < 0) {
+            log.warn("Stream '{}' died at runtime — restart attempts exhausted ({}), giving up",
+                    streamName, maxAttempts);
+        } else {
+            log.warn("Stream '{}' died at runtime — resubscription attempt {} in {}ms",
+                    streamName, attempt, delay);
+        }
     }
 
     /**
@@ -188,21 +209,34 @@ public final class StreamRestarter {
         scheduler.shutdownNow();
     }
 
-    /** Caller holds the monitor. */
-    private void scheduleLocked(String streamName, RestartState state, long generation, long delaySeconds) {
+    /**
+     * Schedules the next step for {@code state.attempt}: the attempt itself
+     * after the policy's backoff, or — when the policy's ceiling is
+     * exhausted — the give-up, immediately. Returns the delay in
+     * milliseconds, or {@code -1} when the step is a give-up. The give-up
+     * runs on the restart thread like every other terminal path, so a
+     * death notification never calls back into the manager from the thread
+     * that reported it. Caller holds the monitor.
+     */
+    private long scheduleNextLocked(String streamName, RestartState state) {
+        long generation = state.generation;
+        boolean exhausted = state.policy.isExhausted(state.attempt);
+        long delayMillis = exhausted ? 0 : state.policy.computeDelayMillis(state.attempt);
         try {
             state.future = scheduler.schedule(
                     () -> attemptRestart(streamName, generation),
-                    delaySeconds, TimeUnit.SECONDS);
+                    delayMillis, TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException e) {
             // Scheduler shut down — the application is going away.
             states.remove(streamName);
         }
+        return exhausted ? -1 : delayMillis;
     }
 
     private void attemptRestart(String streamName, long generation) {
         int attempt;
         Throwable cause;
+        RestartPolicyConfig policy;
         synchronized (this) {
             RestartState state = states.get(streamName);
             if (state == null || state.generation != generation) {
@@ -211,12 +245,28 @@ public final class StreamRestarter {
             state.future = null; // now in flight
             attempt = state.attempt;
             cause = state.cause;
+            policy = state.policy;
         }
 
         if (callbacks.isInstalled(streamName)) {
             // Manually restarted (or never fully died) in the meantime — the
-            // installed stream wins, the loop stands down.
+            // installed stream wins, the loop stands down. Checked before the
+            // ceiling: giving up on a running stream would release its lease.
             clearIfCurrent(streamName, generation);
+            return;
+        }
+
+        if (policy.isExhausted(attempt)) {
+            // Terminal: the policy's ceiling is reached — same path as a
+            // history loss, with the last death cause as the crash cause.
+            if (!clearIfCurrent(streamName, generation)) {
+                return; // cancelled mid-flight: the stop already won
+            }
+            log.error("Stream '{}' restart attempts exhausted ({}) — giving up; death cause: {}",
+                    streamName, policy.maxAttempts(),
+                    cause != null ? cause.getMessage() : "unknown", cause);
+            emitCrashed(streamName, cause);
+            callbacks.onTerminalGiveUp(streamName);
             return;
         }
 
@@ -235,18 +285,22 @@ public final class StreamRestarter {
             return;
         } catch (RuntimeException e) {
             // Transient (server still down, cascade probe failure, …): keep
-            // trying — the backoff is capped, the loop never gives up on a
-            // transient class of failure.
+            // trying — the backoff is capped, and the loop gives up on a
+            // transient class of failure only when the policy bounds it.
             synchronized (this) {
                 RestartState state = states.get(streamName);
                 if (state == null || state.generation != generation) {
                     return; // cancelled mid-flight
                 }
                 state.attempt++;
-                long delay = delaySeconds(state.attempt);
-                log.warn("Stream '{}' restart attempt {} failed ({}) — retrying in {}s",
-                        streamName, attempt, e.getMessage(), delay);
-                scheduleLocked(streamName, state, generation, delay);
+                long delay = scheduleNextLocked(streamName, state);
+                if (delay < 0) {
+                    log.warn("Stream '{}' restart attempt {} failed ({}) — attempts exhausted, giving up",
+                            streamName, attempt, e.getMessage());
+                } else {
+                    log.warn("Stream '{}' restart attempt {} failed ({}) — retrying in {}ms",
+                            streamName, attempt, e.getMessage(), delay);
+                }
             }
             return;
         }
@@ -317,12 +371,5 @@ public final class StreamRestarter {
             log.warn("Metrics provider failed on crash signal for stream '{}': {}",
                     streamName, e.getMessage());
         }
-    }
-
-    static long delaySeconds(int attempt) {
-        // 1, 2, 4, 8, 16, 32, then capped at 60 — never a hot loop against a
-        // hard-down server, never more than a minute behind a recovered one.
-        long exponential = BASE_DELAY_SECONDS << Math.min(attempt - 1, 6);
-        return Math.min(MAX_DELAY_SECONDS, exponential);
     }
 }

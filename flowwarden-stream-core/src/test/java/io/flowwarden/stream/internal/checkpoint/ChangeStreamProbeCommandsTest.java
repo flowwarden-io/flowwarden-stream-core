@@ -39,7 +39,7 @@ class ChangeStreamProbeCommandsTest {
                 DeploymentMode.ALL_INSTANCES);
         return new ChangeStreamDefinition("probe-commands", "probe_commands", "", "",
                 new Object(), null, Map.of(), config, null, null,
-                null, null, null, null,
+                null, null, null, null, null,
                 new ErrorHandlerResolver(List.of()), Map.of());
     }
 

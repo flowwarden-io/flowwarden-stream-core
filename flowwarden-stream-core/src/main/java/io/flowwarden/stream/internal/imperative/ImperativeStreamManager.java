@@ -39,6 +39,7 @@ import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
 import io.flowwarden.stream.internal.discovery.StreamRegistry;
 import io.flowwarden.stream.internal.discovery.HandlerMethod;
 import io.flowwarden.stream.internal.StreamRestarter;
+import io.flowwarden.stream.internal.restart.RestartPolicyConfig;
 import io.flowwarden.stream.internal.discovery.PipelineMethod;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
 import io.flowwarden.stream.spi.ChangeEventMetadata;
@@ -183,6 +184,14 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
      */
     private final StreamRestarter restarter =
             new StreamRestarter("fw-stream-restart", new StreamRestarter.Callbacks() {
+                @Override
+                public RestartPolicyConfig policyFor(String streamName) {
+                    return registry.findByName(streamName)
+                            .map(ChangeStreamDefinition::restartPolicyAnnotation)
+                            .map(RestartPolicyConfig::fromAnnotation)
+                            .orElse(RestartPolicyConfig.DEFAULTS);
+                }
+
                 @Override
                 public void startStream(String streamName) {
                     ImperativeStreamManager.this.startStream(streamName);
