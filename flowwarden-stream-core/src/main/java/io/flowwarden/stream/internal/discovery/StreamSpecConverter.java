@@ -101,7 +101,19 @@ final class StreamSpecConverter {
                 deadLetterQueue,
                 mongoDlqOptions,
                 new ErrorHandlerResolver(errorHandlerMethods),
-                Collections.emptyMap());
+                metadata(spec));
+    }
+
+    /**
+     * The internal metadata the managers read when building
+     * {@code StreamConfiguration.handlers}: the {@code "handlers"} entry overrides
+     * the names derived from the registered handlers. The map stays internal —
+     * {@link StreamSpec#handlerNames()} is the public contract.
+     */
+    private static Map<String, Object> metadata(StreamSpec<?> spec) {
+        return spec.handlerNames().isEmpty()
+                ? Collections.emptyMap()
+                : Map.of("handlers", spec.handlerNames());
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})

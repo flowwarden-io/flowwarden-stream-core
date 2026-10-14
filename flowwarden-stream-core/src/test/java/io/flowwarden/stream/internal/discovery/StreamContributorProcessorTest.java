@@ -112,6 +112,29 @@ class StreamContributorProcessorTest {
     }
 
     @Test
+    void failsOnBlankHandlerName() {
+        contextRunner
+                .withUserConfiguration(BlankHandlerNameContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("blank handler name")
+                            .hasMessageContaining("blank-handler-name-stream");
+                });
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class BlankHandlerNameContributorConfig {
+        @Bean
+        StreamDefinitionContributor blankHandlerNameContributor() {
+            return registration -> registration.stream("blank-handler-name-stream", Order.class)
+                    .collection("orders")
+                    .handlerNames(java.util.List.of("JAVERS_INITIAL", " "))
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Test
     void failsOnNegativeStuckAfterProbesSameAsAnnotationPath() {
         contextRunner
                 .withUserConfiguration(InvalidStuckAfterProbesContributorConfig.class)
