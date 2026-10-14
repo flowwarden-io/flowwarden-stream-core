@@ -176,6 +176,17 @@ final class StreamDefinitionValidator {
         }
     }
 
+    /** Reported handler names are free-form labels, but a blank one would show as nothing. */
+    static void validateHandlerNames(String beanName, String subject, List<String> handlerNames) {
+        for (String name : handlerNames) {
+            if (name.isBlank()) {
+                throw new BeanCreationException(beanName,
+                        "Change Stream " + subject
+                                + " declares a blank handler name in handlerNames: " + handlerNames);
+            }
+        }
+    }
+
     static void validateDeadLetterQueue(String beanName, String subject, int retentionDays) {
         if (retentionDays < 0) {
             throw new BeanCreationException(beanName,

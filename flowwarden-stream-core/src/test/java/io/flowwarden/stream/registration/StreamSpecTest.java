@@ -129,6 +129,23 @@ class StreamSpecTest {
     }
 
     @Test
+    void handlerNamesDefaultToEmptyAreCopiedAndRejectNulls() {
+        StreamSpec<Object> plain = StreamSpec.builder("s", Object.class).collection("c").onChange(ctx -> { }).build();
+        assertTrue(plain.handlerNames().isEmpty());
+
+        java.util.List<String> mutable = new java.util.ArrayList<>(java.util.List.of("JAVERS_INITIAL"));
+        StreamSpec<Object> spec = StreamSpec.builder("s", Object.class).collection("c")
+                .handlerNames(mutable).onChange(ctx -> { }).build();
+        mutable.add("JAVERS_UPDATE");
+        assertEquals(java.util.List.of("JAVERS_INITIAL"), spec.handlerNames());
+        assertThrows(UnsupportedOperationException.class, () -> spec.handlerNames().add("x"));
+
+        assertThrows(NullPointerException.class, () -> StreamSpec.builder("s", Object.class).handlerNames(null));
+        assertThrows(NullPointerException.class, () -> StreamSpec.builder("s", Object.class)
+                .handlerNames(java.util.Arrays.asList("ok", null)));
+    }
+
+    @Test
     void checkpointSpecRejectsNullStartPosition() {
         assertThrows(NullPointerException.class, () -> CheckpointSpec.builder().startPosition(null));
     }

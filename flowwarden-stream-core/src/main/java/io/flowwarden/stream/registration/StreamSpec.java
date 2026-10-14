@@ -59,6 +59,9 @@ import java.util.function.Supplier;
  *   <li>The {@code @ChangeStream} attributes themselves — {@code collection}, {@code database},
  *       {@code mongoTemplateRef}, {@code enabled}, {@code autoStart}, {@code fullDocument},
  *       {@code fullDocumentBeforeChange}, {@code deploymentMode} and {@code zone}.</li>
+ *   <li>One thing annotations cannot express: {@link Builder#handlerNames(List)}, the names
+ *       monitoring reports for the stream's handlers, for a module that registers one
+ *       handler and routes internally.</li>
  * </ul>
  *
  * <p>What is covered goes through the exact same validation once contributed — see
@@ -89,6 +92,7 @@ public final class StreamSpec<T> {
     private final Supplier<List<Bson>> pipeline;
     private final Predicate<ChangeStreamContext<T>> filter;
     private final List<ErrorHandlerBinding> errorHandlers;
+    private final List<String> handlerNames;
 
     private StreamSpec(Builder<T> builder) {
         this.name = builder.name;
@@ -112,6 +116,7 @@ public final class StreamSpec<T> {
         this.pipeline = builder.pipeline;
         this.filter = builder.filter;
         this.errorHandlers = List.copyOf(builder.errorHandlers);
+        this.handlerNames = List.copyOf(builder.handlerNames);
     }
 
     public String name() {
@@ -211,6 +216,15 @@ public final class StreamSpec<T> {
     }
 
     /**
+     * The names monitoring reports for this stream's handlers (unmodifiable). Empty — the
+     * default — means the names are derived from the registered handlers; see
+     * {@link Builder#handlerNames(List)}.
+     */
+    public List<String> handlerNames() {
+        return handlerNames;
+    }
+
+    /**
      * Starts building a {@link StreamSpec}. Prefer {@link StreamRegistration#stream(String, Class)}
      * over calling this directly — it tracks the built spec for you.
      */
@@ -242,6 +256,7 @@ public final class StreamSpec<T> {
         private Supplier<List<Bson>> pipeline;
         private Predicate<ChangeStreamContext<T>> filter;
         private final List<ErrorHandlerBinding> errorHandlers = new ArrayList<>();
+        private List<String> handlerNames = List.of();
 
         Builder(String name, Class<T> documentType) {
             this.name = Objects.requireNonNull(name, "name must not be null");
@@ -426,6 +441,24 @@ public final class StreamSpec<T> {
                 throw new IllegalStateException("A filter is already registered on stream '" + name + "'");
             }
             this.filter = Objects.requireNonNull(filter, "filter must not be null");
+            return this;
+        }
+
+        /**
+         * The names under which monitoring presents this stream's handlers —
+         * {@code StreamConfiguration.handlers}, hence the reporter and the Console — in
+         * place of the ones derived from the registered handlers ({@code INSERT},
+         * {@code UPDATE}, …, {@code ON_CHANGE}).
+         *
+         * <p>For a module that registers a single handler and routes internally: a
+         * Javers stream dispatches its {@code @OnInitial}/{@code @OnUpdate}/{@code @OnTerminal}
+         * methods from one {@code onInsert} handler on the snapshot collection, and would
+         * otherwise be reported as handling {@code INSERT}. Purely informational — nothing
+         * in the delivery path reads it. An empty list (the default) keeps the derived
+         * names. Elements must not be blank (validated at bootstrap).</p>
+         */
+        public Builder<T> handlerNames(List<String> handlerNames) {
+            this.handlerNames = List.copyOf(Objects.requireNonNull(handlerNames, "handlerNames must not be null"));
             return this;
         }
 

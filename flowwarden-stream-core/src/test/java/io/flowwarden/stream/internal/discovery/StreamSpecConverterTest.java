@@ -124,6 +124,32 @@ class StreamSpecConverterTest {
     }
 
     @Test
+    void handlerNamesBecomeTheHandlersMetadataTheManagersReport() {
+        StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
+                .collection("orders")
+                .handlerNames(List.of("JAVERS_INITIAL", "JAVERS_UPDATE", "JAVERS_TERMINAL"))
+                .onChange(ctx -> { })
+                .build();
+
+        ChangeStreamDefinition definition = StreamSpecConverter.convert(spec, new Object(), "testBean");
+
+        assertEquals(List.of("JAVERS_INITIAL", "JAVERS_UPDATE", "JAVERS_TERMINAL"),
+                definition.metadata().get("handlers"));
+    }
+
+    @Test
+    void noHandlerNames_noMetadata_namesStayDerived() {
+        StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
+                .collection("orders")
+                .onChange(ctx -> { })
+                .build();
+
+        ChangeStreamDefinition definition = StreamSpecConverter.convert(spec, new Object(), "testBean");
+
+        assertTrue(definition.metadata().isEmpty());
+    }
+
+    @Test
     void passesTheZoneThrough() {
         StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
                 .collection("orders")

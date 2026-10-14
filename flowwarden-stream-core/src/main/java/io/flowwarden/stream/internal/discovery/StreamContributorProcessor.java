@@ -105,6 +105,8 @@ public class StreamContributorProcessor implements SmartInitializingSingleton {
         spec.restartPolicy().ifPresent(rp -> StreamDefinitionValidator.validateRestartPolicy(beanName, subject,
                 rp.maxAttempts(), rp.multiplier(), rp.initialDelay(), rp.maxDelay()));
 
+        StreamDefinitionValidator.validateHandlerNames(beanName, subject, spec.handlerNames());
+
         spec.deadLetterQueue().ifPresent(dlq -> StreamDefinitionValidator.validateDeadLetterQueue(beanName, subject,
                 dlq.retentionDays()));
 
