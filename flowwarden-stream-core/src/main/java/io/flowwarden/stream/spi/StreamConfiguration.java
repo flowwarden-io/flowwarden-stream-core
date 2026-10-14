@@ -54,8 +54,20 @@ public record StreamConfiguration(
             int saveEveryN,
             int saveIntervalSeconds,
             int idleHeartbeatIntervalSeconds,
+            int stuckAfterProbes,
             String startPosition,
             String onHistoryLost) {
+
+        /**
+         * Convenience constructor without {@code stuckAfterProbes}, preserved
+         * for callers predating stuck-stream detection ({@code 0} = off).
+         */
+        public CheckpointConfig(int saveEveryN, int saveIntervalSeconds,
+                                int idleHeartbeatIntervalSeconds,
+                                String startPosition, String onHistoryLost) {
+            this(saveEveryN, saveIntervalSeconds, idleHeartbeatIntervalSeconds, 0,
+                    startPosition, onHistoryLost);
+        }
 
         /**
          * Convenience constructor without {@code idleHeartbeatIntervalSeconds},
@@ -63,7 +75,7 @@ public record StreamConfiguration(
          */
         public CheckpointConfig(int saveEveryN, int saveIntervalSeconds,
                                 String startPosition, String onHistoryLost) {
-            this(saveEveryN, saveIntervalSeconds, 0, startPosition, onHistoryLost);
+            this(saveEveryN, saveIntervalSeconds, 0, 0, startPosition, onHistoryLost);
         }
     }
 

@@ -135,6 +135,7 @@ final class StreamSpecConverter {
                 "saveEveryN", spec.saveEveryN(),
                 "saveIntervalSeconds", spec.saveIntervalSeconds(),
                 "idleHeartbeatIntervalSeconds", spec.idleHeartbeatIntervalSeconds(),
+                "stuckAfterProbes", spec.stuckAfterProbes(),
                 "startPosition", spec.startPosition(),
                 "onHistoryLost", spec.onHistoryLost()
         ), Checkpoint.class, null);

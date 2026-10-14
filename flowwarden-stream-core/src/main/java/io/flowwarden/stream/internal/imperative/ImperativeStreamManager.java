@@ -38,7 +38,11 @@ import io.flowwarden.stream.internal.dlq.MongoDlqStore;
 import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
 import io.flowwarden.stream.internal.discovery.StreamRegistry;
 import io.flowwarden.stream.internal.discovery.HandlerMethod;
+import io.flowwarden.stream.StreamStuckException;
 import io.flowwarden.stream.internal.StreamRestarter;
+import io.flowwarden.stream.internal.checkpoint.HeartbeatProbe;
+import io.flowwarden.stream.internal.checkpoint.LivenessGate;
+import io.flowwarden.stream.internal.checkpoint.StreamLiveness;
 import io.flowwarden.stream.internal.restart.RestartPolicyConfig;
 import io.flowwarden.stream.internal.discovery.PipelineMethod;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
@@ -172,9 +176,10 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             AtomicReference<Subscription> subscriptionHolder,
             ChangeStreamDefinition definition,
             AtomicBoolean terminated,
-            ImperativeHeartbeatProbe probe,
+            HeartbeatProbe probe,
             AtomicReference<OperationType> pendingInvalidateCause,
-            AtomicBoolean invalidatedTerminal) {
+            AtomicBoolean invalidatedTerminal,
+            LivenessGate dispatchGate) {
     }
 
     /**
@@ -285,15 +290,29 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         List<Document> resolvedPipeline = def.pipelineMethod() != null
                 ? def.pipelineMethod().resolve(def.bean())
                 : List.of();
-        ImperativeHeartbeatProbe probe =
-                new ImperativeHeartbeatProbe(streamTemplate, def, resolvedPipeline);
+        HeartbeatProbe probe = createHeartbeatProbe(streamTemplate, def, resolvedPipeline);
         StreamState state = new StreamState(container, new AtomicReference<>(), def,
                 new AtomicBoolean(false), probe,
-                new AtomicReference<>(), new AtomicBoolean(false));
+                new AtomicReference<>(), new AtomicBoolean(false), new LivenessGate());
 
         MessageListener<ChangeStreamDocument<Document>, Document> listener =
                 new FlowWardenMessageListenerWrapper(
-                        message -> handleMessage(message, def, state),
+                        message -> {
+                            // Dispatch gate for the stuck-stream verdict:
+                            // claimed for the whole dispatch — filter,
+                            // handler, retries, @OnError, settlement. A
+                            // generation declared stuck drops the event; the
+                            // restart applies StartPosition — redelivered
+                            // under RESUME, skipped under LATEST.
+                            if (!state.dispatchGate().enterHandling()) {
+                                return;
+                            }
+                            try {
+                                handleMessage(message, def, state);
+                            } finally {
+                                state.dispatchGate().exitHandling();
+                            }
+                        },
                         def.streamName(),
                         // Lock-free termination signal FIRST (a startStream
                         // holding the lifecycle lock must see the death of
@@ -398,7 +417,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                     .set(new TokenSnapshot(seedToken, Instant.now(), TokenSnapshot.Source.SEED));
         }
 
-        scheduleIntervalCheckpoint(def, probe, resumeContext);
+        scheduleIntervalCheckpoint(def, probe, resumeContext, state);
         log.info("Started Change Stream '{}' on collection '{}'", streamName, def.collection());
 
         FlowWardenMetrics.get().onStreamStarted(streamName, buildStreamConfiguration(def, "IMPERATIVE"));
@@ -531,6 +550,31 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             log.warn("Failed to cancel subscription for stream '{}': {}",
                     streamName, e.getMessage());
         }
+    }
+
+    /** Heartbeat probe factory — package-private seam for harness tests. */
+    HeartbeatProbe createHeartbeatProbe(MongoTemplate streamTemplate, ChangeStreamDefinition def,
+                                        List<Document> resolvedPipeline) {
+        return new ImperativeHeartbeatProbe(streamTemplate, def, resolvedPipeline);
+    }
+
+    /**
+     * Stuck verdict from the idle heartbeat (probe scheduler thread): the
+     * cursor stopped delivering without the driver ever saying so. Same
+     * lifecycle path as a cursor error — terminated CAS, {@code CRASHED}
+     * with the verdict as cause, generation-safe eviction, restart hand-off
+     * — then the hung subscription is cancelled best-effort, AFTER the
+     * hand-off so that its death throe (if the container reports one) is
+     * absorbed by the terminated flag. The reading thread may stay blocked
+     * inside the driver until the client's socket timeout: a leak bounded
+     * by the application's own Mongo settings, not by this library.
+     */
+    private void declareStuck(String streamName, StreamState state, StreamStuckException cause) {
+        if (streams.get(streamName) != state) {
+            return; // stale generation — a newer stream owns the name
+        }
+        handleStreamError(streamName, state, cause);
+        cancelSubscriptionBestEffort(streamName, state.subscriptionHolder().get());
     }
 
     @Override
@@ -1297,8 +1341,9 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
     }
 
     private void scheduleIntervalCheckpoint(ChangeStreamDefinition def,
-                                            ImperativeHeartbeatProbe probe,
-                                            ResumeContext resumeContext) {
+                                            HeartbeatProbe probe,
+                                            ResumeContext resumeContext,
+                                            StreamState state) {
         if (def.checkpointAnnotation() == null) {
             return;
         }
@@ -1329,7 +1374,19 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                 Duration.ofSeconds(idleSeconds),
                 resumeContext.initialOperationTime(),
                 resumeContext.deadProcessedToken(),
-                processedPolicies.get(streamName));
+                processedPolicies.get(streamName),
+                def.checkpointAnnotation().stuckAfterProbes(),
+                new StreamLiveness() {
+                    @Override
+                    public boolean claimStuck() {
+                        return state.dispatchGate().claimStuck();
+                    }
+
+                    @Override
+                    public void onStuck(StreamStuckException cause) {
+                        declareStuck(streamName, state, cause);
+                    }
+                });
         heartbeats.put(streamName, heartbeat);
         if (flushSeconds > 0) {
             intervalTasks.put(streamName, intervalScheduler.scheduleAtFixedRate(
@@ -1427,7 +1484,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
             var cp = def.checkpointAnnotation();
             cpConfig = new StreamConfiguration.CheckpointConfig(
                     cp.saveEveryN(), cp.saveIntervalSeconds(),
-                    cp.idleHeartbeatIntervalSeconds(),
+                    cp.idleHeartbeatIntervalSeconds(), cp.stuckAfterProbes(),
                     cp.startPosition().name(), cp.onHistoryLost().name());
         }
 

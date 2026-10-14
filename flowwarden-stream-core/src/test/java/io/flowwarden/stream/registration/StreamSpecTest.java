@@ -56,6 +56,7 @@ class StreamSpecTest {
         assertEquals(1, defaults.saveEveryN());
         assertEquals(5, defaults.saveIntervalSeconds());
         assertEquals(300, defaults.idleHeartbeatIntervalSeconds());
+        assertEquals(3, defaults.stuckAfterProbes());
     }
 
     @Test

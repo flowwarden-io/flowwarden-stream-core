@@ -173,6 +173,47 @@ public @interface Checkpoint {
     int idleHeartbeatIntervalSeconds() default 300;
 
     /**
+     * Consecutive idle-probe <em>abstentions</em> after which the stream is
+     * declared stuck and handed to the managed restart loop. Default
+     * {@code 3}; set {@code 0} to keep the stream running whatever the
+     * probe sees.
+     *
+     * <p>A cursor can stop delivering without the driver ever saying so — a
+     * half-open connection with the client's default {@code socketTimeoutMS}
+     * of {@code 0} leaves the {@code getMore} hanging forever, in both
+     * modes. The stream then reports running, the idle probe keeps its resume
+     * point fresh, and nothing is processed. The probe already sees the
+     * symptom: when it abstains, matching events exist that the stream has
+     * not delivered. This attribute turns a streak of such abstentions into
+     * a verdict.</p>
+     *
+     * <p>Only abstentions with <strong>no delivery in between</strong> count
+     * (any settled event resets the streak), only idle probes count (the
+     * startup diagnostic and recovery probes never do), and a stream with a
+     * handler in flight is never declared stuck — a slow handler or a retry
+     * in backoff holds the settled position still exactly like a dead cursor
+     * would, and must not be restarted mid-handler. Detection therefore
+     * takes about {@code stuckAfterProbes × idleHeartbeatIntervalSeconds}
+     * (15 minutes with the defaults) and needs traffic on the collection: a
+     * dead cursor with nothing to deliver is undetectable and harmless.</p>
+     *
+     * <p>The verdict takes the runtime-death path: the stream is reported
+     * stopped with {@code CRASHED} and a {@link io.flowwarden.stream.StreamStuckException}
+     * as cause, then resubscribed on the {@code @RestartPolicy} cadence,
+     * exactly like after a cursor error. Where it resumes is
+     * {@link #startPosition()}'s call, as for every restart: under
+     * {@code RESUME} the cascade restarts from {@code lastProcessedToken} and
+     * nothing is lost; under {@code LATEST} the new cursor starts from now,
+     * and the events the hung cursor never delivered are skipped — the loss
+     * {@code LATEST} accepts on any restart. The hung reading thread may
+     * stay blocked in the driver until the client's socket timeout, which is
+     * why setting {@code socketTimeoutMS} remains the right companion.
+     * Implicitly off when {@link #idleHeartbeatIntervalSeconds()} is
+     * {@code 0}.</p>
+     */
+    int stuckAfterProbes() default 3;
+
+    /**
      * Where to start consuming on (re)start.
      * {@link StartPosition#RESUME} applies the 3-level cascade.
      * {@link StartPosition#LATEST} ignores both persisted anchors and starts from now.
