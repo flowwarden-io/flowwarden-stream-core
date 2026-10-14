@@ -16,6 +16,7 @@
 package io.flowwarden.stream.internal.checkpoint;
 
 import io.flowwarden.stream.FlowWardenMetrics;
+import io.flowwarden.stream.StreamStuckException;
 import io.flowwarden.stream.spi.CheckpointStore;
 import org.bson.BsonDocument;
 import org.slf4j.Logger;
@@ -119,8 +120,27 @@ public final class CheckpointHeartbeat {
      */
     private BsonDocument lastCertifiedSeen;
 
-    /** Consecutive EVENT_PENDING outcomes. Guarded by {@link #lock}. */
+    /**
+     * Consecutive idle-probe EVENT_PENDING outcomes with no delivery in
+     * between ({@link #abstentionStreakSnapshot} unchanged). Startup and
+     * establishment probes ({@link #probeNow()}) never count: an abstention
+     * right after start is the stream catching up. Guarded by {@link #lock}.
+     */
     private int consecutiveAbstentions;
+
+    /**
+     * The settled-token snapshot the current abstention streak started on.
+     * Any delivery installs a new snapshot object, which resets the streak:
+     * a stream that delivers between two abstentions is lagging, not stuck.
+     * Guarded by {@link #lock}.
+     */
+    private TokenSnapshot abstentionStreakSnapshot;
+
+    /** Consecutive idle abstentions before the stream is declared stuck; {@code 0} = never. */
+    private final int stuckAfterProbes;
+
+    /** Manager hooks for the stuck verdict; {@code null} when detection is off. */
+    private final StreamLiveness liveness;
 
     /**
      * Last time {@link #idleTick()} actually ran a probe. The idle check
@@ -158,7 +178,9 @@ public final class CheckpointHeartbeat {
                                Duration idleThreshold,
                                org.bson.BsonTimestamp initialOperationTime,
                                BsonDocument deadProcessedToken,
-                               ProcessedAnchorPolicy processedPolicy) {
+                               ProcessedAnchorPolicy processedPolicy,
+                               int stuckAfterProbes,
+                               StreamLiveness liveness) {
         this.streamName = streamName;
         this.checkpointStore = checkpointStore;
         this.probe = probe;
@@ -169,6 +191,8 @@ public final class CheckpointHeartbeat {
         this.pendingHistoryLostReset = initialOperationTime != null;
         this.deadProcessedToken = deadProcessedToken;
         this.processedPolicy = processedPolicy;
+        this.stuckAfterProbes = liveness != null ? stuckAfterProbes : 0;
+        this.liveness = liveness;
     }
 
     /**
@@ -233,6 +257,7 @@ public final class CheckpointHeartbeat {
         if (cancelled) {
             return;
         }
+        StreamStuckException stuck = null;
         lock.lock();
         try {
             Instant now = Instant.now();
@@ -248,12 +273,22 @@ public final class CheckpointHeartbeat {
                 return; // probes stay spaced a full interval apart
             }
             lastIdleProbeAt = now;
-            runProbe(snapshot);
+            stuck = runProbe(snapshot, true);
         } catch (Exception e) {
             FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
             log.warn("Failed idle heartbeat for stream '{}': {}", streamName, e.getMessage(), e);
         } finally {
             lock.unlock();
+        }
+        if (stuck != null) {
+            // Outside the lock: the manager's death path takes its own
+            // lifecycle lock and must never nest inside the heartbeat's.
+            try {
+                liveness.onStuck(stuck);
+            } catch (Exception e) {
+                log.warn("Stuck-stream hand-off failed for stream '{}': {}",
+                        streamName, e.getMessage(), e);
+            }
         }
     }
 
@@ -273,7 +308,7 @@ public final class CheckpointHeartbeat {
         }
         lock.lock();
         try {
-            runProbe(latestTokenRef.get().get());
+            runProbe(latestTokenRef.get().get(), false);
         } catch (Exception e) {
             FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
             log.warn("Heartbeat probe failed for stream '{}': {}",
@@ -283,7 +318,15 @@ public final class CheckpointHeartbeat {
         }
     }
 
-    private void runProbe(TokenSnapshot snapshot) {
+    /**
+     * Runs one probe. Returns the stuck verdict when an <em>idle</em> probe
+     * completes an abstention streak that reaches {@code stuckAfterProbes}
+     * with no delivery in between (not even during the probe itself) and the
+     * generation's gate was claimed (no handler in flight, none can start) —
+     * the heartbeat is then already cancelled; the caller hands the verdict
+     * to the manager outside the lock. Caller holds the lock.
+     */
+    private StreamStuckException runProbe(TokenSnapshot snapshot, boolean idleProbe) {
         BsonDocument chainToken = snapshot != null ? snapshot.token()
                 : (allowPersistedFallback ? persistedSeenToken() : null);
         ProbeOutcome outcome;
@@ -299,7 +342,7 @@ public final class CheckpointHeartbeat {
             // no event yet). Probing from "now" is unsafe — skip.
             log.debug("Heartbeat probe skipped for stream '{}': no position to chain from",
                     streamName);
-            return;
+            return null;
         }
         switch (outcome.type()) {
             case EVENT_PENDING -> {
@@ -307,7 +350,54 @@ public final class CheckpointHeartbeat {
                 // head — the main stream must deliver them first. A certified
                 // position never crosses unsettled work. Repeated abstentions
                 // mean the stream is lagging or stuck.
+                if (!idleProbe) {
+                    log.debug("Heartbeat abstained for stream '{}': events pending delivery",
+                            streamName);
+                    return null;
+                }
+                if (latestTokenRef.get().get() != snapshot) {
+                    // The stream settled an event WHILE the probe was in
+                    // flight: this abstention chained from a position the
+                    // stream has since moved past — stale, and proof the
+                    // stream is moving. Never counted; the streak restarts.
+                    consecutiveAbstentions = 0;
+                    abstentionStreakSnapshot = null;
+                    log.debug("Heartbeat abstention for stream '{}' is stale — the stream "
+                            + "delivered during the probe", streamName);
+                    return null;
+                }
+                if (abstentionStreakSnapshot != snapshot) {
+                    // A delivery happened since the streak started (or this
+                    // is the first abstention): the stream is moving.
+                    consecutiveAbstentions = 0;
+                    abstentionStreakSnapshot = snapshot;
+                }
                 consecutiveAbstentions++;
+                if (stuckAfterProbes > 0 && consecutiveAbstentions >= stuckAfterProbes) {
+                    if (!liveness.claimStuck()) {
+                        // Lagging, not stuck: a slow handler or a retry in
+                        // backoff holds the settled snapshot still exactly
+                        // like a dead cursor would. Its settlement will reset
+                        // the streak; a dead cursor's never will. The claim is
+                        // a CAS on the generation's gate: a handler that
+                        // starts concurrently either wins (we defer) or loses
+                        // (it never runs — the generation is dead).
+                        log.info("Heartbeat probe abstained {} consecutive times for stream '{}' "
+                                        + "with a handler in flight — lagging, verdict deferred",
+                                consecutiveAbstentions, streamName);
+                        return null;
+                    }
+                    Instant now = Instant.now();
+                    Duration stuckFor = snapshot != null
+                            ? Duration.between(snapshot.timestamp(), now)
+                            : idleThreshold.multipliedBy(consecutiveAbstentions);
+                    cancelled = true; // this heartbeat's stream is about to be evicted
+                    log.error("Stream '{}' declared stuck: {} consecutive idle probes found events "
+                                    + "waiting undelivered while nothing was delivered for {} and no "
+                                    + "handler was running — handing the stream to the restart loop",
+                            streamName, consecutiveAbstentions, stuckFor);
+                    return new StreamStuckException(streamName, consecutiveAbstentions, stuckFor);
+                }
                 if (consecutiveAbstentions == ABSTENTION_WARN_THRESHOLD) {
                     log.warn("Heartbeat probe abstained {} consecutive times for stream '{}': "
                                     + "matching events keep sitting undelivered — the main stream "
@@ -330,6 +420,7 @@ public final class CheckpointHeartbeat {
                 persistCertifiedPosition(snapshot, chainToken, outcome.pbrt(), Instant.now());
             }
         }
+        return null;
     }
 
     private void persistCertifiedPosition(TokenSnapshot snapshot,

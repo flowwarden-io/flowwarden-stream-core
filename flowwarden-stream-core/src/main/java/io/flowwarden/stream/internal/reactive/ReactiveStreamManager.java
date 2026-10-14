@@ -40,7 +40,11 @@ import reactor.util.retry.Retry;
 import io.flowwarden.stream.internal.discovery.StreamRegistry;
 import io.flowwarden.stream.internal.discovery.HandlerMethod;
 import io.flowwarden.stream.internal.discovery.PipelineMethod;
+import io.flowwarden.stream.StreamStuckException;
 import io.flowwarden.stream.internal.StreamRestarter;
+import io.flowwarden.stream.internal.checkpoint.HeartbeatProbe;
+import io.flowwarden.stream.internal.checkpoint.LivenessGate;
+import io.flowwarden.stream.internal.checkpoint.StreamLiveness;
 import io.flowwarden.stream.internal.restart.RestartPolicyConfig;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
 import io.flowwarden.stream.spi.ChangeEventMetadata;
@@ -160,10 +164,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             ChangeStreamDefinition definition,
             AtomicBoolean gracefulStop,
             AtomicReference<Throwable> lastError,
-            ReactiveHeartbeatProbe probe,
+            HeartbeatProbe probe,
             AtomicReference<OperationType> pendingInvalidateCause,
             AtomicBoolean invalidatedTerminal,
-            AtomicBoolean terminated) {
+            AtomicBoolean terminated,
+            LivenessGate dispatchGate) {
     }
 
     /**
@@ -271,8 +276,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         List<Document> resolvedPipeline = def.pipelineMethod() != null
                 ? def.pipelineMethod().resolve(def.bean())
                 : List.of();
-        ReactiveHeartbeatProbe probe =
-                new ReactiveHeartbeatProbe(streamTemplate, def, resolvedPipeline);
+        HeartbeatProbe probe = createHeartbeatProbe(streamTemplate, def, resolvedPipeline);
 
         ResumeContext resumeContext = ResumeContext.NONE;
         if (def.checkpointAnnotation() != null
@@ -332,7 +336,8 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
         ReactiveStreamState state =
                 new ReactiveStreamState(disposableHolder, def, gracefulStop, lastError, probe,
-                        new AtomicReference<>(), new AtomicBoolean(false), terminated);
+                        new AtomicReference<>(), new AtomicBoolean(false), terminated,
+                        new LivenessGate());
         // The processed-anchor policy is installed before any delivery can
         // settle: the delivery path, the flush timer and the manual save
         // all serialize their writes through it.
@@ -341,7 +346,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     streamName, checkpointStore, def.checkpointAnnotation().saveEveryN()));
         }
         streams.put(streamName, state);
-        scheduleIntervalCheckpoint(def, probe, resumeContext);
+        scheduleIntervalCheckpoint(def, probe, resumeContext, state);
 
         Disposable disposable = stampedForStream(streamTemplate, streamName)
                 .changeStream(def.collection(), options, Document.class)
@@ -357,13 +362,40 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 // handleEventReactive stays: a user-returned Mono may complete
                 // on any scheduler, and the settlement side-effects on its
                 // completion need the same blocking-safe discipline.
-                .concatMap(event -> Mono.defer(() -> {
+                .concatMap(event -> {
                     ChangeStreamDocument<Document> raw = event.getRaw();
-                    if (raw != null) {
-                        return handleEventReactive(raw, def, state);
+                    if (raw == null) {
+                        return Mono.empty();
                     }
-                    return Mono.empty();
-                }).subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic()))
+                    // Dispatch gate for the stuck-stream verdict, claimed
+                    // HERE — on receipt, before the boundedElastic hop — so
+                    // an event waiting for a worker already counts as in
+                    // flight. Held for the whole dispatch (filter, handler,
+                    // retries, @OnError, settlement). A generation declared
+                    // stuck drops the event; the restart applies
+                    // StartPosition — redelivered under RESUME, skipped
+                    // under LATEST.
+                    if (!state.dispatchGate().enterHandling()) {
+                        return Mono.empty();
+                    }
+                    // Released BEFORE the terminal signal propagates
+                    // (doOnTerminate / doOnCancel, not doFinally): concatMap
+                    // maps the next event as soon as this one completes, and
+                    // its own enterHandling() must find the gate IDLE — a
+                    // doFinally would run after that mapping and drop the
+                    // event. The release is tied to THIS dispatch and
+                    // idempotent across the two hooks.
+                    AtomicBoolean released = new AtomicBoolean(false);
+                    Runnable release = () -> {
+                        if (released.compareAndSet(false, true)) {
+                            state.dispatchGate().exitHandling();
+                        }
+                    };
+                    return Mono.defer(() -> handleEventReactive(raw, def, state))
+                            .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
+                            .doOnTerminate(release)
+                            .doOnCancel(release);
+                })
                 .doOnError(e -> {
                     lastError.set(e);
                     log.error("Error in reactive Change Stream '{}': {}",
@@ -487,6 +519,35 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
      * ownership claim and the restarter hand-off.
      */
     volatile Runnable deathHandoffTestHook;
+
+    /** Heartbeat probe factory — package-private seam for harness tests. */
+    HeartbeatProbe createHeartbeatProbe(ReactiveMongoTemplate streamTemplate, ChangeStreamDefinition def,
+                                        List<Document> resolvedPipeline) {
+        return new ReactiveHeartbeatProbe(streamTemplate, def, resolvedPipeline);
+    }
+
+    /**
+     * Stuck verdict from the idle heartbeat (probe scheduler thread): the
+     * cursor stopped delivering without the driver ever saying so. The
+     * verdict becomes the generation's {@code lastError} and the pipeline is
+     * disposed: its termination path, running synchronously on this thread,
+     * classifies a non-graceful termination as a runtime death — crash
+     * signal with the verdict as cause, generation-safe eviction, restart
+     * hand-off. The driver's hung {@code getMore} is cancelled
+     * asynchronously and may hold its thread until the client's socket
+     * timeout.
+     */
+    private void declareStuck(String streamName, ReactiveStreamState state, StreamStuckException cause) {
+        if (streams.get(streamName) != state || state.terminated().get()) {
+            return; // stale generation, or already terminating
+        }
+        state.lastError().set(cause);
+        log.error("Change stream cursor appears dead for stream '{}': {}", streamName, cause.getMessage());
+        Disposable disposable = state.disposableHolder().get();
+        if (disposable != null) {
+            disposable.dispose();
+        }
+    }
 
     @Override
     public void stopStream(String streamName) {
@@ -1145,8 +1206,9 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     }
 
     private void scheduleIntervalCheckpoint(ChangeStreamDefinition def,
-                                            ReactiveHeartbeatProbe probe,
-                                            ResumeContext resumeContext) {
+                                            HeartbeatProbe probe,
+                                            ResumeContext resumeContext,
+                                            ReactiveStreamState state) {
         if (def.checkpointAnnotation() == null) {
             return;
         }
@@ -1177,7 +1239,19 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 Duration.ofSeconds(idleSeconds),
                 resumeContext.initialOperationTime(),
                 resumeContext.deadProcessedToken(),
-                processedPolicies.get(streamName));
+                processedPolicies.get(streamName),
+                def.checkpointAnnotation().stuckAfterProbes(),
+                new StreamLiveness() {
+                    @Override
+                    public boolean claimStuck() {
+                        return state.dispatchGate().claimStuck();
+                    }
+
+                    @Override
+                    public void onStuck(StreamStuckException cause) {
+                        declareStuck(streamName, state, cause);
+                    }
+                });
         heartbeats.put(streamName, heartbeat);
         if (flushSeconds > 0) {
             intervalTasks.put(streamName, intervalScheduler.scheduleAtFixedRate(
@@ -1305,7 +1379,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             var cp = def.checkpointAnnotation();
             cpConfig = new StreamConfiguration.CheckpointConfig(
                     cp.saveEveryN(), cp.saveIntervalSeconds(),
-                    cp.idleHeartbeatIntervalSeconds(),
+                    cp.idleHeartbeatIntervalSeconds(), cp.stuckAfterProbes(),
                     cp.startPosition().name(), cp.onHistoryLost().name());
         }
 

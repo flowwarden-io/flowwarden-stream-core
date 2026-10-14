@@ -88,6 +88,29 @@ class StreamContributorProcessorTest {
     }
 
     @Test
+    void failsOnNegativeStuckAfterProbesSameAsAnnotationPath() {
+        contextRunner
+                .withUserConfiguration(InvalidStuckAfterProbesContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@Checkpoint")
+                            .hasMessageContaining("negative stuckAfterProbes");
+                });
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidStuckAfterProbesContributorConfig {
+        @Bean
+        StreamDefinitionContributor invalidStuckAfterProbesContributor() {
+            return registration -> registration.stream("invalid-stuck-stream", Order.class)
+                    .collection("orders")
+                    .checkpoint(CheckpointSpec.builder().stuckAfterProbes(-1).build())
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Test
     void failsOnInvalidRetryPolicySameAsAnnotationPath() {
         // Parity check: an invalid RetryPolicySpec fails for the same reason as the
         // equivalent invalid @RetryPolicy (see ChangeStreamBeanPostProcessorValidationTest).

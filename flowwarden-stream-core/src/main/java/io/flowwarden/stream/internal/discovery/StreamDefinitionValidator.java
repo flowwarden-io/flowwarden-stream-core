@@ -54,7 +54,14 @@ final class StreamDefinitionValidator {
     }
 
     static void validateCheckpoint(String beanName, String subject, int saveEveryN,
-                                    int saveIntervalSeconds, int idleHeartbeatIntervalSeconds) {
+                                    int saveIntervalSeconds, int idleHeartbeatIntervalSeconds,
+                                    int stuckAfterProbes) {
+        if (stuckAfterProbes < 0) {
+            throw new BeanCreationException(beanName,
+                    "@Checkpoint on " + subject
+                            + " has negative stuckAfterProbes: " + stuckAfterProbes
+                            + ". Must be >= 0 (0 = never declare the stream stuck).");
+        }
         if (saveIntervalSeconds < 0) {
             throw new BeanCreationException(beanName,
                     "@Checkpoint on " + subject
@@ -75,7 +82,8 @@ final class StreamDefinitionValidator {
         if (idleHeartbeatIntervalSeconds == 0) {
             log.warn("@Checkpoint on {} has idleHeartbeatIntervalSeconds=0 — idle probing is "
                             + "disabled, so a stream that stays idle longer than the oplog window "
-                            + "loses its resume point (ChangeStreamHistoryLost on restart). "
+                            + "loses its resume point (ChangeStreamHistoryLost on restart), and "
+                            + "stuck-stream detection (stuckAfterProbes) is off with it. "
                             + "Only disable this if the collection is guaranteed to receive "
                             + "regular traffic.",
                     subject);

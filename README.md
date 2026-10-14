@@ -218,7 +218,7 @@ All stream-level settings are configured via annotations on your `@ChangeStream`
 
 | Annotation | Purpose | Key defaults |
 |------------|---------|--------------|
-| `@Checkpoint` | Durable anchor persistence (at-least-once resume) | `saveEveryN = 1` (persist after N settled events), `saveIntervalSeconds = 5` (max age of an unpersisted anchor — whichever threshold is hit first), `idleHeartbeatIntervalSeconds = 300` (idle-stream oplog-rollover protection, `0` opts out), `startPosition = RESUME` |
+| `@Checkpoint` | Durable anchor persistence (at-least-once resume) | `saveEveryN = 1` (persist after N settled events), `saveIntervalSeconds = 5` (max age of an unpersisted anchor — whichever threshold is hit first), `idleHeartbeatIntervalSeconds = 300` (idle-stream oplog-rollover protection, `0` opts out), `stuckAfterProbes = 3` (consecutive idle probes finding undelivered events before a hung cursor is declared stuck and resubscribed, `0` opts out), `startPosition = RESUME` |
 | `@RetryPolicy` | Exponential backoff on failure | `maxAttempts = 3`, `initialDelay = "500ms"`, `multiplier = 2.0`, `maxDelay = "30s"`, `jitter = true` |
 | `@RestartPolicy` | Backoff and ceiling of the managed restart loop after a runtime cursor death | `maxAttempts = 0` (unlimited), `initialDelay = "1s"`, `multiplier = 2.0`, `maxDelay = "60s"`, `jitter = false` |
 | `@DeadLetterQueue` | Route failed events to a DLQ (backend-agnostic) | `enabled = true`, `retentionDays = 30` |
