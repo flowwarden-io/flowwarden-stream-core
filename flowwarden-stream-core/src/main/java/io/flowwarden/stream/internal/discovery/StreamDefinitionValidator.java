@@ -97,11 +97,15 @@ final class StreamDefinitionValidator {
                             + " has invalid maxAttempts: " + maxAttempts
                             + ". Must be >= 1.");
         }
-        if (multiplier <= 0) {
+        // NaN compares false against everything, so a plain `<= 0` would let
+        // it through — and an infinite multiplier would silently collapse to
+        // maxDelay from the second attempt on. Both are rejected explicitly;
+        // a multiplier below 1 (a shrinking cadence) stays legitimate here.
+        if (!Double.isFinite(multiplier) || multiplier <= 0) {
             throw new BeanCreationException(beanName,
                     "@RetryPolicy on " + subject
                             + " has invalid multiplier: " + multiplier
-                            + ". Must be > 0.");
+                            + ". Must be a finite number > 0.");
         }
         try {
             RetryPolicyConfig.parseDuration(initialDelay);

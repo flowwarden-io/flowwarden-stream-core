@@ -45,13 +45,24 @@ public @interface RetryPolicy {
     /** Maximum number of attempts (including the initial one). */
     int maxAttempts() default 3;
 
-    /** Initial delay before the first retry. Supports "500ms", "1s", "1m" format. */
+    /**
+     * Initial delay before the first retry. Supports "500ms", "1s", "1m" format.
+     * {@code "0ms"} is an explicit opt-in to immediate retries (every delay is
+     * zero); any positive value is never truncated to zero by the multiplier or
+     * the jitter — the computed delay is floored at 1 ms.
+     */
     String initialDelay() default "500ms";
 
-    /** Maximum delay cap. Supports "500ms", "1s", "1m" format. */
+    /**
+     * Maximum delay cap. Supports "500ms", "1s", "1m" format. {@code "0ms"}
+     * makes every retry immediate, like a zero {@link #initialDelay()}.
+     */
     String maxDelay() default "30s";
 
-    /** Multiplier applied to the delay between each retry. */
+    /**
+     * Multiplier applied to the delay between each retry. Must be a finite
+     * number {@code > 0}; a value below 1 shrinks the delay between retries.
+     */
     double multiplier() default 2.0;
 
     /**

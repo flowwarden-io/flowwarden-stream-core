@@ -88,6 +88,30 @@ class StreamContributorProcessorTest {
     }
 
     @Test
+    void failsOnNaNRetryMultiplierSameAsAnnotationPath() {
+        contextRunner
+                .withUserConfiguration(NaNRetryContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RetryPolicy")
+                            .hasMessageContaining("multiplier: NaN");
+                });
+    }
+
+    @Test
+    void failsOnInfiniteRetryMultiplierSameAsAnnotationPath() {
+        contextRunner
+                .withUserConfiguration(InfiniteRetryContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RetryPolicy")
+                            .hasMessageContaining("multiplier: Infinity");
+                });
+    }
+
+    @Test
     void failsOnInvalidRetryPolicySameAsAnnotationPath() {
         // Parity check: an invalid RetryPolicySpec fails for the same reason as the
         // equivalent invalid @RetryPolicy (see ChangeStreamBeanPostProcessorValidationTest).
@@ -294,6 +318,28 @@ class StreamContributorProcessorTest {
             return registration -> registration.stream("invalid-retry-stream", Order.class)
                     .collection("orders")
                     .retryPolicy(RetryPolicySpec.builder().multiplier(-1.0).build())
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class NaNRetryContributorConfig {
+        @Bean
+        StreamDefinitionContributor nanRetryContributor() {
+            return registration -> registration.stream("nan-retry-stream", Order.class)
+                    .collection("orders")
+                    .retryPolicy(RetryPolicySpec.builder().multiplier(Double.NaN).build())
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InfiniteRetryContributorConfig {
+        @Bean
+        StreamDefinitionContributor infiniteRetryContributor() {
+            return registration -> registration.stream("infinite-retry-stream", Order.class)
+                    .collection("orders")
+                    .retryPolicy(RetryPolicySpec.builder().multiplier(Double.POSITIVE_INFINITY).build())
                     .onChange(ctx -> { });
         }
     }

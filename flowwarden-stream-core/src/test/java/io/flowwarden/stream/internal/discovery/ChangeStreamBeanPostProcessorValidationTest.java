@@ -425,6 +425,39 @@ class ChangeStreamBeanPostProcessorValidationTest {
     }
 
     @Test
+    void failsWhenRetryPolicyMultiplierIsNaN() {
+        // NaN compares false against everything: a plain `<= 0` check lets it through.
+        contextRunner
+                .withUserConfiguration(InvalidRetryNaNMultiplierConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RetryPolicy")
+                            .hasMessageContaining("multiplier: NaN");
+                });
+    }
+
+    @Test
+    void failsWhenRetryPolicyMultiplierIsInfinite() {
+        contextRunner
+                .withUserConfiguration(InvalidRetryInfiniteMultiplierConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@RetryPolicy")
+                            .hasMessageContaining("multiplier: Infinity");
+                });
+    }
+
+    @Test
+    void succeedsWithShrinkingRetryMultiplier() {
+        // A multiplier below 1 is a legitimate retry policy (unlike @RestartPolicy).
+        contextRunner
+                .withUserConfiguration(ShrinkingRetryHandlerConfig.class)
+                .run(context -> assertThat(context).hasNotFailed());
+    }
+
+    @Test
     void succeedsWithValidRetryPolicy() {
         contextRunner
                 .withUserConfiguration(ValidRetryHandlerConfig.class)
@@ -537,6 +570,54 @@ class ChangeStreamBeanPostProcessorValidationTest {
         @Bean
         InvalidRetryDelayHandler invalidRetryDelayHandler() {
             return new InvalidRetryDelayHandler();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidRetryNaNMultiplierConfig {
+        @Bean
+        InvalidRetryNaNMultiplierHandler invalidRetryNaNMultiplierHandler() {
+            return new InvalidRetryNaNMultiplierHandler();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidRetryInfiniteMultiplierConfig {
+        @Bean
+        InvalidRetryInfiniteMultiplierHandler invalidRetryInfiniteMultiplierHandler() {
+            return new InvalidRetryInfiniteMultiplierHandler();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ShrinkingRetryHandlerConfig {
+        @Bean
+        ShrinkingRetryHandler shrinkingRetryHandler() {
+            return new ShrinkingRetryHandler();
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @RetryPolicy(multiplier = Double.NaN)
+    static class InvalidRetryNaNMultiplierHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @RetryPolicy(multiplier = Double.POSITIVE_INFINITY)
+    static class InvalidRetryInfiniteMultiplierHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @RetryPolicy(multiplier = 0.5)
+    static class ShrinkingRetryHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
         }
     }
 

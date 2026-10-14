@@ -19,6 +19,7 @@ import io.flowwarden.stream.annotation.RetryPolicy;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -143,6 +144,56 @@ class RetryPolicyConfigTest {
             long delay3 = config.computeDelayMillis(3); // expected ~2000ms
             assertThat(delay3).isBetween(1600L, 2400L);
         }
+    }
+
+    // --- computeDelayMillis: never zero by truncation, zero only when explicitly immediate (#97) ---
+
+    @Test
+    void shrinkingMultiplier_withoutJitter_neverTruncatesToZero() {
+        // Review finding: `(long) baseDelay` already truncates before the
+        // jitter block — 1ms × 0.5 = 0.5ms → 0, with any decreasing
+        // multiplier (a legitimate @RetryPolicy).
+        RetryPolicyConfig config = new RetryPolicyConfig(
+                10, Duration.ofMillis(1), Duration.ofSeconds(1), 0.5, Set.of(), Set.of(), false);
+
+        for (int attempt = 1; attempt <= 10; attempt++) {
+            assertThat(config.computeDelayMillis(attempt))
+                    .as("attempt %s", attempt)
+                    .isGreaterThanOrEqualTo(1L);
+        }
+    }
+
+    @Test
+    void oneMillisecondWithJitter_neverReturnsZero() {
+        RetryPolicyConfig config = new RetryPolicyConfig(
+                3, Duration.ofMillis(1), Duration.ofMillis(1), 2.0, Set.of(), Set.of(), true);
+
+        for (int i = 0; i < 1_000; i++) {
+            assertThat(config.computeDelayMillis(1)).isGreaterThanOrEqualTo(1L);
+            assertThat(config.computeDelayMillis(3)).isGreaterThanOrEqualTo(1L);
+        }
+    }
+
+    @Test
+    void explicitZeroInitialDelay_staysImmediate_evenWithJitter() {
+        // Contract decision (#97): "0ms" is the explicit opt-in to immediate
+        // retries and keeps its meaning — the 1ms floor applies only to
+        // positive delays truncated by the multiplier or the jitter.
+        RetryPolicyConfig config = new RetryPolicyConfig(
+                5, Duration.ZERO, Duration.ofSeconds(30), 2.0, Set.of(), Set.of(), true);
+
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            assertThat(config.computeDelayMillis(attempt)).isZero();
+        }
+    }
+
+    @Test
+    void explicitZeroMaxDelay_staysImmediate() {
+        RetryPolicyConfig config = new RetryPolicyConfig(
+                5, Duration.ofSeconds(1), Duration.ZERO, 2.0, Set.of(), Set.of(), false);
+
+        assertThat(config.computeDelayMillis(1)).isZero();
+        assertThat(config.computeDelayMillis(4)).isZero();
     }
 
     // --- shouldRetry ---
