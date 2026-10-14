@@ -19,6 +19,7 @@ import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
 import io.flowwarden.stream.annotation.MongoDlqOptions;
+import io.flowwarden.stream.annotation.RestartPolicy;
 import io.flowwarden.stream.annotation.RetryPolicy;
 
 import java.util.Map;
@@ -39,6 +40,7 @@ import java.util.Map;
  * @param filterMethod            the {@code @Filter} method (nullable if no filter defined)
  * @param checkpointAnnotation    the {@code @Checkpoint} annotation (nullable if not present)
  * @param retryPolicyAnnotation   the {@code @RetryPolicy} annotation (nullable if not present)
+ * @param restartPolicyAnnotation the {@code @RestartPolicy} annotation (nullable if not present)
  * @param deadLetterQueueAnnotation the {@code @DeadLetterQueue} annotation (nullable if not present)
  * @param mongoDlqOptionsAnnotation the {@code @MongoDlqOptions} annotation (nullable if not present)
  * @param errorHandlerResolver    the resolver for {@code @OnError} handlers (never null)
@@ -57,6 +59,7 @@ public record ChangeStreamDefinition(
         FilterMethod filterMethod,
         Checkpoint checkpointAnnotation,
         RetryPolicy retryPolicyAnnotation,
+        RestartPolicy restartPolicyAnnotation,
         DeadLetterQueue deadLetterQueueAnnotation,
         MongoDlqOptions mongoDlqOptionsAnnotation,
         ErrorHandlerResolver errorHandlerResolver,

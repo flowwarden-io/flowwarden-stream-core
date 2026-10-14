@@ -82,6 +82,7 @@ class StreamRegistryTest {
                 null,
                 null,
                 null,
+                null,
                 new ErrorHandlerResolver(List.of()),
                 Collections.emptyMap());
     }
