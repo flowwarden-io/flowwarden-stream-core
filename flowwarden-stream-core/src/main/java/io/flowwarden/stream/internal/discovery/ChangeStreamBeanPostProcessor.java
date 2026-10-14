@@ -24,6 +24,7 @@ import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
 import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.annotation.OnChange;
+import io.flowwarden.stream.annotation.RestartPolicy;
 import io.flowwarden.stream.annotation.RetryPolicy;
 import io.flowwarden.stream.annotation.OnDelete;
 import io.flowwarden.stream.annotation.OnError;
@@ -125,6 +126,13 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                     retryAnnotation.initialDelay(), retryAnnotation.maxDelay());
         }
 
+        RestartPolicy restartAnnotation = AnnotationUtils.findAnnotation(targetClass, RestartPolicy.class);
+        if (restartAnnotation != null) {
+            StreamDefinitionValidator.validateRestartPolicy(beanName, targetClass.getName(),
+                    restartAnnotation.maxAttempts(), restartAnnotation.multiplier(),
+                    restartAnnotation.initialDelay(), restartAnnotation.maxDelay());
+        }
+
         DeadLetterQueue dlqAnnotation = AnnotationUtils.findAnnotation(targetClass, DeadLetterQueue.class);
         if (dlqAnnotation != null) {
             StreamDefinitionValidator.validateDeadLetterQueue(beanName, targetClass.getName(),
@@ -200,6 +208,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                 filterMethod,
                 cpAnnotation,
                 retryAnnotation,
+                restartAnnotation,
                 dlqAnnotation,
                 mongoDlqOptionsAnnotation,
                 errorHandlerResolver,
@@ -227,9 +236,9 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
             handlers.append("@Filter=").append(filterMethod.method().getName());
         }
 
-        log.info("Discovered Change Stream '{}' on collection '{}' (handlers: {}, checkpoint: {}, retryPolicy: {}, dlq: {}, onError: {})",
-                streamName, collection, handlers, cpAnnotation != null, retryAnnotation != null, dlqAnnotation != null,
-                !errorHandlerResolver.isEmpty());
+        log.info("Discovered Change Stream '{}' on collection '{}' (handlers: {}, checkpoint: {}, retryPolicy: {}, restartPolicy: {}, dlq: {}, onError: {})",
+                streamName, collection, handlers, cpAnnotation != null, retryAnnotation != null,
+                restartAnnotation != null, dlqAnnotation != null, !errorHandlerResolver.isEmpty());
 
         return bean;
     }

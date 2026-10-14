@@ -42,13 +42,13 @@ The library automatically handles **checkpoint/resume**, **retry with exponentia
 <dependency>
     <groupId>io.flowwarden</groupId>
     <artifactId>flowwarden-stream-core</artifactId>
-    <version>1.0.0-rc.5</version>
+    <version>1.0.0-rc.6</version>
 </dependency>
 ```
 
 **Gradle**
 ```groovy
-implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.5'
+implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.6'
 ```
 
 **Optional — using the FlowWarden BOM** *(available from `1.0.0-rc.3` onward)*. Handy if you also pull `flowwarden-stream-core-testkit` or a satellite backend (`flowwarden-javers`, `flowwarden-redis`, `flowwarden-amqp`), so versions stay aligned:
@@ -59,7 +59,7 @@ implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.5'
     <dependency>
       <groupId>io.flowwarden</groupId>
       <artifactId>flowwarden-bom</artifactId>
-      <version>1.0.0-rc.5</version>
+      <version>1.0.0-rc.6</version>
       <type>pom</type>
       <scope>import</scope>
     </dependency>
@@ -220,10 +220,33 @@ All stream-level settings are configured via annotations on your `@ChangeStream`
 |------------|---------|--------------|
 | `@Checkpoint` | Durable anchor persistence (at-least-once resume) | `saveEveryN = 1` (persist after N settled events), `saveIntervalSeconds = 5` (max age of an unpersisted anchor — whichever threshold is hit first), `idleHeartbeatIntervalSeconds = 300` (idle-stream oplog-rollover protection, `0` opts out), `startPosition = RESUME` |
 | `@RetryPolicy` | Exponential backoff on failure | `maxAttempts = 3`, `initialDelay = "500ms"`, `multiplier = 2.0`, `maxDelay = "30s"`, `jitter = true` |
+| `@RestartPolicy` | Backoff and ceiling of the managed restart loop after a runtime cursor death | `maxAttempts = 0` (unlimited), `initialDelay = "1s"`, `multiplier = 2.0`, `maxDelay = "60s"`, `jitter = false` |
 | `@DeadLetterQueue` | Route failed events to a DLQ (backend-agnostic) | `enabled = true`, `retentionDays = 30` |
 | `@MongoDlqOptions` | MongoDB-specific DLQ tuning (collection override) | `collection = "_fw_dlq"` (overrides `flowwarden.dlq.mongo.collection`) |
 
 See the [Comprehensive Example](#comprehensive-example) above for usage, or the [documentation](https://docs.flowwarden.io) for the full reference.
+
+### Streams without annotations
+
+When the stream catalog lives outside the JVM — a YAML file, a database table, a feature-flag service — declare streams programmatically instead. A `StreamDefinitionContributor` bean is called once at bootstrap and describes each stream with the `StreamSpec` builder; every builder call maps 1:1 to an annotation (`.pipeline(...)`, `.filter(...)`, `.onError(...)`, `.checkpoint(...)`, `.retryPolicy(...)`, `.restartPolicy(...)`, `.deadLetterQueue(...)`), with the same defaults and the same fail-fast validation. Both styles coexist in one application.
+
+```java
+@Component
+class OrderStreamContributor implements StreamDefinitionContributor {
+
+    @Override
+    public void contribute(StreamRegistration registration) {
+        registration.stream("order-stream", Order.class)
+                .collection("orders")
+                .checkpoint(CheckpointSpec.defaults())
+                .filter(ctx -> ctx.getFullDocument(Order.class)
+                        .map(o -> "PAID".equals(o.getStatus())).orElse(false))
+                .onInsert((order, ctx) -> orderService.onNewOrder(order));
+    }
+}
+```
+
+Registration is bootstrap-only (no hot registration on a running instance) and does not cover `zone` yet. See the [Programmatic Registration guide](https://docs.flowwarden.io/guides/programmatic-registration) and sample `12-registration` in [flowwarden-examples](https://github.com/flowwarden-io/flowwarden-examples).
 
 ### When history is lost
 

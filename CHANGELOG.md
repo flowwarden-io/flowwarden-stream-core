@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New `@RestartPolicy` annotation (and `RestartPolicySpec` / `StreamSpec.Builder.restartPolicy(...)` for contributed streams): per-stream control over the managed restart loop that resubscribes a stream after a runtime cursor death or a collection invalidation. Same attributes as `@RetryPolicy` — `initialDelay`, `maxDelay`, `multiplier`, `jitter` — plus `maxAttempts`, where `0` means unlimited. Defaults are exactly the previous hard-coded cadence (1s doubling up to 60s, no jitter, never gives up), so a stream without the annotation behaves as before. A bounded policy that exhausts its attempts takes the same terminal path as a history loss: `onStreamStopped(CRASHED)` with the death cause, the loop stops for that stream, and under `SINGLE_LEADER` the lease is released. Validated fail-fast on both discovery paths, with two restart-specific rules on top of the retry ones — a zero delay and a multiplier below 1 (or non-finite) are rejected, since the loop exists to never hot-loop against a down server. (#95)
+
+### Changed
+- The restart loop's log lines now report the delay before the next attempt in milliseconds instead of seconds.
+
+## [1.0.0-rc.6] — 2026-09-18
+
+### Added
 - New `io.flowwarden.stream.registration` package: a bootstrap-only, annotation-free way to declare Change Stream definitions programmatically via `StreamDefinitionContributor` beans — for streams whose configuration lives outside the JVM (YAML, a database, a feature-flag service). `StreamSpec`/`StreamSpec.Builder` cover typed functional handlers (`@OnInsert`/`@OnUpdate`/`@OnDelete`/`@OnReplace`/`@OnChange`), `CheckpointSpec`/`RetryPolicySpec`/`DeadLetterQueueSpec`/`MongoDlqOptionsSpec` (builder-based, same defaults as their annotation counterparts), a `.pipeline(Supplier<List<Bson>>)` (equivalent of `@Pipeline`), a `.filter(Predicate<ChangeStreamContext<T>>)` (equivalent of `@Filter`, same DELETE/DROP/INVALIDATE incompatibility rule), and a repeatable `.onError(ErrorHandler, Class<? extends Throwable>...)` (equivalent of `@OnError`, no-args = catch-all) — **not yet covered**: a `zone`. What is covered goes through the same fail-fast validation as `@ChangeStream` classes, and a duplicate stream name — annotated or contributed — fails startup. Contribution happens once, after all singleton beans are created and before the stream managers start reading the catalog; there is no support yet for registering a stream on an already-running instance. (#87, #89)
 - New public `io.flowwarden.stream.core.ErrorHandler` functional interface (`ErrorAction handle(Throwable ex, ChangeStreamContext<?> ctx)`), the `StreamSpec` equivalent of an `@OnError` method. (#89)
 
@@ -191,7 +199,8 @@ First release candidate of FlowWarden Stream Core.
 - `DeploymentMode.PARTITIONED` — defined in the enum but not yet implemented, reserved for a future release
 - Watchdog / zombie stream detection — planned for a future release
 
-[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.5...HEAD
+[Unreleased]: https://github.com/flowwarden-io/flowwarden-stream-core/compare/v1.0.0-rc.6...HEAD
+[1.0.0-rc.6]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.6
 [1.0.0-rc.5]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.4
 [1.0.0-rc.3]: https://github.com/flowwarden-io/flowwarden-stream-core/releases/tag/v1.0.0-rc.3
