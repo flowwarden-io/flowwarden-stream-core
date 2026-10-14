@@ -116,7 +116,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         if (cpAnnotation != null) {
             StreamDefinitionValidator.validateCheckpoint(beanName, targetClass.getName(),
                     cpAnnotation.saveEveryN(), cpAnnotation.saveIntervalSeconds(),
-                    cpAnnotation.idleHeartbeatIntervalSeconds());
+                    cpAnnotation.idleHeartbeatIntervalSeconds(), cpAnnotation.stuckAfterProbes());
         }
 
         RetryPolicy retryAnnotation = AnnotationUtils.findAnnotation(targetClass, RetryPolicy.class);

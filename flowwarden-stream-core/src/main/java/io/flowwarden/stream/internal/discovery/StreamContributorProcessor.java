@@ -96,7 +96,8 @@ public class StreamContributorProcessor implements SmartInitializingSingleton {
         StreamDefinitionValidator.resolveCollection(beanName, subject, spec.collection(), spec.documentType());
 
         spec.checkpoint().ifPresent(cp -> StreamDefinitionValidator.validateCheckpoint(beanName, subject,
-                cp.saveEveryN(), cp.saveIntervalSeconds(), cp.idleHeartbeatIntervalSeconds()));
+                cp.saveEveryN(), cp.saveIntervalSeconds(), cp.idleHeartbeatIntervalSeconds(),
+                cp.stuckAfterProbes()));
 
         spec.retryPolicy().ifPresent(rp -> StreamDefinitionValidator.validateRetryPolicy(beanName, subject,
                 rp.maxAttempts(), rp.multiplier(), rp.initialDelay(), rp.maxDelay()));

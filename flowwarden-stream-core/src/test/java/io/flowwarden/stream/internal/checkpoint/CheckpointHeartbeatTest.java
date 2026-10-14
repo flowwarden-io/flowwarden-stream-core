@@ -90,13 +90,38 @@ class CheckpointHeartbeatTest {
         // Count threshold out of reach: flushTick is the only anchor writer.
         policy = new ProcessedAnchorPolicy(STREAM, store, 100);
         return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
-                true, IDLE_THRESHOLD, null, null, policy);
+                true, IDLE_THRESHOLD, null, null, policy, 0, null);
     }
 
     private CheckpointHeartbeat noFallbackHeartbeat(Function<BsonDocument, ProbeOutcome> probeFn) {
         policy = new ProcessedAnchorPolicy(STREAM, store, 100);
         return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
-                false, IDLE_THRESHOLD, null, null, policy);
+                false, IDLE_THRESHOLD, null, null, policy, 0, null);
+    }
+
+    private final RecordingLiveness liveness = new RecordingLiveness();
+
+    /** Stuck detection armed at {@code stuckAfterProbes}, with the recording liveness hooks. */
+    private CheckpointHeartbeat stuckHeartbeat(int stuckAfterProbes,
+                                               Function<BsonDocument, ProbeOutcome> probeFn) {
+        policy = new ProcessedAnchorPolicy(STREAM, store, 100);
+        return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
+                true, IDLE_THRESHOLD, null, null, policy, stuckAfterProbes, liveness);
+    }
+
+    private static final class RecordingLiveness implements StreamLiveness {
+        final LivenessGate gate = new LivenessGate();
+        final List<io.flowwarden.stream.StreamStuckException> verdicts = new ArrayList<>();
+
+        @Override
+        public boolean claimStuck() {
+            return gate.claimStuck();
+        }
+
+        @Override
+        public void onStuck(io.flowwarden.stream.StreamStuckException cause) {
+            verdicts.add(cause);
+        }
     }
 
     private CheckpointHeartbeat opTimeHeartbeat(org.bson.BsonTimestamp opTime,
@@ -106,7 +131,7 @@ class CheckpointHeartbeatTest {
         // deferred-cleanup guard.
         policy = new ProcessedAnchorPolicy(STREAM, store, 100);
         return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
-                false, IDLE_THRESHOLD, opTime, DEAD_PROCESSED, policy);
+                false, IDLE_THRESHOLD, opTime, DEAD_PROCESSED, policy, 0, null);
     }
 
     private HeartbeatProbe probeOf(Function<BsonDocument, ProbeOutcome> fn) {
@@ -287,6 +312,157 @@ class CheckpointHeartbeatTest {
         heartbeat(r -> ProbeOutcome.eventPending()).idleTick();
 
         assertThat(store.calls).isEmpty();
+    }
+
+    // --- stuck-stream verdict: an abstention streak with no delivery and no handler in flight ---
+
+    /** One idle probe per call: the spacing throttle is bypassed by rewinding the last-probe clock. */
+    private void idleProbe(CheckpointHeartbeat hb) {
+        hb.idleTick();
+        rewindIdleThrottle(hb);
+    }
+
+    private static void rewindIdleThrottle(CheckpointHeartbeat hb) {
+        try {
+            java.lang.reflect.Field f = CheckpointHeartbeat.class.getDeclaredField("lastIdleProbeAt");
+            f.setAccessible(true);
+            f.set(hb, null);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    @Test
+    void stuck_streakOfIdleAbstentionsWithoutDelivery_reachesThreshold_handsVerdictToManager() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        CheckpointHeartbeat hb = stuckHeartbeat(3, r -> ProbeOutcome.eventPending());
+
+        idleProbe(hb);
+        idleProbe(hb);
+        assertThat(liveness.verdicts).as("below the threshold").isEmpty();
+
+        idleProbe(hb);
+
+        assertThat(liveness.verdicts).hasSize(1);
+        assertThat(liveness.verdicts.get(0).getStreamName()).isEqualTo(STREAM);
+        assertThat(liveness.verdicts.get(0).getConsecutiveAbstentions()).isEqualTo(3);
+        assertThat(liveness.verdicts.get(0).getStuckFor()).isGreaterThanOrEqualTo(Duration.ofSeconds(120));
+        assertThat(hb.isActive()).as("the heartbeat cancels itself with the verdict").isFalse();
+        assertThat(store.calls).isEmpty();
+
+        idleProbe(hb);
+        assertThat(liveness.verdicts).as("a cancelled heartbeat never probes again").hasSize(1);
+        assertThat(probed).hasSize(3);
+    }
+
+    @Test
+    void stuck_deliveryBetweenAbstentions_resetsTheStreak() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        CheckpointHeartbeat hb = stuckHeartbeat(3, r -> ProbeOutcome.eventPending());
+
+        idleProbe(hb);
+        idleProbe(hb);
+        // The stream settled an event (new snapshot object), then went idle
+        // again: lagging, not stuck.
+        ref.set(new TokenSnapshot(EVENT_B, IDLE_SINCE));
+        idleProbe(hb);
+        idleProbe(hb);
+
+        assertThat(liveness.verdicts).isEmpty();
+        assertThat(hb.isActive()).isTrue();
+
+        idleProbe(hb); // third abstention on the new snapshot
+        assertThat(liveness.verdicts).hasSize(1);
+    }
+
+    @Test
+    void stuck_handlerInFlight_defersTheVerdict_gateStaysHandling() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        CheckpointHeartbeat hb = stuckHeartbeat(2, r -> ProbeOutcome.eventPending());
+        assertThat(liveness.gate.enterHandling()).isTrue(); // a dispatch is in flight
+
+        idleProbe(hb);
+        idleProbe(hb);
+        idleProbe(hb);
+
+        assertThat(liveness.verdicts).as("a slow handler or a retry in backoff is lagging, not stuck").isEmpty();
+        assertThat(liveness.gate.isHandling()).as("the claim must not disturb the dispatch").isTrue();
+        assertThat(hb.isActive()).isTrue();
+
+        liveness.gate.exitHandling();
+        idleProbe(hb);
+        assertThat(liveness.verdicts).as("the streak is intact — verdict as soon as nothing is in flight").hasSize(1);
+        assertThat(liveness.gate.isStuck()).isTrue();
+        assertThat(liveness.gate.enterHandling())
+                .as("a generation declared stuck can never start a handler")
+                .isFalse();
+    }
+
+    @Test
+    void stuck_deliveryDuringTheProbe_abstentionIsStale_neverCounted() {
+        // Review finding: the probe chains from snapshot A and does I/O; the
+        // stream settles B meanwhile (publishSettledToken writes the shared
+        // reference without the heartbeat lock), its handler ends, then the
+        // probe returns EVENT_PENDING on A. That abstention is stale — the
+        // stream moved past the probed position — and must never count.
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        CheckpointHeartbeat hb = stuckHeartbeat(1, r -> {
+            ref.set(new TokenSnapshot(EVENT_B, IDLE_SINCE)); // delivery while the probe is in flight
+            return ProbeOutcome.eventPending();
+        });
+
+        idleProbe(hb);
+
+        assertThat(liveness.verdicts).isEmpty();
+        assertThat(liveness.gate.isStuck()).isFalse();
+        assertThat(hb.isActive()).isTrue();
+        assertThat(probed).containsExactly(EVENT_A);
+    }
+
+    @Test
+    void stuck_emptyOrFailedProbe_resetsTheStreak() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        AtomicReference<ProbeOutcome> next = new AtomicReference<>(ProbeOutcome.eventPending());
+        CheckpointHeartbeat hb = stuckHeartbeat(2, r -> next.get());
+
+        idleProbe(hb);
+        next.set(ProbeOutcome.failed(new RuntimeException("transient")));
+        idleProbe(hb);
+        next.set(ProbeOutcome.eventPending());
+        idleProbe(hb);
+
+        assertThat(liveness.verdicts).as("one abstention since the failure").isEmpty();
+        idleProbe(hb);
+        assertThat(liveness.verdicts).hasSize(1);
+    }
+
+    @Test
+    void stuck_zeroThreshold_neverDeclares() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        CheckpointHeartbeat hb = stuckHeartbeat(0, r -> ProbeOutcome.eventPending());
+
+        for (int i = 0; i < 10; i++) {
+            idleProbe(hb);
+        }
+
+        assertThat(liveness.verdicts).isEmpty();
+        assertThat(hb.isActive()).isTrue();
+    }
+
+    @Test
+    void stuck_startupAndEstablishmentProbes_neverCount() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        CheckpointHeartbeat hb = stuckHeartbeat(2, r -> ProbeOutcome.eventPending());
+
+        hb.probeNow(); // startup diagnostic: the stream is catching up
+        hb.probeNow();
+        hb.probeNow();
+        assertThat(liveness.verdicts).isEmpty();
+
+        idleProbe(hb);
+        assertThat(liveness.verdicts).as("idle abstention #1 only").isEmpty();
+        idleProbe(hb);
+        assertThat(liveness.verdicts).hasSize(1);
     }
 
     @Test

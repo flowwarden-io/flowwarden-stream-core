@@ -104,6 +104,7 @@ class StreamSpecConverterTest {
                         .saveEveryN(2)
                         .saveIntervalSeconds(10)
                         .idleHeartbeatIntervalSeconds(60)
+                        .stuckAfterProbes(5)
                         .startPosition(StartPosition.LATEST)
                         .onHistoryLost(OnHistoryLost.RESUME_FROM_NOW)
                         .build())
@@ -112,6 +113,7 @@ class StreamSpecConverterTest {
 
         ChangeStreamDefinition definition = StreamSpecConverter.convert(spec, new Object(), "testBean");
         Checkpoint checkpoint = definition.checkpointAnnotation();
+        assertEquals(5, checkpoint.stuckAfterProbes());
 
         assertNotNull(checkpoint);
         assertEquals(2, checkpoint.saveEveryN());

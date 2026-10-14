@@ -35,6 +35,7 @@ public final class CheckpointSpec {
     private final int saveEveryN;
     private final int saveIntervalSeconds;
     private final int idleHeartbeatIntervalSeconds;
+    private final int stuckAfterProbes;
     private final StartPosition startPosition;
     private final OnHistoryLost onHistoryLost;
 
@@ -42,6 +43,7 @@ public final class CheckpointSpec {
         this.saveEveryN = builder.saveEveryN;
         this.saveIntervalSeconds = builder.saveIntervalSeconds;
         this.idleHeartbeatIntervalSeconds = builder.idleHeartbeatIntervalSeconds;
+        this.stuckAfterProbes = builder.stuckAfterProbes;
         this.startPosition = builder.startPosition;
         this.onHistoryLost = builder.onHistoryLost;
     }
@@ -56,6 +58,11 @@ public final class CheckpointSpec {
 
     public int idleHeartbeatIntervalSeconds() {
         return idleHeartbeatIntervalSeconds;
+    }
+
+    /** Consecutive idle-probe abstentions before the stream is declared stuck; {@code 0} = never. */
+    public int stuckAfterProbes() {
+        return stuckAfterProbes;
     }
 
     public StartPosition startPosition() {
@@ -80,6 +87,7 @@ public final class CheckpointSpec {
         private int saveEveryN = 1;
         private int saveIntervalSeconds = 5;
         private int idleHeartbeatIntervalSeconds = 300;
+        private int stuckAfterProbes = 3;
         private StartPosition startPosition = StartPosition.RESUME;
         private OnHistoryLost onHistoryLost = OnHistoryLost.FAIL;
 
@@ -98,6 +106,11 @@ public final class CheckpointSpec {
 
         public Builder idleHeartbeatIntervalSeconds(int idleHeartbeatIntervalSeconds) {
             this.idleHeartbeatIntervalSeconds = idleHeartbeatIntervalSeconds;
+            return this;
+        }
+
+        public Builder stuckAfterProbes(int stuckAfterProbes) {
+            this.stuckAfterProbes = stuckAfterProbes;
             return this;
         }
 

@@ -386,6 +386,36 @@ class ChangeStreamBeanPostProcessorValidationTest {
         }
     }
 
+    // --- @Checkpoint validation tests ---
+
+    @Test
+    void failsWhenCheckpointStuckAfterProbesNegative() {
+        contextRunner
+                .withUserConfiguration(InvalidStuckAfterProbesConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@Checkpoint")
+                            .hasMessageContaining("stuckAfterProbes");
+                });
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class InvalidStuckAfterProbesConfig {
+        @Bean
+        InvalidStuckAfterProbesHandler invalidStuckAfterProbesHandler() {
+            return new InvalidStuckAfterProbesHandler();
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @io.flowwarden.stream.annotation.Checkpoint(stuckAfterProbes = -1)
+    static class InvalidStuckAfterProbesHandler {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
     // --- @RetryPolicy validation tests ---
 
     @Test
