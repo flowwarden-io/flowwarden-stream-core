@@ -91,15 +91,24 @@ public record RetryPolicyConfig(
      *
      * <p>Formula: {@code min(initialDelay * multiplier^(attempt-1), maxDelay)} with optional jitter.</p>
      *
+     * <p>Two invariants: a policy that is <em>explicitly</em> immediate
+     * ({@code initialDelay} or {@code maxDelay} of {@code "0ms"}) stays
+     * immediate — every delay is {@code 0}; and a mathematically positive
+     * delay is never truncated to zero, neither by a multiplier below 1 nor
+     * by the jitter factor — the floor is {@code 1} millisecond.</p>
+     *
      * @param attemptNumber the attempt number that just failed (1-based)
      * @return delay in milliseconds before the next retry
      */
     public long computeDelayMillis(int attemptNumber) {
+        if (initialDelay.isZero() || maxDelay.isZero()) {
+            return 0L; // explicit opt-in to immediate retries
+        }
         double baseDelay = initialDelay.toMillis() * Math.pow(multiplier, attemptNumber - 1);
-        long cappedDelay = Math.min((long) baseDelay, maxDelay.toMillis());
+        long cappedDelay = Math.max(1L, Math.min((long) baseDelay, maxDelay.toMillis()));
         if (jitter) {
             double jitterFactor = 0.8 + ThreadLocalRandom.current().nextDouble() * 0.4; // ±20%
-            return Math.max(0, (long) (cappedDelay * jitterFactor));
+            return Math.max(1L, (long) (cappedDelay * jitterFactor));
         }
         return cappedDelay;
     }
