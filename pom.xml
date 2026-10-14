@@ -89,7 +89,7 @@
             additive only on the public packages — io.flowwarden.stream.internal.*
             carries no guarantee and is excluded from the comparison.
         -->
-        <japicmp.version>0.23.1</japicmp.version>
+        <japicmp.version>0.26.3</japicmp.version>
         <japicmp.groovy.version>4.0.27</japicmp.groovy.version>
         <japicmp.baseline>1.0.0-rc.6</japicmp.baseline>
     </properties>
