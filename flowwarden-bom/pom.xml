@@ -19,9 +19,9 @@
 
     <properties>
         <!-- Satellites release on their own cadence; these pins define the set validated against this core version. -->
-        <flowwarden-javers.version>1.0.0-rc.2</flowwarden-javers.version>
-        <flowwarden-redis.version>1.0.0-rc.2</flowwarden-redis.version>
-        <flowwarden-amqp.version>1.0.0-rc.2</flowwarden-amqp.version>
+        <flowwarden-javers.version>1.0.0-rc.3</flowwarden-javers.version>
+        <flowwarden-redis.version>1.0.0-rc.3</flowwarden-redis.version>
+        <flowwarden-amqp.version>1.0.0-rc.3</flowwarden-amqp.version>
     </properties>
 
     <dependencyManagement>
