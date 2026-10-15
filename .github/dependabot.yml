@@ -7,12 +7,18 @@ updates:
     schedule:
       interval: "weekly"
     ignore:
-      # The library is guaranteed on the Spring Boot line of the applications it
-      # runs in (3.2.x). A Boot major is a deliberate release decision for the
-      # whole ecosystem, never a dependency bump.
+      # The library is pinned to the Spring Boot 3.2.x line of the applications
+      # it runs in: the parent pom is the compile baseline it is guaranteed
+      # against, so a Boot minor is as deliberate a decision as a major —
+      # patches only.
       - dependency-name: "org.springframework.boot:*"
-        update-types: ["version-update:semver-major"]
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
       # Testcontainers 2.x changes the API the test harness and the testkit are
       # written against; the move is a deliberate migration, not a bump.
       - dependency-name: "org.testcontainers:*"
+        update-types: ["version-update:semver-major"]
+      # Groovy is only here to run the japicmp post-analysis script on recent
+      # JDKs (the plugin bundles 4.0.x); a Groovy major is neither needed nor
+      # wanted.
+      - dependency-name: "org.apache.groovy:*"
         update-types: ["version-update:semver-major"]
