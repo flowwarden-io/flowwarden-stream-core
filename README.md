@@ -26,6 +26,7 @@ The library automatically handles **checkpoint/resume**, **retry with exponentia
 - **Automatic checkpoint & resume** — MongoDB-backed resume tokens survive restarts
 - **Dead Letter Queue** — failed events are routed to a configurable DLQ with retention policies
 - **Exponential backoff retry** — `@RetryPolicy` with configurable max attempts and delays
+- **Self-healing streams** — a dead cursor is resubscribed on a `@RestartPolicy` cadence, and a hung cursor is detected and restarted (`@Checkpoint(stuckAfterProbes)`)
 - **Server-side filtering** — `@Pipeline` pushes aggregation pipelines down to MongoDB
 - **Application-side filtering** — `@Filter` runs Java predicates on each event before dispatching to handlers
 - **Dual execution mode** — `IMPERATIVE` (`MongoTemplate`) or `REACTIVE` (`ReactiveMongoTemplate`)
@@ -42,13 +43,13 @@ The library automatically handles **checkpoint/resume**, **retry with exponentia
 <dependency>
     <groupId>io.flowwarden</groupId>
     <artifactId>flowwarden-stream-core</artifactId>
-    <version>1.0.0-rc.6</version>
+    <version>1.0.0-rc.7</version>
 </dependency>
 ```
 
 **Gradle**
 ```groovy
-implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.6'
+implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.7'
 ```
 
 **Optional — using the FlowWarden BOM** *(available from `1.0.0-rc.3` onward)*. Handy if you also pull `flowwarden-stream-core-testkit` or a satellite backend (`flowwarden-javers`, `flowwarden-redis`, `flowwarden-amqp`), so versions stay aligned:
@@ -59,7 +60,7 @@ implementation 'io.flowwarden:flowwarden-stream-core:1.0.0-rc.6'
     <dependency>
       <groupId>io.flowwarden</groupId>
       <artifactId>flowwarden-bom</artifactId>
-      <version>1.0.0-rc.6</version>
+      <version>1.0.0-rc.7</version>
       <type>pom</type>
       <scope>import</scope>
     </dependency>
