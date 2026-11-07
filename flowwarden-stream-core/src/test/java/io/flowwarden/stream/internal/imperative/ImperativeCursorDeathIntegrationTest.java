@@ -15,6 +15,8 @@
  */
 package io.flowwarden.stream.internal.imperative;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
 import io.flowwarden.stream.ChangeStreamContext;
 import io.flowwarden.stream.DeploymentMode;
 import io.flowwarden.stream.FlowWardenMetrics;
@@ -27,6 +29,7 @@ import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.StopReason;
 import io.flowwarden.stream.spi.StreamMetricsProvider;
+import io.flowwarden.stream.test.LogCapture;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.BsonDocument;
 import org.bson.Document;
@@ -291,6 +294,82 @@ class ImperativeCursorDeathIntegrationTest {
     }
 
     @Test
+    void refusedOpens_logTheStackOnce_untilTheGenerationProvesItself() {
+        // The cursor opens on the reading thread, AFTER startStream returned:
+        // a refused open is the death of a generation that never proved
+        // itself, and the synchronous return must not reset the restart
+        // cycle. Two consecutive refusals with the same cause: one ERROR with
+        // the stack trace, then one WARN without. The first delivered event
+        // is the proof of life that closes the cycle — a later death with the
+        // same cause is a new incident, logged in full.
+        try (LogCapture logs = LogCapture.of(ImperativeStreamManager.class)) {
+            enableFailPoint("aggregate", 2);
+            streamManager.startStream(GHOST_STREAM);
+
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                    assertThat(deathLogs(logs)).hasSize(2));
+            List<ILoggingEvent> deaths = deathLogs(logs);
+            assertThat(deaths.get(0).getLevel()).isEqualTo(Level.ERROR);
+            assertThat(deaths.get(0).getThrowableProxy())
+                    .as("first death of the cycle: full stack trace")
+                    .isNotNull();
+            assertThat(deaths.get(1).getLevel())
+                    .as("same cause, generation never proven: one line, no stack trace")
+                    .isEqualTo(Level.WARN);
+            assertThat(deaths.get(1).getThrowableProxy()).isNull();
+
+            // The failpoint is consumed: the third generation opens and
+            // proves itself by delivering an event.
+            awaitResubscribedAndDeliver(2);
+
+            enableFailPointOnce();
+            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                    assertThat(deathLogs(logs)).hasSize(3));
+            assertThat(deathLogs(logs).get(2).getLevel())
+                    .as("a proven generation died: new incident, full stack trace")
+                    .isEqualTo(Level.ERROR);
+            assertThat(deathLogs(logs).get(2).getThrowableProxy()).isNotNull();
+
+            // Same cause as the previous death — but that generation proved
+            // itself too, so this is again a new incident.
+            awaitResubscribedAndDeliver(3);
+            enableFailPointOnce();
+            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                    assertThat(deathLogs(logs)).hasSize(4));
+            assertThat(deathLogs(logs).get(3).getLevel())
+                    .as("same cause as the previous death, but that generation was proven")
+                    .isEqualTo(Level.ERROR);
+            assertThat(deathLogs(logs).get(3).getThrowableProxy()).isNotNull();
+        }
+    }
+
+    /** Runtime-death lines of the ghost stream (ERROR on a first death, WARN on a repeat). */
+    private static List<ILoggingEvent> deathLogs(LogCapture logs) {
+        return logs.events().stream()
+                .filter(e -> e.getLevel().isGreaterOrEqual(Level.WARN))
+                .filter(e -> e.getFormattedMessage().contains("died")
+                        && e.getFormattedMessage().contains("'" + GHOST_STREAM + "'"))
+                .toList();
+    }
+
+    /**
+     * Waits for the {@code n}-th resubscription of the ghost stream to be
+     * running, then inserts until the handler sees one more event: the
+     * cursor open is asynchronous, so a single insert right after
+     * {@code isRunning} could precede it and be invisible to a LATEST start.
+     */
+    private void awaitResubscribedAndDeliver(int n) {
+        await().atMost(Duration.ofSeconds(30)).until(() ->
+                metrics.restarts.stream().filter(s -> s.startsWith(GHOST_STREAM + ":")).count() >= n
+                        && streamManager.isRunning(GHOST_STREAM));
+        int before = ghostHandler.count();
+        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(300)).until(() -> {
+            mongoTemplate.insert(new Document("seq", before + 1), GHOST_COLLECTION);
+            return ghostHandler.count() > before;
+        });
+    }
+
+    @Test
     void terminalFailureAtResubscribe_underSingleLeader_stopsLoopAndReleasesLock() throws Exception {
         // Elected leader, running stream.
         leaderElection.startElection(LEADER_STREAM,
@@ -333,9 +412,13 @@ class ImperativeCursorDeathIntegrationTest {
     }
 
     private void enableFailPointOnce(String command) {
+        enableFailPoint(command, 1);
+    }
+
+    private void enableFailPoint(String command, int times) {
         mongoTemplate.getMongoDatabaseFactory().getMongoDatabase("admin")
                 .runCommand(new Document("configureFailPoint", "failCommand")
-                        .append("mode", new Document("times", 1))
+                        .append("mode", new Document("times", times))
                         .append("data", new Document("errorCode", 286)
                                 .append("failCommands", List.of(command))
                                 .append("appName", APP_NAME)));

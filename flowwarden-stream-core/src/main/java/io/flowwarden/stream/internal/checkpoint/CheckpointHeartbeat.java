@@ -51,6 +51,17 @@ import java.util.function.Supplier;
  *       construction, with no state machine involved.</li>
  * </ul>
  *
+ * <p><strong>Rolled-out position.</strong> The idle probe chains from a
+ * position that is, by construction, at least one idle interval old; an
+ * oplog that truncates faster than that makes the probe fail with a
+ * non-resumable error, and the position never comes back. Rather than
+ * replaying the dead position every interval (freezing the stored one and
+ * turning the next restart into a history loss), the idle probe then
+ * installs a fresh server-certified position under the generation's
+ * dispatch gate — nothing is in flight, nothing was missed, the open cursor
+ * is at the head — and purges the dead pair; see
+ * {@link #repairRolledOutPosition}.</p>
+ *
  * <p><strong>Persist-then-publish.</strong> A probe PBRT is written to the
  * store first and only installed into the shared in-memory snapshot on
  * success (CAS — a concurrent event always wins). A store failure therefore
@@ -136,10 +147,25 @@ public final class CheckpointHeartbeat {
      */
     private TokenSnapshot abstentionStreakSnapshot;
 
+    /**
+     * Consecutive FAILED probe outcomes (any probe). The first one is the
+     * WARN; the rest stay at DEBUG with a periodic WARN reminder, and the
+     * recovery is an INFO — the metric is emitted every time regardless.
+     * Guarded by {@link #lock}.
+     */
+    private int consecutiveFailures;
+
+    /** Every N-th consecutive failure repeats the WARN (≈ hourly at the default cadence). */
+    static final int FAILURE_WARN_EVERY = 12;
+
     /** Consecutive idle abstentions before the stream is declared stuck; {@code 0} = never. */
     private final int stuckAfterProbes;
 
-    /** Manager hooks for the stuck verdict; {@code null} when detection is off. */
+    /**
+     * Manager hooks on the generation's dispatch gate — the stuck verdict
+     * and the exclusive section of a position repair. {@code null} only in
+     * unit tests (no gate: a repair then runs unguarded).
+     */
     private final StreamLiveness liveness;
 
     /**
@@ -350,6 +376,7 @@ public final class CheckpointHeartbeat {
                 // head — the main stream must deliver them first. A certified
                 // position never crosses unsettled work. Repeated abstentions
                 // mean the stream is lagging or stuck.
+                noteProbeRecovered();
                 if (!idleProbe) {
                     log.debug("Heartbeat abstained for stream '{}': events pending delivery",
                             streamName);
@@ -411,16 +438,115 @@ public final class CheckpointHeartbeat {
             case FAILED -> {
                 consecutiveAbstentions = 0;
                 FlowWardenMetrics.get().onHeartbeatProbeFailed(streamName, outcome.cause());
-                log.warn("Heartbeat probe failed for stream '{}': {}", streamName,
-                        outcome.cause() != null ? outcome.cause().getMessage() : "unknown",
-                        outcome.cause());
+                if (idleProbe && HistoryLostErrors.isHistoryLost(outcome.cause())) {
+                    repairRolledOutPosition(snapshot, outcome.cause());
+                } else {
+                    logProbeFailure(outcome.cause());
+                }
             }
             case EMPTY -> {
                 consecutiveAbstentions = 0;
+                noteProbeRecovered();
                 persistCertifiedPosition(snapshot, chainToken, outcome.pbrt(), Instant.now());
             }
         }
         return null;
+    }
+
+    /**
+     * The chained position — a settled event token, a certified PBRT or the
+     * oplog-start operation time — has rolled out of the oplog: the server
+     * refuses to open a cursor from it, and it never comes back (a window
+     * that grows again only adds newer entries). Replaying it every interval
+     * would freeze the stored position and turn the next restart into a
+     * history loss, for a stream that is perfectly fine: the main cursor
+     * keeps its own position at the oplog head and has missed nothing.
+     *
+     * <p>Under this probe's precondition — nothing settled for the idle
+     * threshold, and the dispatch gate claimed so nothing is in flight — the
+     * stream has no undelivered event, so a fresh server-certified position is
+     * exactly where it stands. The dead pair is replaced by that position,
+     * with the store's at-least-once guard on the processed anchor.</p>
+     *
+     * <p>Idle probes only: the establishment chain of an {@code OPLOG_START}
+     * recovery runs while the stream may still be replaying, and the startup
+     * diagnostic runs before anything is known about the cursor. A repair
+     * failure is logged and retried at the next idle probe. Caller holds
+     * {@link #lock}.</p>
+     */
+    private void repairRolledOutPosition(TokenSnapshot snapshot, Throwable cause) {
+        if (liveness != null && !liveness.beginRepair()) {
+            log.info("Heartbeat probe for stream '{}' found its position rolled out of the oplog "
+                            + "with a handler in flight — not idle after all; the settlement will "
+                            + "chain a fresh position",
+                    streamName);
+            return;
+        }
+        try {
+            log.warn("Heartbeat probe failed for stream '{}': its certified position rolled out "
+                            + "of the oplog ({}). The open cursor is unaffected and nothing was "
+                            + "missed, but the stored position is dead and would turn the next "
+                            + "restart into a history loss — installing a fresh server-certified "
+                            + "position. Check the oplog window",
+                    streamName, cause != null ? cause.getMessage() : "unknown");
+            BsonDocument fresh = probe.initialPosition();
+            if (cancelled) {
+                return;
+            }
+            // Settle the processed anchor first, so the dead pair read below
+            // is the whole dead pair: a dirty settled token can only be the
+            // chained (dead) position or older, and the flush thread must not
+            // re-install it behind the purge.
+            if (processedPolicy != null) {
+                processedPolicy.flushIfDirty();
+            }
+            BsonDocument deadProcessed = pendingHistoryLostReset
+                    ? deadProcessedToken
+                    : persistedProcessedToken();
+            Instant now = Instant.now();
+            checkpointStore.resetAfterHistoryLost(streamName, fresh, deadProcessed, now);
+            lastCertifiedSeen = fresh;
+            initialOperationTime = null;
+            pendingHistoryLostReset = false;
+            consecutiveFailures = 0;
+            FlowWardenMetrics.get().onCheckpoint(streamName, fresh.toJson());
+            // The gate is held: no settlement can have moved the snapshot.
+            latestTokenRef.get().compareAndSet(snapshot,
+                    new TokenSnapshot(fresh, now, TokenSnapshot.Source.SEED));
+            log.info("Stream '{}' certified position repaired — the next restart resumes from it",
+                    streamName);
+        } catch (RuntimeException e) {
+            FlowWardenMetrics.get().onCheckpointFailed(streamName, e);
+            log.warn("Position repair failed for stream '{}' (retried at the next idle probe): {}",
+                    streamName, e.getMessage(), e);
+        } finally {
+            if (liveness != null) {
+                liveness.endRepair();
+            }
+        }
+    }
+
+    /** Caller holds {@link #lock}. */
+    private void logProbeFailure(Throwable cause) {
+        consecutiveFailures++;
+        String message = cause != null ? cause.getMessage() : "unknown";
+        if (consecutiveFailures == 1 || consecutiveFailures % FAILURE_WARN_EVERY == 0) {
+            log.warn("Heartbeat probe failed for stream '{}'{}: {}", streamName,
+                    consecutiveFailures > 1 ? " (" + consecutiveFailures + " consecutive failures)" : "",
+                    message, cause);
+        } else {
+            log.debug("Heartbeat probe failed for stream '{}' ({} consecutive failures): {}",
+                    streamName, consecutiveFailures, message);
+        }
+    }
+
+    /** Caller holds {@link #lock}. */
+    private void noteProbeRecovered() {
+        if (consecutiveFailures > 0) {
+            log.info("Heartbeat probe recovered for stream '{}' after {} consecutive failure(s)",
+                    streamName, consecutiveFailures);
+            consecutiveFailures = 0;
+        }
     }
 
     private void persistCertifiedPosition(TokenSnapshot snapshot,
@@ -479,6 +605,12 @@ public final class CheckpointHeartbeat {
     private BsonDocument persistedSeenToken() {
         return checkpointStore.findByStreamName(streamName)
                 .map(io.flowwarden.stream.spi.Checkpoint::lastSeenToken)
+                .orElse(null);
+    }
+
+    private BsonDocument persistedProcessedToken() {
+        return checkpointStore.findByStreamName(streamName)
+                .map(io.flowwarden.stream.spi.Checkpoint::lastProcessedToken)
                 .orElse(null);
     }
 }

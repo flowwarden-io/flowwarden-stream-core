@@ -15,6 +15,8 @@
  */
 package io.flowwarden.stream.internal.reactive;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
 import io.flowwarden.stream.ChangeStreamContext;
 import io.flowwarden.stream.FlowWardenMetrics;
 import io.flowwarden.stream.OnHistoryLost;
@@ -25,6 +27,7 @@ import io.flowwarden.stream.annotation.OnInsert;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.StopReason;
 import io.flowwarden.stream.spi.StreamMetricsProvider;
+import io.flowwarden.stream.test.LogCapture;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.BsonDocument;
 import org.bson.Document;
@@ -68,6 +71,8 @@ class ReactiveCursorDeathIntegrationTest {
     private static final String COLLECTION = "rx_cursor_death";
     private static final String POISON_STREAM = "rx-cursor-death-poison";
     private static final String POISON_COLLECTION = "rx_cursor_death_poison";
+    private static final String GHOST_STREAM = "rx-ghost-open-refused";
+    private static final String GHOST_COLLECTION = "rx_ghost_open_refused";
     private static final BsonDocument EXPIRED_TOKEN =
             BsonDocument.parse("{\"_data\": \"0000DEAD\"}");
 
@@ -82,6 +87,7 @@ class ReactiveCursorDeathIntegrationTest {
     @Autowired CheckpointStore checkpointStore;
     @Autowired ReactiveCursorDeathHandler handler;
     @Autowired ReactivePoisonHandler poisonHandler;
+    @Autowired ReactiveGhostHandler ghostHandler;
 
     private RecordingMetrics metrics;
 
@@ -90,9 +96,12 @@ class ReactiveCursorDeathIntegrationTest {
         disableFailPoint();
         handler.clear();
         poisonHandler.clear();
+        ghostHandler.clear();
         reactiveMongoTemplate.dropCollection(COLLECTION)
                 .onErrorResume(e -> Mono.empty()).block();
         reactiveMongoTemplate.dropCollection(POISON_COLLECTION)
+                .onErrorResume(e -> Mono.empty()).block();
+        reactiveMongoTemplate.dropCollection(GHOST_COLLECTION)
                 .onErrorResume(e -> Mono.empty()).block();
         checkpointStore.delete(STREAM);
         checkpointStore.delete(POISON_STREAM);
@@ -105,6 +114,7 @@ class ReactiveCursorDeathIntegrationTest {
         disableFailPoint();
         try { streamManager.stopStream(STREAM); } catch (Exception ignored) { }
         try { streamManager.stopStream(POISON_STREAM); } catch (Exception ignored) { }
+        try { streamManager.stopStream(GHOST_STREAM); } catch (Exception ignored) { }
         checkpointStore.delete(STREAM);
         checkpointStore.delete(POISON_STREAM);
         FlowWardenMetrics.setProvider(StreamMetricsProvider.noOp());
@@ -270,11 +280,91 @@ class ReactiveCursorDeathIntegrationTest {
                 .untilAsserted(() -> assertThat(handler.count()).isEqualTo(2));
     }
 
+    @Test
+    void refusedOpens_logTheStackOnce_untilTheGenerationProvesItself() {
+        // Reactive twin of the imperative test: the aggregate completes in
+        // the driver's callbacks, after subscribe() returned — a refused
+        // open terminates a pipeline whose generation never proved itself,
+        // and that return must not reset the restart cycle. Two consecutive
+        // refusals with the same cause: one ERROR with the stack trace, then
+        // one WARN without. The first delivered event closes the cycle.
+        try (LogCapture logs = LogCapture.of(ReactiveStreamManager.class)) {
+            enableFailPoint("aggregate", 2);
+            streamManager.startStream(GHOST_STREAM);
+
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                    assertThat(deathLogs(logs)).hasSize(2));
+            List<ILoggingEvent> deaths = deathLogs(logs);
+            assertThat(deaths.get(0).getLevel()).isEqualTo(Level.ERROR);
+            assertThat(deaths.get(0).getThrowableProxy())
+                    .as("first death of the cycle: full stack trace")
+                    .isNotNull();
+            assertThat(deaths.get(1).getLevel())
+                    .as("same cause, generation never proven: one line, no stack trace")
+                    .isEqualTo(Level.WARN);
+            assertThat(deaths.get(1).getThrowableProxy()).isNull();
+
+            // The failpoint is consumed: the third generation opens and
+            // proves itself by delivering an event.
+            awaitResubscribedAndDeliver(2);
+
+            enableFailPointOnce();
+            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                    assertThat(deathLogs(logs)).hasSize(3));
+            assertThat(deathLogs(logs).get(2).getLevel())
+                    .as("a proven generation died: new incident, full stack trace")
+                    .isEqualTo(Level.ERROR);
+            assertThat(deathLogs(logs).get(2).getThrowableProxy()).isNotNull();
+
+            // Same cause as the previous death — but that generation proved
+            // itself too, so this is again a new incident.
+            awaitResubscribedAndDeliver(3);
+            enableFailPointOnce();
+            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                    assertThat(deathLogs(logs)).hasSize(4));
+            assertThat(deathLogs(logs).get(3).getLevel())
+                    .as("same cause as the previous death, but that generation was proven")
+                    .isEqualTo(Level.ERROR);
+            assertThat(deathLogs(logs).get(3).getThrowableProxy()).isNotNull();
+        }
+    }
+
+    /** Runtime-death lines of the ghost stream (ERROR on a first death, WARN on a repeat). */
+    private static List<ILoggingEvent> deathLogs(LogCapture logs) {
+        return logs.events().stream()
+                .filter(e -> e.getLevel().isGreaterOrEqual(Level.WARN))
+                .filter(e -> e.getFormattedMessage().contains("'" + GHOST_STREAM + "'"))
+                .filter(e -> e.getFormattedMessage().startsWith("Error in reactive Change Stream")
+                        || e.getFormattedMessage().contains("died again"))
+                .toList();
+    }
+
+    /**
+     * Waits for the {@code n}-th resubscription of the ghost stream to be
+     * running, then inserts until the handler sees one more event: the
+     * cursor open is asynchronous, so a single insert right after
+     * {@code isRunning} could precede it and be invisible to a LATEST start.
+     */
+    private void awaitResubscribedAndDeliver(int n) {
+        await().atMost(Duration.ofSeconds(30)).until(() ->
+                metrics.restarts.stream().filter(s -> s.startsWith(GHOST_STREAM + ":")).count() >= n
+                        && streamManager.isRunning(GHOST_STREAM));
+        int before = ghostHandler.count();
+        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(300)).until(() -> {
+            reactiveMongoTemplate.insert(new Document("seq", before + 1), GHOST_COLLECTION).block();
+            return ghostHandler.count() > before;
+        });
+    }
+
     private void enableFailPointOnce() {
+        enableFailPoint("getMore", 1);
+    }
+
+    private void enableFailPoint(String command, int times) {
         adminCommand(new Document("configureFailPoint", "failCommand")
-                .append("mode", new Document("times", 1))
+                .append("mode", new Document("times", times))
                 .append("data", new Document("errorCode", 286)
-                        .append("failCommands", List.of("getMore"))
+                        .append("failCommands", List.of(command))
                         .append("appName", APP_NAME)));
     }
 
@@ -295,8 +385,26 @@ class ReactiveCursorDeathIntegrationTest {
 
     @SpringBootApplication
     @EnableFlowWarden
-    @Import({ReactiveCursorDeathHandler.class, ReactivePoisonHandler.class})
+    @Import({ReactiveCursorDeathHandler.class, ReactivePoisonHandler.class,
+            ReactiveGhostHandler.class})
     static class TestApp {}
+
+    /** No {@code @Checkpoint}: the cursor open is this stream's only aggregate command. */
+    @ChangeStream(name = GHOST_STREAM, collection = GHOST_COLLECTION,
+            documentType = Document.class, autoStart = false)
+    static class ReactiveGhostHandler {
+
+        private final List<Document> events = new CopyOnWriteArrayList<>();
+
+        @OnInsert
+        Mono<Void> handle(ChangeStreamContext<Document> ctx) {
+            ctx.getFullDocument(Document.class).ifPresent(events::add);
+            return Mono.empty();
+        }
+
+        int count() { return events.size(); }
+        void clear() { events.clear(); }
+    }
 
     @ChangeStream(name = STREAM, collection = COLLECTION,
             documentType = Document.class, autoStart = false)

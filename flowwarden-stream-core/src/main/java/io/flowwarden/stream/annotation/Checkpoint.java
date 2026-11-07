@@ -95,6 +95,15 @@ import java.lang.annotation.Target;
  *       bootstrap).</li>
  *   <li>{@link #onHistoryLost()} = strategy at cascade level 3 only.</li>
  * </ul>
+ *
+ * <p><strong>Two cadences, two jobs.</strong> {@code saveEveryN} and
+ * {@code saveIntervalSeconds} bound the work replayed after a crash on an
+ * <em>active</em> stream: they write the token of the last settled event,
+ * and only when one was settled — on a stream that settles nothing they
+ * write nothing, however often they fire, and the token they would write
+ * does not get any younger. Only {@code idleHeartbeatIntervalSeconds} keeps
+ * an <em>idle</em> stream's position alive against oplog rollover. A
+ * {@code saveIntervalSeconds} of 60 is not a one-minute keep-alive.</p>
  */
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)
@@ -169,6 +178,17 @@ public @interface Checkpoint {
      * rolls faster or probes that keep failing. Set to {@code 0} to disable
      * idle probing entirely: the stream is then exposed to oplog rollover
      * whenever it stays idle longer than the window.</p>
+     *
+     * <p>The chained position is, by construction, about one interval old
+     * when the probe runs. When the oplog has rolled past it (a write burst
+     * shrinking the window below the interval), the server refuses the probe
+     * with a non-resumable error and that position never comes back. The
+     * probe then repairs the checkpoint in place: the open cursor is at the
+     * oplog head and has missed nothing, so a fresh server-certified
+     * position is installed and the dead tokens are purged, under the
+     * stream's dispatch gate so no event in flight can be crossed. One WARN,
+     * {@code onHeartbeatProbeFailed} emitted, no history loss at the next
+     * restart. The oplog window itself remains the operator's to size.</p>
      */
     int idleHeartbeatIntervalSeconds() default 300;
 

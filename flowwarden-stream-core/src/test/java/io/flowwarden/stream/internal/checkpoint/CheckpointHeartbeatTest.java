@@ -112,6 +112,8 @@ class CheckpointHeartbeatTest {
     private static final class RecordingLiveness implements StreamLiveness {
         final LivenessGate gate = new LivenessGate();
         final List<io.flowwarden.stream.StreamStuckException> verdicts = new ArrayList<>();
+        int repairsBegun;
+        int repairsEnded;
 
         @Override
         public boolean claimStuck() {
@@ -122,6 +124,46 @@ class CheckpointHeartbeatTest {
         public void onStuck(io.flowwarden.stream.StreamStuckException cause) {
             verdicts.add(cause);
         }
+
+        @Override
+        public boolean beginRepair() {
+            boolean claimed = gate.enterRepair();
+            if (claimed) {
+                repairsBegun++;
+            }
+            return claimed;
+        }
+
+        @Override
+        public void endRepair() {
+            repairsEnded++;
+            gate.exitRepair();
+        }
+    }
+
+    private static final BsonDocument FRESH = BsonDocument.parse("{\"_data\": \"fresh\"}");
+
+    /** What {@code initialPosition()} answers — the fresh certified position of a repair. */
+    private final AtomicReference<java.util.function.Supplier<BsonDocument>> initialPosition =
+            new AtomicReference<>(() -> {
+                throw new UnsupportedOperationException("not used by tick tests");
+            });
+
+    /** Idle heartbeat with the recording liveness gate (stuck detection off). */
+    private CheckpointHeartbeat gatedHeartbeat(Function<BsonDocument, ProbeOutcome> probeFn) {
+        return gatedHeartbeat(IDLE_THRESHOLD, probeFn);
+    }
+
+    /**
+     * Same, with an explicit idle threshold — {@code Duration.ZERO} lets two
+     * consecutive {@code idleTick()} calls both probe (the heartbeat spaces
+     * idle probes one full threshold apart).
+     */
+    private CheckpointHeartbeat gatedHeartbeat(Duration idleThreshold,
+                                               Function<BsonDocument, ProbeOutcome> probeFn) {
+        policy = new ProcessedAnchorPolicy(STREAM, store, 100);
+        return new CheckpointHeartbeat(STREAM, store, probeOf(probeFn), () -> ref,
+                true, idleThreshold, null, null, policy, 0, liveness);
     }
 
     private CheckpointHeartbeat opTimeHeartbeat(org.bson.BsonTimestamp opTime,
@@ -150,9 +192,177 @@ class CheckpointHeartbeatTest {
 
             @Override
             public BsonDocument initialPosition() {
-                throw new UnsupportedOperationException("not used by tick tests");
+                return initialPosition.get().get();
             }
         };
+    }
+
+    /** The server's answer to a probe whose position rolled out of the oplog. */
+    private static com.mongodb.MongoCommandException historyLost() {
+        return new com.mongodb.MongoCommandException(
+                BsonDocument.parse("{\"ok\": 0.0, \"code\": 286, "
+                        + "\"codeName\": \"ChangeStreamHistoryLost\", "
+                        + "\"errmsg\": \"Resume of change stream was not possible, as the resume "
+                        + "point may no longer be in the oplog.\"}"),
+                new com.mongodb.ServerAddress("localhost", 27017));
+    }
+
+    // --- rolled-out position: in-place repair ---
+
+    @Test
+    void idleProbe_positionRolledOut_installsFreshPosition_andPurgesDeadPair() {
+        // The chained position is at least one idle interval old; an oplog
+        // that rolled past it answers 286 and never holds it again. The main
+        // cursor is fine (its position is at the head), nothing is in flight:
+        // a fresh certified position IS the stream's position.
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        store.persisted = new Checkpoint(STREAM, null, PERSISTED_SEEN, IDLE_SINCE,
+                DEAD_PROCESSED, IDLE_SINCE, java.util.Map.of());
+        initialPosition.set(() -> FRESH);
+        com.mongodb.MongoCommandException rolledOut = historyLost();
+        CheckpointHeartbeat hb = gatedHeartbeat(r -> ProbeOutcome.failed(rolledOut));
+
+        hb.idleTick();
+
+        assertThat(metrics.probeFailures).as("the failure is still reported").containsExactly(rolledOut);
+        assertThat(store.calls)
+                .as("the dead pair is purged along with the install, guarded on the stored processed token")
+                .containsExactly("reset:fresh/guard:dead-processed");
+        assertThat(ref.get().token()).isEqualTo(FRESH);
+        assertThat(ref.get().source()).isEqualTo(TokenSnapshot.Source.SEED);
+        assertThat(liveness.repairsBegun).isEqualTo(1);
+        assertThat(liveness.repairsEnded).as("the gate is always released").isEqualTo(1);
+        assertThat(liveness.gate.enterHandling()).as("a dispatch may run after the repair").isTrue();
+        assertThat(metrics.checkpointFailures).isEmpty();
+    }
+
+    @Test
+    void idleProbe_positionRolledOut_nextProbeChainsFromTheFreshPosition() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        initialPosition.set(() -> FRESH);
+        java.util.concurrent.atomic.AtomicReference<ProbeOutcome> outcome =
+                new java.util.concurrent.atomic.AtomicReference<>(ProbeOutcome.failed(historyLost()));
+        CheckpointHeartbeat hb = gatedHeartbeat(Duration.ZERO, r -> outcome.get());
+
+        hb.idleTick(); // dead → repaired
+        outcome.set(ProbeOutcome.empty(PBRT));
+        hb.idleTick(); // next interval, still idle
+
+        assertThat(probed).containsExactly(EVENT_A, FRESH);
+        assertThat(store.calls).containsExactly("reset:fresh/guard:null", "saveSeen+hb:pbrt");
+    }
+
+    @Test
+    void idleProbe_positionRolledOut_withHandlerInFlight_doesNotRepair() {
+        // A dispatch in flight means the stream is not idle after all; its
+        // settlement installs a fresh event token to chain from. Repairing
+        // now would install a position AFTER the event being handled.
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        initialPosition.set(() -> FRESH);
+        assertThat(liveness.gate.enterHandling()).isTrue();
+        CheckpointHeartbeat hb = gatedHeartbeat(r -> ProbeOutcome.failed(historyLost()));
+
+        hb.idleTick();
+
+        assertThat(store.calls).isEmpty();
+        assertThat(ref.get().token()).isEqualTo(EVENT_A);
+        assertThat(liveness.repairsBegun).isZero();
+        assertThat(metrics.probeFailures).hasSize(1);
+    }
+
+    @Test
+    void probeNow_positionRolledOut_neverRepairs() {
+        // The startup diagnostic and the establishment chain run while
+        // nothing is known about the cursor (or while it may be replaying):
+        // no repair outside the idle precondition.
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        initialPosition.set(() -> FRESH);
+        CheckpointHeartbeat hb = gatedHeartbeat(r -> ProbeOutcome.failed(historyLost()));
+
+        hb.probeNow();
+
+        assertThat(store.calls).isEmpty();
+        assertThat(ref.get().token()).isEqualTo(EVENT_A);
+        assertThat(liveness.repairsBegun).isZero();
+    }
+
+    @Test
+    void idleProbe_transientFailure_keepsThePosition() {
+        // Only a non-resumable answer proves the position dead; a timeout or
+        // a network error says nothing about it.
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        initialPosition.set(() -> FRESH);
+        RuntimeException boom = new RuntimeException("socket timeout");
+        CheckpointHeartbeat hb = gatedHeartbeat(r -> ProbeOutcome.failed(boom));
+
+        hb.idleTick();
+
+        assertThat(store.calls).isEmpty();
+        assertThat(ref.get().token()).isEqualTo(EVENT_A);
+        assertThat(liveness.repairsBegun).isZero();
+        assertThat(metrics.probeFailures).containsExactly(boom);
+    }
+
+    @Test
+    void idleProbe_rolledOutDuringOplogStartRecovery_repairsWithTheDeadProcessedGuard() {
+        // The recovery operation time itself rolled over before anything was
+        // established: the deferred cleanup is performed by the repair, with
+        // the dead processed token read at detection as the guard.
+        org.bson.BsonTimestamp opTime = new org.bson.BsonTimestamp(1234, 1);
+        policy = new ProcessedAnchorPolicy(STREAM, store, 100);
+        CheckpointHeartbeat hb = new CheckpointHeartbeat(STREAM, store,
+                probeOf(r -> ProbeOutcome.failed(historyLost())), () -> ref,
+                false, IDLE_THRESHOLD, opTime, DEAD_PROCESSED, policy, 0, liveness);
+        initialPosition.set(() -> FRESH);
+        assertThat(hb.needsEstablishment()).isTrue();
+
+        hb.idleTick();
+
+        assertThat(opTimeProbes).containsExactly(opTime);
+        assertThat(store.calls).containsExactly("reset:fresh/guard:dead-processed");
+        assertThat(hb.needsEstablishment()).as("a durable position ends the chain").isFalse();
+        assertThat(ref.get().token()).isEqualTo(FRESH);
+    }
+
+    @Test
+    void idleProbe_repairFailure_isContained_andRetriedAtTheNextProbe() {
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        initialPosition.set(() -> {
+            if (calls.incrementAndGet() == 1) {
+                throw new RuntimeException("server selection timed out");
+            }
+            return FRESH;
+        });
+        CheckpointHeartbeat hb = gatedHeartbeat(Duration.ZERO, r -> ProbeOutcome.failed(historyLost()));
+
+        hb.idleTick();
+        assertThat(store.calls).isEmpty();
+        assertThat(metrics.checkpointFailures).hasSize(1);
+        assertThat(liveness.repairsEnded).as("the gate is released on failure too").isEqualTo(1);
+        assertThat(ref.get().token()).isEqualTo(EVENT_A);
+
+        hb.idleTick(); // next interval, still idle
+        assertThat(store.calls).containsExactly("reset:fresh/guard:null");
+        assertThat(ref.get().token()).isEqualTo(FRESH);
+    }
+
+    @Test
+    void idleProbe_repair_flushesADirtyProcessedAnchorFirst() {
+        // A dirty settled token can only be the chained (dead) position or
+        // older: it is written, read back as the guard and purged by the
+        // same reset — the flush thread cannot re-install it afterwards.
+        ref.set(new TokenSnapshot(EVENT_A, IDLE_SINCE));
+        initialPosition.set(() -> FRESH);
+        CheckpointHeartbeat hb = gatedHeartbeat(r -> ProbeOutcome.failed(historyLost()));
+        policy.onSettled(EVENT_A, IDLE_SINCE);
+        store.persisted = new Checkpoint(STREAM, null, null, null, EVENT_A, IDLE_SINCE, java.util.Map.of());
+
+        hb.idleTick();
+
+        assertThat(store.calls).containsExactly("saveProcessed+hb:event-a", "reset:fresh/guard:event-a");
+        hb.flushTick();
+        assertThat(store.calls).as("clean after the flush: nothing re-installed").hasSize(2);
     }
 
     // --- flushTick: the processed-anchor time threshold, dirty-only ---
