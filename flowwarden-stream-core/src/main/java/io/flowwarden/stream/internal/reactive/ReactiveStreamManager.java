@@ -43,6 +43,7 @@ import io.flowwarden.stream.internal.discovery.PipelineMethod;
 import io.flowwarden.stream.StreamStuckException;
 import io.flowwarden.stream.internal.StreamRestarter;
 import io.flowwarden.stream.internal.checkpoint.HeartbeatProbe;
+import io.flowwarden.stream.internal.checkpoint.HistoryLostErrors;
 import io.flowwarden.stream.internal.checkpoint.LivenessGate;
 import io.flowwarden.stream.internal.checkpoint.StreamLiveness;
 import io.flowwarden.stream.internal.restart.RestartPolicyConfig;
@@ -81,6 +82,7 @@ import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -118,6 +120,26 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     private final Map<String, ScheduledFuture<?>> intervalTasks = new ConcurrentHashMap<>();
     private final Map<String, ScheduledFuture<?>> idleProbeTasks = new ConcurrentHashMap<>();
     private final Map<String, CheckpointHeartbeat> heartbeats = new ConcurrentHashMap<>();
+    /**
+     * Streams whose last generation of the current restart cycle resumed at
+     * the oldest oplog entry ({@code RESUME_FROM_OPLOG_START}) and died with
+     * a history-lost error before establishing a position — see the
+     * imperative manager's twin field. Mutated on the death path alone: the
+     * death of a {@linkplain ReactiveStreamState#proven proven} generation
+     * closes the cycle and clears the entry first; an operator stop clears
+     * it too.
+     */
+    private final Set<String> degradeOplogStart = ConcurrentHashMap.newKeySet();
+    /**
+     * Signature of the last runtime death of each stream within the current
+     * restart cycle — a repeat logs one WARN line instead of an ERROR with
+     * the stack trace; see the imperative manager's twin field. Written on
+     * the death path alone and only consulted for the death of a generation
+     * that never {@linkplain ReactiveStreamState#proven proved} itself.
+     * Never touched by {@code subscribe()} returning (the aggregate
+     * completes asynchronously) nor by any proof-of-life signal.
+     */
+    private final Map<String, String> lastDeathSignatures = new ConcurrentHashMap<>();
     private final ScheduledExecutorService intervalScheduler =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "fw-checkpoint-interval-reactive");
@@ -168,7 +190,14 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             AtomicReference<OperationType> pendingInvalidateCause,
             AtomicBoolean invalidatedTerminal,
             AtomicBoolean terminated,
-            LivenessGate dispatchGate) {
+            LivenessGate dispatchGate,
+            /** This generation resumed at the oldest oplog entry (recovery not yet established). */
+            AtomicBoolean oplogStartRecovery,
+            /**
+             * This generation's OWN cursor delivered an event — the only open
+             * signal Reactor exposes. Read by this generation's death.
+             */
+            AtomicBoolean proven) {
     }
 
     /**
@@ -284,10 +313,14 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             resumeContext = ResumeCascade.resolve(streamName, def.checkpointAnnotation(),
                     checkpointStore, probe,
                     token -> isTokenValid(def.collection(), token, streamTemplate, streamName),
-                    () -> getOldestOplogTimestamp(streamTemplate));
+                    () -> getOldestOplogTimestamp(streamTemplate),
+                    !degradeOplogStart.contains(streamName));
             if (resumeContext.seedToken() != null) {
                 optionsBuilder.resumeAfter(resumeContext.seedToken());
             } else if (resumeContext.initialOperationTime() != null) {
+                // The full BsonTimestamp, increment included: the oldest
+                // oplog entry is (t, i ≥ 1), and (t, 0) would be rejected
+                // as fallen off the oplog on every attempt.
                 optionsBuilder.resumeAt(resumeContext.initialOperationTime());
             }
         }
@@ -337,7 +370,9 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         ReactiveStreamState state =
                 new ReactiveStreamState(disposableHolder, def, gracefulStop, lastError, probe,
                         new AtomicReference<>(), new AtomicBoolean(false), terminated,
-                        new LivenessGate());
+                        new LivenessGate(),
+                        new AtomicBoolean(resumeContext.initialOperationTime() != null),
+                        new AtomicBoolean(false));
         // The processed-anchor policy is installed before any delivery can
         // settle: the delivery path, the flush timer and the manual save
         // all serialize their writes through it.
@@ -367,6 +402,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     if (raw == null) {
                         return Mono.empty();
                     }
+                    noteGenerationProven(state);
                     // Dispatch gate for the stuck-stream verdict, claimed
                     // HERE — on receipt, before the boundedElastic hop — so
                     // an event waiting for a worker already counts as in
@@ -398,8 +434,22 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 })
                 .doOnError(e -> {
                     lastError.set(e);
-                    log.error("Error in reactive Change Stream '{}': {}",
-                            streamName, e.getMessage(), e);
+                    // The cycle state is decided HERE from this generation's
+                    // own proof: Reactor serializes the signals, so no event
+                    // of this subscription can follow its error.
+                    logRuntimeDeath(streamName, state, e);
+                    if (state.proven().get()) {
+                        // A proven generation closes its restart cycle.
+                        degradeOplogStart.remove(streamName);
+                    }
+                    if (state.oplogStartRecovery().get() && HistoryLostErrors.isHistoryLost(e)) {
+                        // Resumed at the oldest oplog entry and died
+                        // non-resumable before establishing a position: the
+                        // entry rolled over between the read and the open.
+                        // The next attempt of this cycle must not lose the
+                        // same race.
+                        degradeOplogStart.add(streamName);
+                    }
                 })
                 .onErrorResume(e -> {
                     try {
@@ -508,10 +558,51 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             return;
         }
 
+        // NOT the end of the restart cycle: the aggregate completes in the
+        // driver's callbacks, after subscribe() returned — a refused open
+        // terminates the pipeline with the state already installed. The
+        // cycle closes with the death of a generation that proved itself
+        // (noteGenerationProven).
         log.info("Started reactive Change Stream '{}' on collection '{}'",
                 streamName, def.collection());
 
         FlowWardenMetrics.get().onStreamStarted(streamName, buildStreamConfiguration(def, "REACTIVE"));
+    }
+
+    /**
+     * Proof that this generation's OWN cursor opened on the server: its
+     * first delivered event — the only signal Reactor exposes for the main
+     * cursor (the aggregate and the getMores complete inside the driver). An
+     * idle generation therefore stays unproven until it delivers, which can
+     * only throttle a repeat of the previous cause to one WARN line — never
+     * the reverse. A heartbeat probe proves nothing: it opens its own
+     * cursor. Only a proven generation closes the restart cycle, at its
+     * death; see the imperative manager's twin method.
+     */
+    private void noteGenerationProven(ReactiveStreamState state) {
+        state.proven().set(true);
+    }
+
+    /**
+     * ERROR with the full stack trace on the first death of a restart cycle;
+     * one WARN line for every further death with the same signature. A loop
+     * of identical deaths is one problem, not one problem per attempt. The
+     * death of a proven generation opens a new cycle and is logged in full
+     * whatever the previous signature; only an unproven generation — its
+     * open refused, or dead before its first event — can repeat it.
+     */
+    private void logRuntimeDeath(String streamName, ReactiveStreamState state, Throwable error) {
+        String signature = HistoryLostErrors.signatureOf(error);
+        String previous = state.proven().get() ? null : lastDeathSignatures.get(streamName);
+        lastDeathSignatures.put(streamName, signature);
+        if (signature.equals(previous)) {
+            log.warn("Reactive Change Stream '{}' died again (same cause as the previous death, "
+                            + "stack trace omitted): {}",
+                    streamName, error.getMessage());
+        } else {
+            log.error("Error in reactive Change Stream '{}': {}",
+                    streamName, error.getMessage(), error);
+        }
     }
 
     /**
@@ -585,6 +676,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             idleTask.cancel(false);
         }
         latestTokens.remove(streamName);
+        // An operator stop ends the restart cycle — including one whose
+        // restart was still pending (no state installed): the next start is
+        // a new cycle, its first death logged in full.
+        lastDeathSignatures.remove(streamName);
+        degradeOplogStart.remove(streamName);
 
         ReactiveStreamState state = streams.remove(streamName);
         if (state == null) {
@@ -644,6 +740,12 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
     boolean isRestartPending(String streamName) {
         return restarter.isRestartPending(streamName);
+    }
+
+    /** Whether the installed generation's own cursor is known to have opened. */
+    boolean isGenerationProven(String streamName) {
+        ReactiveStreamState state = streams.get(streamName);
+        return state != null && state.proven().get();
     }
 
     /**
@@ -1250,6 +1352,16 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     @Override
                     public void onStuck(StreamStuckException cause) {
                         declareStuck(streamName, state, cause);
+                    }
+
+                    @Override
+                    public boolean beginRepair() {
+                        return state.dispatchGate().enterRepair();
+                    }
+
+                    @Override
+                    public void endRepair() {
+                        state.dispatchGate().exitRepair();
                     }
                 });
         heartbeats.put(streamName, heartbeat);

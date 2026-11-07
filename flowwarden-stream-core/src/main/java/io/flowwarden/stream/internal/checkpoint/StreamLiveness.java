@@ -45,4 +45,17 @@ public interface StreamLiveness {
      * restart hand-off.
      */
     void onStuck(StreamStuckException cause);
+
+    /**
+     * Claims the generation's {@link LivenessGate} for a position repair —
+     * the heartbeat replacing a position that rolled out of the oplog with a
+     * fresh server-certified one. {@code false} when a dispatch is in flight
+     * or the generation was declared stuck: no repair then. While held, a
+     * dispatch waits instead of starting, so the fresh position cannot cross
+     * an event in flight. Always paired with {@link #endRepair()}.
+     */
+    boolean beginRepair();
+
+    /** Releases the gate claimed by {@link #beginRepair()}. */
+    void endRepair();
 }

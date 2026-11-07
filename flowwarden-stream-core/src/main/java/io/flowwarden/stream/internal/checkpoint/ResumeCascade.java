@@ -79,6 +79,16 @@ public final class ResumeCascade {
      * @param oldestOplogTimestamp  reads the oldest entry of the stream's own
      *                              cluster's oplog; may throw — the failure
      *                              falls back to a RESUME_FROM_NOW bootstrap
+     * @param oplogStartAllowed     whether a {@code RESUME_FROM_OPLOG_START}
+     *                              recovery may actually resume at the oldest
+     *                              oplog entry. {@code false} when the
+     *                              previous attempt of the same restart cycle
+     *                              opened at that entry and died with a
+     *                              history-lost error (the entry rolled over
+     *                              between the read and the open): the
+     *                              recovery then degrades to a fresh
+     *                              certified position instead of losing the
+     *                              same race again
      * @return the immutable resume outcome
      * @throws HistoryLostException under {@code OnHistoryLost.FAIL} when both
      *                              tokens have aged out
@@ -88,7 +98,8 @@ public final class ResumeCascade {
                                         CheckpointStore checkpointStore,
                                         HeartbeatProbe probe,
                                         TokenValidator tokenValidator,
-                                        Supplier<BsonTimestamp> oldestOplogTimestamp) {
+                                        Supplier<BsonTimestamp> oldestOplogTimestamp,
+                                        boolean oplogStartAllowed) {
         Optional<io.flowwarden.stream.spi.Checkpoint> cpOpt =
                 checkpointStore.findByStreamName(streamName);
         if (cpOpt.isEmpty()) {
@@ -132,7 +143,7 @@ public final class ResumeCascade {
             return handleHistoryLost(streamName, checkpointAnnotation, checkpointStore, probe,
                     mostRecent(cp.lastProcessedTimestamp(), cp.lastSeenTimestamp(),
                             cp.lastHeartbeatTimestamp()),
-                    processedToken, oldestOplogTimestamp);
+                    processedToken, oldestOplogTimestamp, oplogStartAllowed);
         }
         // Checkpoint document exists but both tokens are null → bootstrap,
         // same as a stream with no prior checkpoint.
@@ -182,7 +193,8 @@ public final class ResumeCascade {
                                                    HeartbeatProbe probe,
                                                    Instant lastCheckpointTimestamp,
                                                    BsonDocument deadProcessedToken,
-                                                   Supplier<BsonTimestamp> oldestOplogTimestamp) {
+                                                   Supplier<BsonTimestamp> oldestOplogTimestamp,
+                                                   boolean oplogStartAllowed) {
         OnHistoryLost strategy = checkpointAnnotation.onHistoryLost();
         log.warn("Resume token expired for stream '{}' (last checkpoint: {}). Applying strategy: {}",
                 streamName, lastCheckpointTimestamp, strategy);
@@ -199,6 +211,20 @@ public final class ResumeCascade {
                 return bootstrapInitialPosition(streamName, checkpointStore, probe, deadProcessedToken);
             }
             case RESUME_FROM_OPLOG_START -> {
+                if (!oplogStartAllowed) {
+                    // The previous attempt of this restart cycle resumed at
+                    // the oldest entry and died at open with a history-lost
+                    // error: the entry rolled over between the read and the
+                    // open, and an oplog truncating that fast will win the
+                    // race again. Degrade once instead of looping.
+                    log.warn("Stream '{}': the previous attempt to resume from the oldest oplog "
+                                    + "entry died at open with a history-lost error — the oplog is "
+                                    + "truncating faster than the stream can open. Starting from a "
+                                    + "fresh certified position instead; events since the last "
+                                    + "checkpoint activity ({}) were NOT replayed",
+                            streamName, lastCheckpointTimestamp);
+                    return bootstrapInitialPosition(streamName, checkpointStore, probe, deadProcessedToken);
+                }
                 BsonTimestamp oldestTs;
                 try {
                     // The stream's own template: on multi-cluster setups the
@@ -214,6 +240,22 @@ public final class ResumeCascade {
                             streamName, e.getMessage());
                     return bootstrapInitialPosition(streamName, checkpointStore, probe, deadProcessedToken);
                 }
+                // Validate the position before committing the stream to it,
+                // exactly as the cascade validates tokens: the oldest entry
+                // read a moment ago may already be gone on an oplog that is
+                // being truncated. Only a non-resumable answer degrades; a
+                // transient probe failure leaves the decision to the open.
+                ProbeOutcome check = probe.probeFromOperationTime(oldestTs);
+                if (check.type() == ProbeOutcome.Type.FAILED
+                        && HistoryLostErrors.isHistoryLost(check.cause())) {
+                    log.warn("Stream '{}': the oldest oplog entry ({}) rolled over before the stream "
+                                    + "could resume from it — the oplog is truncating faster than the "
+                                    + "stream can open. Starting from a fresh certified position "
+                                    + "instead; events since the last checkpoint activity ({}) were "
+                                    + "NOT replayed",
+                            streamName, toInstant(oldestTs), lastCheckpointTimestamp);
+                    return bootstrapInitialPosition(streamName, checkpointStore, probe, deadProcessedToken);
+                }
                 // The dead tokens deliberately STAY in the checkpoint: they
                 // are the only durable marker that a recovery is due. A crash
                 // before the establishment write re-enters this recovery on
@@ -221,11 +263,25 @@ public final class ResumeCascade {
                 // silently bootstrapping "from now". The establishment write
                 // performs the deferred cleanup, guarded by the dead
                 // processed token carried in the context.
-                log.info("Stream '{}' will resume from oldest oplog entry at {}", streamName, oldestTs);
+                //
+                // The replay bound is the operator's reconciliation range:
+                // whatever happened on the watched collection between the
+                // last checkpoint activity and the oldest surviving entry is
+                // gone with the oplog, and nothing here can tell whether
+                // there was anything.
+                log.warn("Stream '{}' resumes from the oldest oplog entry at {}: events on the watched "
+                                + "collection between the last checkpoint activity ({}) and that entry, "
+                                + "if any, are gone with the oplog and were NOT replayed — reconcile "
+                                + "that range on the application side",
+                        streamName, toInstant(oldestTs), lastCheckpointTimestamp);
                 return new ResumeContext(null, oldestTs, deadProcessedToken);
             }
         }
         throw new IllegalStateException("Unknown OnHistoryLost strategy: " + strategy);
+    }
+
+    private static Instant toInstant(BsonTimestamp ts) {
+        return Instant.ofEpochSecond(ts.getTime());
     }
 
     private static Instant mostRecent(Instant... candidates) {
