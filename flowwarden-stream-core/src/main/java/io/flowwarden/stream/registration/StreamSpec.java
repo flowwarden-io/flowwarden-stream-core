@@ -25,6 +25,8 @@ import io.flowwarden.stream.core.DocumentHandler;
 import io.flowwarden.stream.core.ErrorHandler;
 import io.flowwarden.stream.core.ReactiveContextHandler;
 import io.flowwarden.stream.core.ReactiveDocumentHandler;
+import io.flowwarden.stream.core.ReactiveReconcileHandler;
+import io.flowwarden.stream.core.ReconcileHandler;
 import org.bson.conversions.Bson;
 
 import java.util.ArrayList;
@@ -55,7 +57,8 @@ import java.util.function.Supplier;
  *       {@code @DeadLetterQueue} ({@link DeadLetterQueueSpec}),
  *       {@code @MongoDlqOptions} ({@link MongoDlqOptionsSpec}), the typed handlers
  *       ({@code @OnInsert}/{@code @OnUpdate}/{@code @OnDelete}/{@code @OnReplace}/{@code @OnChange}),
- *       {@code @Pipeline}, {@code @Filter}, and {@code @OnError}.</li>
+ *       {@code @Pipeline}, {@code @Filter}, {@code @OnError}, and {@code @Reconcile}
+ *       ({@link Builder#reconcile(ReconcileHandler)} / {@link Builder#reconcileReactive(ReactiveReconcileHandler)}).</li>
  *   <li>The {@code @ChangeStream} attributes themselves — {@code collection}, {@code database},
  *       {@code mongoTemplateRef}, {@code enabled}, {@code autoStart}, {@code fullDocument},
  *       {@code fullDocumentBeforeChange}, {@code deploymentMode} and {@code zone}.</li>
@@ -91,6 +94,8 @@ public final class StreamSpec<T> {
     private final TypedHandler<T> onChangeHandler;
     private final Supplier<List<Bson>> pipeline;
     private final Predicate<ChangeStreamContext<T>> filter;
+    private final ReconcileHandler reconcile;
+    private final ReactiveReconcileHandler reconcileReactive;
     private final List<ErrorHandlerBinding> errorHandlers;
     private final List<String> handlerNames;
 
@@ -115,6 +120,8 @@ public final class StreamSpec<T> {
         this.onChangeHandler = builder.onChangeHandler;
         this.pipeline = builder.pipeline;
         this.filter = builder.filter;
+        this.reconcile = builder.reconcile;
+        this.reconcileReactive = builder.reconcileReactive;
         this.errorHandlers = List.copyOf(builder.errorHandlers);
         this.handlerNames = List.copyOf(builder.handlerNames);
     }
@@ -210,6 +217,16 @@ public final class StreamSpec<T> {
         return Optional.ofNullable(filter);
     }
 
+    /** The blocking reconciliation hook, if any — equivalent of a {@code void @Reconcile} method. */
+    public Optional<ReconcileHandler> reconcile() {
+        return Optional.ofNullable(reconcile);
+    }
+
+    /** The reactive reconciliation hook, if any — equivalent of a {@code Mono<Void> @Reconcile} method. */
+    public Optional<ReactiveReconcileHandler> reconcileReactive() {
+        return Optional.ofNullable(reconcileReactive);
+    }
+
     /** All {@code onError} registrations (unmodifiable, possibly empty) — equivalent of {@code @OnError}. */
     public List<ErrorHandlerBinding> errorHandlers() {
         return errorHandlers;
@@ -255,6 +272,8 @@ public final class StreamSpec<T> {
         private TypedHandler<T> onChangeHandler;
         private Supplier<List<Bson>> pipeline;
         private Predicate<ChangeStreamContext<T>> filter;
+        private ReconcileHandler reconcile;
+        private ReactiveReconcileHandler reconcileReactive;
         private final List<ErrorHandlerBinding> errorHandlers = new ArrayList<>();
         private List<String> handlerNames = List.of();
 
@@ -445,6 +464,34 @@ public final class StreamSpec<T> {
         }
 
         /**
+         * The application's reconciliation of a lost history window — equivalent of
+         * {@code @Reconcile}. Runs before the cursor opens and before any checkpoint write
+         * when both saved positions have aged out of the oplog and the checkpoint's
+         * {@code onHistoryLost} strategy resumes; a throw stops the start. Only one hook
+         * (blocking or reactive) is allowed per stream. Requires a {@link #checkpoint(CheckpointSpec)}
+         * with {@code startPosition = RESUME} and a strategy other than {@code FAIL}
+         * (validated at bootstrap).
+         *
+         * @see io.flowwarden.stream.annotation.Reconcile
+         */
+        public Builder<T> reconcile(ReconcileHandler reconcile) {
+            requireReconcileUnset();
+            this.reconcile = Objects.requireNonNull(reconcile, "reconcile must not be null");
+            return this;
+        }
+
+        /**
+         * Reactive variant of {@link #reconcile(ReconcileHandler)}: the returned {@code Mono}
+         * is awaited on the starting thread before the cursor opens; an error signal stops
+         * the start.
+         */
+        public Builder<T> reconcileReactive(ReactiveReconcileHandler reconcile) {
+            requireReconcileUnset();
+            this.reconcileReactive = Objects.requireNonNull(reconcile, "reconcile must not be null");
+            return this;
+        }
+
+        /**
          * The names under which monitoring presents this stream's handlers —
          * {@code StreamConfiguration.handlers}, hence the reporter and the Console — in
          * place of the ones derived from the registered handlers ({@code INSERT},
@@ -488,6 +535,12 @@ public final class StreamSpec<T> {
             }
             typedHandlers.put(operationType, handler);
             return this;
+        }
+
+        private void requireReconcileUnset() {
+            if (reconcile != null || reconcileReactive != null) {
+                throw new IllegalStateException("A reconcile hook is already registered on stream '" + name + "'");
+            }
         }
 
         private void requireOnChangeUnset() {

@@ -23,6 +23,7 @@ import io.flowwarden.stream.core.DocumentHandler;
 import io.flowwarden.stream.core.ReactiveContextHandler;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import reactor.core.publisher.Mono;
 
 import java.util.List;
 
@@ -249,6 +250,42 @@ class StreamSpecTest {
         StreamSpec.Builder<Order> builder = StreamSpec.builder("orders-stream", Order.class)
                 .filter(ctx -> true);
         assertThrows(IllegalStateException.class, () -> builder.filter(ctx -> false));
+    }
+
+    @Test
+    void reconcileIsStored() {
+        StreamSpec<Order> spec = StreamSpec.builder("orders-stream", Order.class)
+                .reconcile(ctx -> { })
+                .onChange(ctx -> { })
+                .build();
+
+        assertTrue(spec.reconcile().isPresent());
+        assertTrue(spec.reconcileReactive().isEmpty());
+    }
+
+    @Test
+    void reconcileReactiveIsStored() {
+        StreamSpec<Order> spec = StreamSpec.builder("orders-stream", Order.class)
+                .reconcileReactive(ctx -> Mono.empty())
+                .onChange(ctx -> { })
+                .build();
+
+        assertTrue(spec.reconcileReactive().isPresent());
+        assertTrue(spec.reconcile().isEmpty());
+    }
+
+    @Test
+    void throwsWhenReconcileRegisteredTwice() {
+        StreamSpec.Builder<Order> builder = StreamSpec.builder("orders-stream", Order.class)
+                .reconcile(ctx -> { });
+        assertThrows(IllegalStateException.class, () -> builder.reconcile(ctx -> { }));
+    }
+
+    @Test
+    void throwsWhenBlockingAndReactiveReconcileBothRegistered() {
+        StreamSpec.Builder<Order> builder = StreamSpec.builder("orders-stream", Order.class)
+                .reconcile(ctx -> { });
+        assertThrows(IllegalStateException.class, () -> builder.reconcileReactive(ctx -> Mono.empty()));
     }
 
     @Test

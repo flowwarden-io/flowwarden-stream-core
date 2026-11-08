@@ -229,7 +229,7 @@ See the [Comprehensive Example](#comprehensive-example) above for usage, or the 
 
 ### Streams without annotations
 
-When the stream catalog lives outside the JVM — a YAML file, a database table, a feature-flag service — declare streams programmatically instead. A `StreamDefinitionContributor` bean is called once at bootstrap and describes each stream with the `StreamSpec` builder; every builder call maps 1:1 to an annotation (`.pipeline(...)`, `.filter(...)`, `.onError(...)`, `.checkpoint(...)`, `.retryPolicy(...)`, `.restartPolicy(...)`, `.deadLetterQueue(...)`), with the same defaults and the same fail-fast validation. Both styles coexist in one application.
+When the stream catalog lives outside the JVM — a YAML file, a database table, a feature-flag service — declare streams programmatically instead. A `StreamDefinitionContributor` bean is called once at bootstrap and describes each stream with the `StreamSpec` builder; every builder call maps 1:1 to an annotation (`.pipeline(...)`, `.filter(...)`, `.onError(...)`, `.reconcile(...)`, `.checkpoint(...)`, `.retryPolicy(...)`, `.restartPolicy(...)`, `.deadLetterQueue(...)`), with the same defaults and the same fail-fast validation. Both styles coexist in one application.
 
 ```java
 @Component
@@ -256,6 +256,26 @@ If a stream stays down (or its resume point cannot be maintained) longer than th
 - **`FAIL`** (default) — a terminal stop: the stream refuses to start until an operator either deletes the stream's document from the checkpoint collection (`_fw_checkpoints` with the built-in Mongo stores) to restart from a fresh position, or switches the strategy. Choose it when losing events must never go unnoticed.
 - **`RESUME_FROM_NOW`** — the recovery abandons the lost history explicitly: a fresh server-certified position is persisted (clearing the expired tokens) and the stream resumes from it. Recommended for rebuildable projections (search models, caches) — reindex the gap after recovery.
 - **`RESUME_FROM_OPLOG_START`** — replays whatever history is still readable from the oldest oplog entry. Inherently racy on a tight oplog; falls back to the `RESUME_FROM_NOW` behavior if the oplog boundary cannot be read.
+
+Under either self-repairing strategy the events of the lost window are gone — MongoDB discarded them. A stream that maintains a **derived view** (a search model, a cache, a projection aggregated from several collections) declares a `@Reconcile` method (or `.reconcile(...)` on a contributed stream): it receives the bound of the lost window and runs **before** the stream resumes and before any checkpoint write, so the reconciliation never interleaves with live events. A hook that throws stops the start like `FAIL`; the expired tokens are kept, and the next start reconciles again.
+
+```java
+@ChangeStream(collection = "dossiers")
+@Checkpoint(onHistoryLost = OnHistoryLost.RESUME_FROM_OPLOG_START)
+public class DossierSearchProjection {
+
+    @OnInsert @OnUpdate
+    public void project(Dossier d, ChangeStreamContext<Dossier> ctx) { /* update the search model */ }
+
+    @Reconcile
+    public void rebuild(HistoryLostContext ctx) {
+        // [lostWindowStart, lostWindowEnd]: the window to re-synchronize; everything after it is replayed by the stream
+        searchModel.resyncDossiersTouchedSince(ctx.lostWindowStart().orElse(Instant.EPOCH));
+    }
+}
+```
+
+If the reconciliation outlives the oplog window, the hook is called once more on the small residual window; if that rolls out too, the start fails with a message saying the reconciliation does not fit in the oplog — grow it, or make the reconciliation faster. Sizing the oplog for the longest expected downtime remains the operator's job; the idle heartbeat's probe warning is the signal that it is too small.
 
 
 ## FlowWarden Ecosystem

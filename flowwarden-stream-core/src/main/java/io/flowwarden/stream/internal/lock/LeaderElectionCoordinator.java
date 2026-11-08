@@ -27,7 +27,9 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -52,8 +54,26 @@ public class LeaderElectionCoordinator {
     private final String instanceId;
     private final Duration lockTtl;
     private final ScheduledExecutorService scheduler;
+    /**
+     * Where a standby poll — and the {@code onBecameLeader} callback it may
+     * run — executes. The callback starts the stream: resume cascade,
+     * possibly a {@code @Reconcile} hook of several minutes. It must never
+     * occupy the two-thread scheduler, whose fixed-rate tasks renew every
+     * lease this instance holds: two long starts there would starve every
+     * renewal, lose every leadership, and let another instance begin the
+     * same reconciliations.
+     */
+    private final ExecutorService startExecutor;
     private final Map<String, ScheduledFuture<?>> heartbeatTasks = new ConcurrentHashMap<>();
     private final Map<String, ScheduledFuture<?>> pollingTasks = new ConcurrentHashMap<>();
+    /**
+     * Streams with a standby poll in flight on the start executor. Fixed-rate
+     * scheduling only prevents overlap for a task that runs on the scheduler;
+     * once the tick is handed off, a slow {@code tryAcquire} (or a long
+     * leader callback) would let the next tick run concurrently and acquire
+     * the same lease twice — the SPI allows reacquisition by the owner.
+     */
+    private final java.util.Set<String> pollsInFlight = ConcurrentHashMap.newKeySet();
     private final Map<String, LeaderRole> roles = new ConcurrentHashMap<>();
 
     public LeaderElectionCoordinator(LockService lockService, String instanceId) {
@@ -66,6 +86,11 @@ public class LeaderElectionCoordinator {
         this.lockTtl = lockTtl;
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r, "fw-leader-election");
+            t.setDaemon(true);
+            return t;
+        });
+        this.startExecutor = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "fw-leader-start");
             t.setDaemon(true);
             return t;
         });
@@ -133,6 +158,7 @@ public class LeaderElectionCoordinator {
                     released, instanceId);
         }
 
+        startExecutor.shutdownNow();
         scheduler.shutdown();
         try {
             if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -142,6 +168,11 @@ public class LeaderElectionCoordinator {
             scheduler.shutdownNow();
             Thread.currentThread().interrupt();
         }
+    }
+
+    /** Whether a lease renewal task is scheduled for the stream (test/diagnostic hook). */
+    boolean isRenewingLease(String streamName) {
+        return heartbeatTasks.containsKey(streamName);
     }
 
     /**
@@ -155,6 +186,17 @@ public class LeaderElectionCoordinator {
         roles.put(streamName, LeaderRole.LEADER);
         log.info("Instance became LEADER for stream '{}' (instanceId={})", streamName, instanceId);
         emitLeadershipChange(streamName, "LEADER");
+
+        // Renew the lease WHILE the callback runs: starting the stream can
+        // take longer than the lock TTL (a resume cascade on a slow cluster,
+        // a @Reconcile hook reconciling a lost window), and a lease that
+        // expires mid-start hands the same stream to a standby. Both failure
+        // branches below cancel this task — a leader whose startup failed
+        // must not keep renewing.
+        ScheduledFuture<?> heartbeat = scheduler.scheduleAtFixedRate(
+                () -> heartbeatTick(streamName, onBecameLeader, onLostLeadership),
+                HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        heartbeatTasks.put(streamName, heartbeat);
 
         try {
             onBecameLeader.run();
@@ -191,19 +233,11 @@ public class LeaderElectionCoordinator {
             // Same compensation-before-release ordering as the terminal
             // branch — a partial start must be undone before another
             // instance can acquire the lease.
+            cancelTask(heartbeatTasks, streamName);
             invokeLostLeadership(streamName, onLostLeadership);
             releaseQuietly(streamName);
             becomeStandby(streamName, onBecameLeader, onLostLeadership);
-            return;
         }
-
-        // Schedule heartbeat renewal — only after the callback returned
-        // normally: a leader whose startup failed must never renew the lease.
-        ScheduledFuture<?> heartbeat = scheduler.scheduleAtFixedRate(
-                () -> heartbeatTick(streamName, onBecameLeader, onLostLeadership),
-                HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
-
-        heartbeatTasks.put(streamName, heartbeat);
     }
 
     /**
@@ -278,8 +312,25 @@ public class LeaderElectionCoordinator {
         cancelTask(heartbeatTasks, streamName);
         roles.put(streamName, LeaderRole.STANDBY);
 
-        invokeLostLeadership(streamName, onLostLeadership);
-        becomeStandby(streamName, onBecameLeader, onLostLeadership);
+        // The compensation is the manager's stopStream, which waits for the
+        // stream's lifecycle lock — held for the whole duration of a start
+        // (resume cascade, @Reconcile hook). It must not run on a scheduler
+        // thread: two streams losing their lease mid-reconciliation would
+        // pin both renewal threads and stall every other lease. Standby
+        // polling re-enters after it, as before; a poll that wins the lease
+        // before the stop completed is serialized behind it by the same
+        // lifecycle lock.
+        Runnable compensateThenPoll = () -> {
+            invokeLostLeadership(streamName, onLostLeadership);
+            becomeStandby(streamName, onBecameLeader, onLostLeadership);
+        };
+        try {
+            startExecutor.execute(compensateThenPoll);
+        } catch (RejectedExecutionException e) {
+            // Shutting down: run inline, the state machine still needs its
+            // compensation, and there is no scheduler left to starve.
+            compensateThenPoll.run();
+        }
     }
 
     /**
@@ -305,8 +356,10 @@ public class LeaderElectionCoordinator {
         emitLeadershipChange(streamName, "STANDBY");
 
         // Schedule standby polling
+        // The tick itself runs off the scheduler: on acquisition it starts
+        // the stream, which may take minutes (see startExecutor).
         ScheduledFuture<?> polling = scheduler.scheduleAtFixedRate(
-                () -> standbyPollTick(streamName, onBecameLeader, onLostLeadership),
+                () -> dispatchPoll(streamName, onBecameLeader, onLostLeadership),
                 STANDBY_POLL_INTERVAL_SECONDS, STANDBY_POLL_INTERVAL_SECONDS, TimeUnit.SECONDS);
 
         pollingTasks.put(streamName, polling);
@@ -321,6 +374,24 @@ public class LeaderElectionCoordinator {
      * unexpected internal transition errors. Package-private so it can be
      * exercised in unit tests without waiting for the scheduler.
      */
+    void dispatchPoll(String streamName, Runnable onBecameLeader, Runnable onLostLeadership) {
+        if (!pollsInFlight.add(streamName)) {
+            return; // the previous tick is still acquiring, or starting the stream
+        }
+        try {
+            startExecutor.execute(() -> {
+                try {
+                    standbyPollTick(streamName, onBecameLeader, onLostLeadership);
+                } finally {
+                    pollsInFlight.remove(streamName);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            // Shutting down — the polling task is being cancelled as well.
+            pollsInFlight.remove(streamName);
+        }
+    }
+
     void standbyPollTick(String streamName, Runnable onBecameLeader, Runnable onLostLeadership) {
         try {
             if (lockService.tryAcquire(streamName, instanceId, lockTtl)) {

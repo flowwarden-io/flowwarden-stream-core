@@ -24,6 +24,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
@@ -129,6 +130,14 @@ public final class StreamRestarter {
 
     private final Callbacks callbacks;
     private final ScheduledExecutorService scheduler;
+    /**
+     * Where restart attempts actually run. The scheduler only times them: a
+     * start attempt can block for as long as the stream's resume cascade and
+     * its {@code @Reconcile} hook take (a reconciliation may run for
+     * minutes), and it must never hold the single timing thread hostage —
+     * every other stream's restart would wait behind it.
+     */
+    private final ExecutorService startExecutor;
     private final Map<String, RestartState> states = new HashMap<>();
     /**
      * Monotonic generation source, shared across all streams and never
@@ -143,6 +152,11 @@ public final class StreamRestarter {
         this.callbacks = callbacks;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, threadName);
+            t.setDaemon(true);
+            return t;
+        });
+        this.startExecutor = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, threadName + "-start");
             t.setDaemon(true);
             return t;
         });
@@ -207,6 +221,7 @@ public final class StreamRestarter {
 
     public void shutdown() {
         scheduler.shutdownNow();
+        startExecutor.shutdownNow();
     }
 
     /**
@@ -224,13 +239,29 @@ public final class StreamRestarter {
         long delayMillis = exhausted ? 0 : state.policy.computeDelayMillis(state.attempt);
         try {
             state.future = scheduler.schedule(
-                    () -> attemptRestart(streamName, generation),
+                    () -> dispatchAttempt(streamName, generation),
                     delayMillis, TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException e) {
             // Scheduler shut down — the application is going away.
             states.remove(streamName);
         }
         return exhausted ? -1 : delayMillis;
+    }
+
+    /**
+     * Hands the attempt to the start executor so the timing thread is free
+     * at once. A rejection means the restarter is shutting down — the
+     * application is going away, the attempt is dropped like a cancelled
+     * one.
+     */
+    private void dispatchAttempt(String streamName, long generation) {
+        try {
+            startExecutor.execute(() -> attemptRestart(streamName, generation));
+        } catch (RejectedExecutionException e) {
+            synchronized (this) {
+                states.remove(streamName);
+            }
+        }
     }
 
     private void attemptRestart(String streamName, long generation) {

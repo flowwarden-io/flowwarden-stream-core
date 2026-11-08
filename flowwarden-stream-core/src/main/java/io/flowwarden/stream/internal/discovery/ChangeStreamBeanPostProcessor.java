@@ -33,6 +33,8 @@ import io.flowwarden.stream.annotation.OnReplace;
 import io.flowwarden.stream.annotation.OnUpdate;
 import io.flowwarden.stream.annotation.Filter;
 import io.flowwarden.stream.annotation.Pipeline;
+import io.flowwarden.stream.annotation.Reconcile;
+import io.flowwarden.stream.HistoryLostContext;
 import io.flowwarden.stream.ErrorAction;
 import org.bson.Document;
 import org.bson.conversions.Bson;
@@ -147,7 +149,14 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         Map<OperationType, HandlerMethod> typedHandlers = findTypedHandlers(targetClass, beanName, annotation);
         PipelineMethod pipelineMethod = findPipelineMethod(targetClass, beanName);
         FilterMethod filterMethod = findFilterMethod(targetClass, beanName);
+        ReconcileMethod reconcileMethod = findReconcileMethod(targetClass, beanName);
         ErrorHandlerResolver errorHandlerResolver = findErrorHandlers(targetClass, beanName);
+
+        // Validate: a @Reconcile hook must be reachable (checkpointed, RESUME, self-repairing strategy)
+        StreamDefinitionValidator.validateReconcile(beanName, targetClass.getName(), reconcileMethod != null,
+                cpAnnotation != null,
+                cpAnnotation != null ? cpAnnotation.onHistoryLost() : null,
+                cpAnnotation != null ? cpAnnotation.startPosition() : null);
 
         // Warn when a method combines annotations with and without fullDocument
         warnMixedFullDocumentAnnotations(typedHandlers, targetClass);
@@ -185,12 +194,19 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         if (filterMethod != null) {
             filterMethod.method().setAccessible(true);
         }
+        if (reconcileMethod != null) {
+            reconcileMethod.method().setAccessible(true);
+        }
 
         // Validate handler return types against configured mode
         if (applicationContext != null) {
             String mode = applicationContext.getEnvironment()
                     .getProperty("flowwarden.default-mode", "IMPERATIVE").toUpperCase();
             validateHandlerReturnTypes(mode, beanName, targetClass, onChangeHandler, typedHandlers);
+            if (reconcileMethod != null) {
+                StreamDefinitionValidator.validateHandlerReturnMode(beanName, targetClass.getName(),
+                        reconcileMethod.method().getName(), mode, reconcileMethod.isReactiveReturn());
+            }
         }
 
         StreamConfig config = StreamConfig.fromAnnotation(annotation);
@@ -206,6 +222,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                 config,
                 pipelineMethod,
                 filterMethod,
+                reconcileMethod,
                 cpAnnotation,
                 retryAnnotation,
                 restartAnnotation,
@@ -234,6 +251,10 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         if (filterMethod != null) {
             if (!handlers.isEmpty()) handlers.append(", ");
             handlers.append("@Filter=").append(filterMethod.method().getName());
+        }
+        if (reconcileMethod != null) {
+            if (!handlers.isEmpty()) handlers.append(", ");
+            handlers.append("@Reconcile=").append(reconcileMethod.method().getName());
         }
 
         log.info("Discovered Change Stream '{}' on collection '{}' (handlers: {}, checkpoint: {}, retryPolicy: {}, restartPolicy: {}, dlq: {}, onError: {})",
@@ -467,6 +488,36 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         Method method = filterMethods.get(0);
         FilterMethod.ReturnStyle returnStyle = resolveFilterReturnStyle(method, targetClass, beanName);
         return new FilterMethod(method, returnStyle);
+    }
+
+    // --- Reconcile discovery ---
+
+    private ReconcileMethod findReconcileMethod(Class<?> targetClass, String beanName) {
+        List<Method> reconcileMethods = new ArrayList<>();
+        for (Method method : targetClass.getDeclaredMethods()) {
+            if (AnnotationUtils.findAnnotation(method, Reconcile.class) != null) {
+                reconcileMethods.add(method);
+            }
+        }
+
+        if (reconcileMethods.isEmpty()) {
+            return null;
+        }
+        if (reconcileMethods.size() > 1) {
+            throw new BeanCreationException(beanName,
+                    "@ChangeStream class " + targetClass.getName()
+                            + " must have at most one @Reconcile method, found " + reconcileMethods.size());
+        }
+
+        Method method = reconcileMethods.get(0);
+        Class<?>[] params = method.getParameterTypes();
+        if (params.length != 1 || !params[0].isAssignableFrom(HistoryLostContext.class)) {
+            throw new BeanCreationException(beanName,
+                    "@Reconcile method " + targetClass.getName() + "#" + method.getName()
+                            + " must take exactly one parameter of type HistoryLostContext");
+        }
+        boolean reactiveReturn = detectReactiveReturn(method, targetClass, beanName);
+        return new ReconcileMethod(method, reactiveReturn);
     }
 
     private FilterMethod.ReturnStyle resolveFilterReturnStyle(Method method, Class<?> targetClass,

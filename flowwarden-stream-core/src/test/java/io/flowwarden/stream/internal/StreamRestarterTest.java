@@ -231,6 +231,55 @@ class StreamRestarterTest {
     }
 
     @Test
+    void longStartOnOneStream_doesNotDelayAnotherStreamsRestart() throws Exception {
+        java.util.concurrent.CountDownLatch slowEntered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch slowGate = new java.util.concurrent.CountDownLatch(1);
+        java.util.Set<String> started = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        StreamRestarter.Callbacks callbacks = new StreamRestarter.Callbacks() {
+            @Override
+            public RestartPolicyConfig policyFor(String streamName) {
+                return FAST_UNBOUNDED;
+            }
+
+            @Override
+            public void startStream(String streamName) {
+                if (streamName.equals("slow")) {
+                    slowEntered.countDown();
+                    try {
+                        slowGate.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                started.add(streamName);
+            }
+
+            @Override
+            public boolean isInstalled(String streamName) {
+                return started.contains(streamName);
+            }
+
+            @Override
+            public void onTerminalGiveUp(String streamName) {
+            }
+        };
+        restarter = new StreamRestarter("restart-test", callbacks);
+        try {
+            restarter.onRuntimeDeath("slow", new RuntimeException("cursor died"));
+            assertThat(slowEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+            // The slow start (a reconciliation, say) is still blocked: the
+            // other stream's attempt must run regardless.
+            restarter.onRuntimeDeath("quick", new RuntimeException("cursor died"));
+            await().atMost(Duration.ofSeconds(5)).until(() -> started.contains("quick"));
+            assertThat(started).doesNotContain("slow");
+        } finally {
+            slowGate.countDown();
+        }
+        await().atMost(Duration.ofSeconds(5)).until(() -> started.contains("slow"));
+    }
+
+    @Test
     void cancelDuringInFlightAttempt_attemptStandsDown_neverEmitsNorRetries() throws Exception {
         // Round 2 contract: the attempt detects the cancellation after
         // startStream and stands down — no emission, no retry. It does NOT

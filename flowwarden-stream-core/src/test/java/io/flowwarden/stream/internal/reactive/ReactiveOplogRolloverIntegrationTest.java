@@ -17,6 +17,9 @@ package io.flowwarden.stream.internal.reactive;
 
 import io.flowwarden.stream.ChangeStreamContext;
 import io.flowwarden.stream.FlowWardenMetrics;
+import io.flowwarden.stream.HistoryLostContext;
+import io.flowwarden.stream.ReconciliationFailedException;
+import io.flowwarden.stream.annotation.Reconcile;
 import io.flowwarden.stream.OnHistoryLost;
 import io.flowwarden.stream.annotation.ChangeStream;
 import io.flowwarden.stream.annotation.Checkpoint;
@@ -53,6 +56,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
 /**
@@ -67,6 +71,7 @@ class ReactiveOplogRolloverIntegrationTest {
     private static final BsonDocument FAKE_TOKEN = BsonDocument.parse("{\"_data\": \"DEADBEEF\"}");
     private static final String OPLOG_START_STREAM = "rollover-oplog-start-reactive";
     private static final String PROBE_STREAM = "rollover-probe-reactive";
+    private static final String RECONCILE_STREAM = "rollover-reconcile-reactive";
 
     @DynamicPropertySource
     static void mongoProperties(DynamicPropertyRegistry registry) {
@@ -78,6 +83,7 @@ class ReactiveOplogRolloverIntegrationTest {
     @Autowired CheckpointStore checkpointStore;
     @Autowired OplogStartHandler oplogStartHandler;
     @Autowired ProbeRepairHandler probeRepairHandler;
+    @Autowired ReconcileHandler reconcileHandler;
 
     private final RecordingMetrics metrics = new RecordingMetrics();
     private StreamMetricsProvider previousProvider;
@@ -92,11 +98,50 @@ class ReactiveOplogRolloverIntegrationTest {
     void tearDown() {
         try { streamManager.stopStream(OPLOG_START_STREAM); } catch (Exception ignored) {}
         try { streamManager.stopStream(PROBE_STREAM); } catch (Exception ignored) {}
+        try { streamManager.stopStream(RECONCILE_STREAM); } catch (Exception ignored) {}
         checkpointStore.delete(OPLOG_START_STREAM);
         checkpointStore.delete(PROBE_STREAM);
+        checkpointStore.delete(RECONCILE_STREAM);
         oplogStartHandler.clear();
         probeRepairHandler.clear();
+        reconcileHandler.clear();
         FlowWardenMetrics.setProvider(previousProvider);
+    }
+
+    @Test
+    void reconcile_outlivesTheOplogOnce_secondBoundedCall_thenTheStreamResumes() {
+        saveExpiredCheckpoint(RECONCILE_STREAM);
+        reconcileHandler.rollsRemaining.set(1);
+
+        streamManager.startStream(RECONCILE_STREAM);
+
+        await().atMost(Duration.ofSeconds(15)).until(() -> streamManager.isRunning(RECONCILE_STREAM));
+        assertThat(reconcileHandler.reconciliations).extracting(HistoryLostContext::attempt).containsExactly(1, 2);
+        assertThat(reconcileHandler.reconciliations.get(1).lostWindowStart())
+                .contains(reconcileHandler.reconciliations.get(0).lostWindowEnd());
+        assertThat(metrics.reconciled).containsExactly(1, 2);
+        io.flowwarden.stream.spi.Checkpoint cp = checkpointStore.findByStreamName(RECONCILE_STREAM).orElseThrow();
+        assertThat(cp.lastProcessedToken()).isNotEqualTo(FAKE_TOKEN);
+
+        reactiveMongoTemplate.insert(new Document("item", "after-reconcile"), "rollover_reconcile_reactive").block();
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(reconcileHandler.items).contains("after-reconcile"));
+    }
+
+    @Test
+    void reconcile_outlivesTheOplogTwice_failsClearly_deadTokensKept() {
+        saveExpiredCheckpoint(RECONCILE_STREAM);
+        reconcileHandler.rollsRemaining.set(2);
+
+        assertThatThrownBy(() -> streamManager.startStream(RECONCILE_STREAM))
+                .isInstanceOf(ReconciliationFailedException.class)
+                .hasMessageContaining("does not fit in the oplog window");
+
+        assertThat(reconcileHandler.reconciliations).extracting(HistoryLostContext::attempt).containsExactly(1, 2);
+        assertThat(streamManager.isRunning(RECONCILE_STREAM)).isFalse();
+        assertThat(metrics.reconciliationFailures).hasValue(1);
+        assertThat(checkpointStore.findByStreamName(RECONCILE_STREAM).orElseThrow().lastProcessedToken())
+                .isEqualTo(FAKE_TOKEN);
     }
 
     @Test
@@ -208,9 +253,40 @@ class ReactiveOplogRolloverIntegrationTest {
     @EnableFlowWarden
     @Import({
             ReactiveOplogRolloverIntegrationTest.OplogStartHandler.class,
-            ReactiveOplogRolloverIntegrationTest.ProbeRepairHandler.class
+            ReactiveOplogRolloverIntegrationTest.ProbeRepairHandler.class,
+            ReactiveOplogRolloverIntegrationTest.ReconcileHandler.class
     })
     static class TestApp {}
+
+    @ChangeStream(name = RECONCILE_STREAM, collection = "rollover_reconcile_reactive", autoStart = false)
+    @Checkpoint(saveEveryN = 1, idleHeartbeatIntervalSeconds = 2, onHistoryLost = OnHistoryLost.RESUME_FROM_NOW)
+    static class ReconcileHandler {
+        private final List<String> items = new CopyOnWriteArrayList<>();
+        final List<HistoryLostContext> reconciliations = new CopyOnWriteArrayList<>();
+        final AtomicInteger rollsRemaining = new AtomicInteger();
+
+        @OnInsert
+        Mono<Void> handle(ChangeStreamContext<Document> ctx) {
+            ctx.getFullDocument(Document.class).ifPresent(d -> items.add(d.getString("item")));
+            return Mono.empty();
+        }
+
+        @Reconcile
+        Mono<Void> reconcile(HistoryLostContext ctx) {
+            return Mono.fromRunnable(() -> {
+                reconciliations.add(ctx);
+                if (rollsRemaining.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                    RollingOplogMongoContainer.rollOver(RollingOplogMongoContainer.newestOplogTimestamp());
+                }
+            });
+        }
+
+        void clear() {
+            items.clear();
+            reconciliations.clear();
+            rollsRemaining.set(0);
+        }
+    }
 
     @ChangeStream(name = OPLOG_START_STREAM, collection = "rollover_oplog_start_reactive", autoStart = false)
     @Checkpoint(saveEveryN = 1, idleHeartbeatIntervalSeconds = 2,
@@ -247,7 +323,19 @@ class ReactiveOplogRolloverIntegrationTest {
         final AtomicInteger probeFailures = new AtomicInteger();
         final AtomicInteger crashes = new AtomicInteger();
         final AtomicInteger historyLosses = new AtomicInteger();
+        final List<Integer> reconciled = new CopyOnWriteArrayList<>();
+        final AtomicInteger reconciliationFailures = new AtomicInteger();
         volatile Instant lastCheckpointAt;
+
+        @Override
+        public void onHistoryLostReconciled(String streamName, int attempt, Duration elapsed) {
+            reconciled.add(attempt);
+        }
+
+        @Override
+        public void onHistoryLostReconciliationFailed(String streamName, int attempt, Throwable cause) {
+            reconciliationFailures.incrementAndGet();
+        }
 
         @Override
         public void onHeartbeatProbeFailed(String streamName, Throwable cause) {

@@ -18,7 +18,16 @@ package io.flowwarden.stream;
 /**
  * Strategy to apply when a saved resume token has expired from the MongoDB oplog.
  *
+ * <p>Under {@link #RESUME_FROM_NOW} and {@link #RESUME_FROM_OPLOG_START} the
+ * events of the lost window are gone with the oplog. A stream that maintains
+ * a derived view declares a {@link io.flowwarden.stream.annotation.Reconcile
+ * @Reconcile} method: it receives the bound of the lost window and runs
+ * before the stream resumes, before any checkpoint write; a throw stops the
+ * start like {@link #FAIL} would, with the expired tokens kept so the next
+ * start reconciles again.</p>
+ *
  * @see io.flowwarden.stream.annotation.Checkpoint#onHistoryLost()
+ * @see io.flowwarden.stream.annotation.Reconcile
  */
 public enum OnHistoryLost {
 

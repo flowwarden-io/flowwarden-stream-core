@@ -41,6 +41,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -92,9 +93,11 @@ class LeaderElectionCoordinatorTest {
 
         coordinator.heartbeatTick(STREAM, onBecameLeader, onLostLeadership);
 
-        verify(onLostLeadership).run();
+        // The role flips synchronously; the compensation runs off the
+        // scheduler threads (it may wait for a stream's lifecycle lock).
         assertThat(coordinator.getRole(STREAM))
                 .isEqualTo(LeaderElectionCoordinator.LeaderRole.STANDBY);
+        await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> verify(onLostLeadership).run());
     }
 
     @Test
@@ -109,9 +112,69 @@ class LeaderElectionCoordinatorTest {
         // Before the #39 fix this assertion failed: onLostLeadership stayed un-invoked
         // and the role remained LEADER, leaving the instance convinced it owned the lock
         // even though the underlying lease was about to expire.
-        verify(onLostLeadership).run();
         assertThat(coordinator.getRole(STREAM))
                 .isEqualTo(LeaderElectionCoordinator.LeaderRole.STANDBY);
+        await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> verify(onLostLeadership).run());
+    }
+
+    @Test
+    void heartbeatTick_leadershipLoss_compensationRunsOffTheCallingThread() throws Exception {
+        becomeLeader();
+        when(lockService.renew(eq(STREAM), eq(INSTANCE), any())).thenReturn(false);
+        java.util.concurrent.CountDownLatch stopEntered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch stopGate = new java.util.concurrent.CountDownLatch(1);
+        Runnable blockingStop = () -> {
+            stopEntered.countDown();
+            try {
+                stopGate.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        try {
+            // The tick (a scheduler thread in production) must return while
+            // the compensation — stopStream waiting for a reconciling start —
+            // is still blocked.
+            coordinator.heartbeatTick(STREAM, onBecameLeader, blockingStop);
+
+            assertThat(stopEntered.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThat(coordinator.getRole(STREAM))
+                    .isEqualTo(LeaderElectionCoordinator.LeaderRole.STANDBY);
+            assertThat(coordinator.isRenewingLease(STREAM)).isFalse();
+        } finally {
+            stopGate.countDown();
+        }
+    }
+
+    @Test
+    void dispatchPoll_whileAPollIsStillInFlight_isSkipped_noDoubleStart() throws Exception {
+        java.util.concurrent.CountDownLatch acquiring = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch acquireGate = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger acquires = new java.util.concurrent.atomic.AtomicInteger();
+        when(lockService.tryAcquire(eq(STREAM), eq(INSTANCE), any())).thenAnswer(invocation -> {
+            acquires.incrementAndGet();
+            acquiring.countDown();
+            acquireGate.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            return true; // the SPI allows reacquisition by the same owner
+        });
+        try {
+            coordinator.dispatchPoll(STREAM, onBecameLeader, onLostLeadership);
+            assertThat(acquiring.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            // A second tick fires while the first is still acquiring (slow
+            // lock service): it must stand down instead of acquiring and
+            // starting the same stream a second time.
+            coordinator.dispatchPoll(STREAM, onBecameLeader, onLostLeadership);
+        } finally {
+            acquireGate.countDown();
+        }
+
+        await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> verify(onBecameLeader).run());
+        assertThat(acquires).hasValue(1);
+        // The guard is released once the poll completed: a later tick may run.
+        await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
+            coordinator.dispatchPoll(STREAM, onBecameLeader, onLostLeadership);
+            assertThat(acquires.get()).isGreaterThanOrEqualTo(2);
+        });
     }
 
     @Test
@@ -131,6 +194,36 @@ class LeaderElectionCoordinatorTest {
     }
 
     // --- #59: onBecameLeader failures must not corrupt the state machine ---
+
+    @Test
+    void becomeLeader_renewsTheLeaseWhileTheCallbackRuns() {
+        when(lockService.tryAcquire(STREAM, INSTANCE, Duration.ofSeconds(60))).thenReturn(true);
+        java.util.concurrent.atomic.AtomicBoolean renewingDuringCallback =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        Runnable longStart = () -> renewingDuringCallback.set(coordinator.isRenewingLease(STREAM));
+
+        coordinator.startElection(STREAM, longStart, onLostLeadership);
+
+        // A start that outlives the lock TTL (a @Reconcile hook) must not lose
+        // the lease it just acquired: the renewal is scheduled before the callback.
+        assertThat(renewingDuringCallback).isTrue();
+        assertThat(coordinator.isRenewingLease(STREAM)).isTrue();
+        assertThat(coordinator.getRole(STREAM)).isEqualTo(LeaderElectionCoordinator.LeaderRole.LEADER);
+    }
+
+    @Test
+    void becomeLeader_callbackThrowsTransient_renewalIsCancelledWithTheLease() {
+        when(lockService.tryAcquire(STREAM, INSTANCE, Duration.ofSeconds(60))).thenReturn(true);
+        Runnable failingStart = () -> {
+            throw new RuntimeException("server down");
+        };
+
+        coordinator.startElection(STREAM, failingStart, onLostLeadership);
+
+        assertThat(coordinator.isRenewingLease(STREAM)).isFalse();
+        assertThat(coordinator.getRole(STREAM)).isEqualTo(LeaderElectionCoordinator.LeaderRole.STANDBY);
+        verify(lockService).release(STREAM, INSTANCE);
+    }
 
     @Test
     void startElection_callbackThrowsHistoryLost_stopsElectionAndSurfacesCrash() {
