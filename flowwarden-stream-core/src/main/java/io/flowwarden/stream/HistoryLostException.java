@@ -18,8 +18,11 @@ package io.flowwarden.stream;
 import java.time.Instant;
 
 /**
- * Thrown when {@link OnHistoryLost#FAIL} is in effect and the saved resume token
- * has expired from the MongoDB oplog.
+ * Thrown when the saved resume token has expired from the MongoDB oplog and
+ * the stream cannot start: under {@link OnHistoryLost#FAIL}, or — as the
+ * {@link ReconciliationFailedException} subclass — when the stream's
+ * {@code @Reconcile} hook failed under a self-repairing strategy. Terminal
+ * for the restart loop in both cases.
  */
 public class HistoryLostException extends RuntimeException {
 

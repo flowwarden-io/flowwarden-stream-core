@@ -38,9 +38,10 @@ import java.util.Map;
  * <p>{@code lastHeartbeatTimestamp} records the last time a recoverable
  * position was <em>confirmed</em> — a processed-anchor write, or a
  * successful empty heartbeat probe (position write or re-certification of
- * the unchanged position). It is never updated on probe abstentions or
- * failures, so its age is the single operational signal for resume-point
- * health.</p>
+ * the unchanged position). It is not updated on probe abstentions or
+ * failures — except the in-place repair of a position that rolled out of
+ * the oplog, which writes a fresh certified position and refreshes it — so
+ * its age is the single operational signal for resume-point health.</p>
  *
  * @param streamName             unique stream identifier
  * @param instanceId             pod/instance identifier (nullable)

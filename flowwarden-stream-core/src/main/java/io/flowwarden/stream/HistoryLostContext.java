@@ -64,14 +64,16 @@ public interface HistoryLostContext {
     Optional<Instant> lastProcessedTimestamp();
 
     /**
-     * When the idle heartbeat last certified a server position, as recorded
-     * in the checkpoint; empty if never recorded.
+     * When a server-certified position was last written as the seen anchor
+     * (startup bootstrap, idle heartbeat probe, or history-lost recovery),
+     * as recorded in the checkpoint; empty if never recorded.
      */
     Optional<Instant> lastSeenTimestamp();
 
     /**
-     * When the idle heartbeat last confirmed the stream alive, as recorded in
-     * the checkpoint; empty if never recorded.
+     * When a recoverable position was last confirmed — a processed-anchor
+     * write or a successful heartbeat probe — as recorded in the checkpoint;
+     * empty if never recorded.
      */
     Optional<Instant> lastHeartbeatTimestamp();
 
