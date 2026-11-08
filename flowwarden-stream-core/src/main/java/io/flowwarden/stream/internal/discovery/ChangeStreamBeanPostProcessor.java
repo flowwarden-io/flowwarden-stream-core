@@ -22,6 +22,7 @@ import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.ChangeStream;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
+import io.flowwarden.stream.annotation.EnableFlowWarden;
 import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.annotation.OnChange;
 import io.flowwarden.stream.annotation.RestartPolicy;
@@ -94,6 +95,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
     );
 
     private final List<ChangeStreamDefinition> definitions = new CopyOnWriteArrayList<>();
+    private volatile boolean autoStartEnabled = true;
     private ApplicationContext applicationContext;
 
     @Override
@@ -109,6 +111,14 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
     @Override
     public Object postProcessAfterInitialization(Object bean, String beanName) throws BeansException {
         Class<?> targetClass = AopUtils.getTargetClass(bean);
+        EnableFlowWarden enable = AnnotationUtils.findAnnotation(targetClass, EnableFlowWarden.class);
+        if (enable != null && !enable.enabled()) {
+            if (autoStartEnabled) {
+                log.info("@EnableFlowWarden(enabled = false) on {} — streams are registered and validated "
+                        + "but will not start automatically", targetClass.getName());
+            }
+            autoStartEnabled = false;
+        }
         ChangeStream annotation = AnnotationUtils.findAnnotation(targetClass, ChangeStream.class);
         if (annotation == null) {
             return bean;
@@ -282,6 +292,11 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         return definitions.stream()
                 .filter(d -> d.streamName().equals(streamName))
                 .findFirst();
+    }
+
+    @Override
+    public boolean isAutoStartEnabled() {
+        return autoStartEnabled;
     }
 
     // --- Handler discovery ---
