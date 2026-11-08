@@ -15,7 +15,9 @@
  */
 package io.flowwarden.stream.internal.discovery;
 
+import io.flowwarden.stream.OnHistoryLost;
 import io.flowwarden.stream.OperationType;
+import io.flowwarden.stream.StartPosition;
 import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -94,6 +96,44 @@ final class StreamDefinitionValidator {
                             + "cascade level-2 safety net (fallback to lastSeenToken when "
                             + "lastProcessedToken ages out) will not work.",
                     subject, saveEveryN);
+        }
+    }
+
+    /**
+     * A {@code @Reconcile} hook must be reachable: it runs only from resume
+     * cascade level 3, which needs a {@code @Checkpoint} with
+     * {@code startPosition = RESUME} and a self-repairing history-lost
+     * strategy. A hook that can never run is a misconfiguration, not a
+     * no-op.
+     *
+     * @param hasReconcile  whether a hook is declared
+     * @param hasCheckpoint whether a {@code @Checkpoint} is declared
+     * @param strategy      the history-lost strategy, null without checkpoint
+     * @param startPosition the start position, null without checkpoint
+     */
+    static void validateReconcile(String beanName, String subject, boolean hasReconcile,
+                                   boolean hasCheckpoint, OnHistoryLost strategy,
+                                   StartPosition startPosition) {
+        if (!hasReconcile) {
+            return;
+        }
+        if (!hasCheckpoint) {
+            throw new BeanCreationException(beanName,
+                    "@Reconcile on " + subject + " requires a @Checkpoint: the hook runs when the "
+                            + "saved resume position has aged out of the oplog, which only a "
+                            + "checkpointed stream can detect.");
+        }
+        if (strategy == OnHistoryLost.FAIL) {
+            throw new BeanCreationException(beanName,
+                    "@Reconcile on " + subject + " can never run with onHistoryLost = FAIL, which "
+                            + "refuses to start instead of resuming. Use RESUME_FROM_NOW or "
+                            + "RESUME_FROM_OPLOG_START, or remove the hook.");
+        }
+        if (startPosition == StartPosition.LATEST) {
+            throw new BeanCreationException(beanName,
+                    "@Reconcile on " + subject + " can never run with startPosition = LATEST, which "
+                            + "ignores the saved position and never detects a history loss. Use "
+                            + "startPosition = RESUME, or remove the hook.");
         }
     }
 

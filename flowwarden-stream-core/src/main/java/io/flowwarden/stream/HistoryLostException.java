@@ -39,6 +39,22 @@ public class HistoryLostException extends RuntimeException {
         this.lastCheckpointTimestamp = lastCheckpointTimestamp;
     }
 
+    /**
+     * For subclasses that describe a specific history-lost outcome with their
+     * own message, such as {@link ReconciliationFailedException}.
+     *
+     * @param streamName              the stream
+     * @param lastCheckpointTimestamp last known checkpoint activity, may be null
+     * @param message                 the operator-facing message
+     * @param cause                   the underlying failure, may be null
+     */
+    protected HistoryLostException(String streamName, Instant lastCheckpointTimestamp,
+                                   String message, Throwable cause) {
+        super(message, cause);
+        this.streamName = streamName;
+        this.lastCheckpointTimestamp = lastCheckpointTimestamp;
+    }
+
     public String getStreamName() {
         return streamName;
     }

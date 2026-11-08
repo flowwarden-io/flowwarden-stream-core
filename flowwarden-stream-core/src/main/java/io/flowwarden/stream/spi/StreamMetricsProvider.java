@@ -188,6 +188,33 @@ public interface StreamMetricsProvider {
     default void onResumeHistoryLost(String streamName) {}
 
     /**
+     * Called when the stream's {@code @Reconcile} hook has returned and the
+     * stream is about to resume: the application reconciled the lost window.
+     * Emitted after the fact, never before the hook completed.
+     *
+     * @param streamName stream identifier
+     * @param attempt    the hook invocation ({@code 1}, or {@code 2} for the
+     *                   bounded second invocation after the oplog rolled
+     *                   during the first)
+     * @param elapsed    how long the hook ran
+     */
+    default void onHistoryLostReconciled(String streamName, int attempt, java.time.Duration elapsed) {}
+
+    /**
+     * Called when the stream's {@code @Reconcile} hook threw, or when the
+     * reconciliation outlived the oplog window twice: the stream does not
+     * start ({@code onStreamStopped(CRASHED, cause)} follows with a
+     * {@link io.flowwarden.stream.ReconciliationFailedException}).
+     *
+     * @param streamName stream identifier
+     * @param attempt    the hook invocation that failed
+     * @param cause      what the hook threw, or the
+     *                   {@code ReconciliationFailedException} when the
+     *                   window rolled out twice
+     */
+    default void onHistoryLostReconciliationFailed(String streamName, int attempt, Throwable cause) {}
+
+    /**
      * Called when a checkpoint heartbeat probe fails while the stream itself
      * keeps running: transient backend error, bounded-read timeout, a reply
      * carrying a null post-batch resume token, or a chained resume token that

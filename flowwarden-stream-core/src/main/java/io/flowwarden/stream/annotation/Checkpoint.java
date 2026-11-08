@@ -76,6 +76,25 @@ import java.lang.annotation.Target;
  *       strategy.</li>
  * </ol>
  *
+ * <h2>Derived views</h2>
+ *
+ * <p>At level 3 the events of the lost window are gone with the oplog: no
+ * strategy can replay them. A stream that maintains a <em>derived view</em>
+ * — a search model, a cache, a projection aggregated from several
+ * collections — is wrong over that window until the application
+ * re-synchronizes it. The contract for such a stream:</p>
+ * <ul>
+ *   <li>handlers idempotent (at-least-once delivery, as always);</li>
+ *   <li>a {@link Reconcile @Reconcile} method that re-synchronizes the view
+ *       over the window the library hands it, run before the stream resumes
+ *       under {@code RESUME_FROM_NOW} or {@code RESUME_FROM_OPLOG_START};
+ *       nothing is delivered meanwhile, and a failed reconciliation stops
+ *       the start;</li>
+ *   <li>an oplog sized for the longest downtime the application expects —
+ *       the idle heartbeat's probe warning is the signal that it is too
+ *       small.</li>
+ * </ul>
+ *
  * <p>Checkpoints written by earlier versions may hold an event token in
  * {@code lastSeenToken}; it remains a valid resume position for the cascade,
  * and the field adopts the PBRT-only semantics at the first successful
@@ -93,7 +112,9 @@ import java.lang.annotation.Target;
  *   <li>{@link #startPosition()} = whether to apply the cascade
  *       ({@code RESUME}) or ignore both anchors ({@code LATEST},
  *       bootstrap).</li>
- *   <li>{@link #onHistoryLost()} = strategy at cascade level 3 only.</li>
+ *   <li>{@link #onHistoryLost()} = strategy at cascade level 3 only; a
+ *       {@link Reconcile @Reconcile} method, if declared, runs before the
+ *       stream resumes under a self-repairing strategy.</li>
  * </ul>
  *
  * <p><strong>Two cadences, two jobs.</strong> {@code saveEveryN} and

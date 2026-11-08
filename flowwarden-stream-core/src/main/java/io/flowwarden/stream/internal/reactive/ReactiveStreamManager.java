@@ -53,6 +53,7 @@ import io.flowwarden.stream.internal.checkpoint.CheckpointHeartbeat;
 import io.flowwarden.stream.internal.checkpoint.ProcessedAnchorPolicy;
 import io.flowwarden.stream.internal.checkpoint.ResumeCascade;
 import io.flowwarden.stream.internal.checkpoint.ResumeContext;
+import io.flowwarden.stream.internal.discovery.ReconcileMethod;
 import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqPolicy;
@@ -272,6 +273,15 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     }
 
     /**
+     * The stream's {@code @Reconcile} hook bound to its bean, for the resume
+     * cascade — {@code null} when the stream declares none.
+     */
+    private static ResumeCascade.ReconcileHook reconcileHookFor(ChangeStreamDefinition def) {
+        ReconcileMethod hook = def.reconcileMethod();
+        return hook == null ? null : ctx -> hook.invoke(def.bean(), ctx);
+    }
+
+    /**
      * Per-stream lifecycle serialization: manual starts, operator stops and
      * managed restart attempts are mutually exclusive for a given stream —
      * see the imperative manager's twin field for the full rationale.
@@ -314,7 +324,8 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                     checkpointStore, probe,
                     token -> isTokenValid(def.collection(), token, streamTemplate, streamName),
                     () -> getOldestOplogTimestamp(streamTemplate),
-                    !degradeOplogStart.contains(streamName));
+                    !degradeOplogStart.contains(streamName),
+                    reconcileHookFor(def));
             if (resumeContext.seedToken() != null) {
                 optionsBuilder.resumeAfter(resumeContext.seedToken());
             } else if (resumeContext.initialOperationTime() != null) {
