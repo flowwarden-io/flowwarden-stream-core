@@ -98,6 +98,10 @@ class LeaderElectionCoordinatorTest {
         assertThat(coordinator.getRole(STREAM))
                 .isEqualTo(LeaderElectionCoordinator.LeaderRole.STANDBY);
         await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> verify(onLostLeadership).run());
+        // Wait for the whole transition: standby polling is its last step, and
+        // the metrics provider is a static — a transition still completing
+        // after tearDown would leak its STANDBY signal into the next test.
+        await().atMost(Duration.ofSeconds(3)).until(() -> coordinator.hasPollingTask(STREAM));
     }
 
     @Test
@@ -115,6 +119,10 @@ class LeaderElectionCoordinatorTest {
         assertThat(coordinator.getRole(STREAM))
                 .isEqualTo(LeaderElectionCoordinator.LeaderRole.STANDBY);
         await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> verify(onLostLeadership).run());
+        // Wait for the whole transition: standby polling is its last step, and
+        // the metrics provider is a static — a transition still completing
+        // after tearDown would leak its STANDBY signal into the next test.
+        await().atMost(Duration.ofSeconds(3)).until(() -> coordinator.hasPollingTask(STREAM));
     }
 
     @Test
@@ -144,6 +152,7 @@ class LeaderElectionCoordinatorTest {
         } finally {
             stopGate.countDown();
         }
+        await().atMost(Duration.ofSeconds(3)).until(() -> coordinator.hasPollingTask(STREAM));
     }
 
     @Test
@@ -191,6 +200,8 @@ class LeaderElectionCoordinatorTest {
 
         assertThat(coordinator.getRole(STREAM))
                 .isEqualTo(LeaderElectionCoordinator.LeaderRole.STANDBY);
+        // The throwing callback must not prevent the standby re-entry either.
+        await().atMost(Duration.ofSeconds(3)).until(() -> coordinator.hasPollingTask(STREAM));
     }
 
     // --- #59: onBecameLeader failures must not corrupt the state machine ---

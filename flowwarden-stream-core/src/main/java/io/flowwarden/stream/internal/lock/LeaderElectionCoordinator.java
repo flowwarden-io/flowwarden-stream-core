@@ -158,14 +158,23 @@ public class LeaderElectionCoordinator {
                     released, instanceId);
         }
 
+        // Let the starts and compensations in flight finish (bounded) before
+        // the scheduler goes: a compensation ends by re-entering standby,
+        // and the coordinator must not be reported shut down while one of
+        // them is still transitioning the state machine.
         startExecutor.shutdownNow();
+        awaitQuietly(startExecutor);
         scheduler.shutdown();
+        awaitQuietly(scheduler);
+    }
+
+    private static void awaitQuietly(ExecutorService executor) {
         try {
-            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                scheduler.shutdownNow();
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
             }
         } catch (InterruptedException e) {
-            scheduler.shutdownNow();
+            executor.shutdownNow();
             Thread.currentThread().interrupt();
         }
     }
@@ -358,9 +367,17 @@ public class LeaderElectionCoordinator {
         // Schedule standby polling
         // The tick itself runs off the scheduler: on acquisition it starts
         // the stream, which may take minutes (see startExecutor).
-        ScheduledFuture<?> polling = scheduler.scheduleAtFixedRate(
-                () -> dispatchPoll(streamName, onBecameLeader, onLostLeadership),
-                STANDBY_POLL_INTERVAL_SECONDS, STANDBY_POLL_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        ScheduledFuture<?> polling;
+        try {
+            polling = scheduler.scheduleAtFixedRate(
+                    () -> dispatchPoll(streamName, onBecameLeader, onLostLeadership),
+                    STANDBY_POLL_INTERVAL_SECONDS, STANDBY_POLL_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        } catch (RejectedExecutionException e) {
+            // Shutting down: a compensation that completed after the
+            // scheduler stopped has nothing left to poll for.
+            log.debug("Not polling for stream '{}': coordinator is shutting down", streamName);
+            return;
+        }
 
         pollingTasks.put(streamName, polling);
     }
