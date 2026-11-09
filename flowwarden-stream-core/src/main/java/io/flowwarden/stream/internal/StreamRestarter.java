@@ -66,9 +66,11 @@ import java.util.concurrent.TimeUnit;
  * the actual teardown, so a by-name rollback can never hit a newer manual
  * generation.</p>
  *
- * <p>Restarts run on a dedicated single thread: a restart attempt performs
- * blocking I/O (cascade validation, bootstrap probe) and must not delay
- * heartbeat probes or flushes of healthy streams.</p>
+ * <p>Restart timing runs on a dedicated single thread; each attempt is then
+ * handed to a separate start executor, because an attempt performs blocking
+ * I/O (cascade validation, bootstrap probe) that must not delay the timing of
+ * other streams' restarts nor heartbeat probes or flushes of healthy
+ * streams.</p>
  *
  * <p>This class is internal and not part of the public API.</p>
  */

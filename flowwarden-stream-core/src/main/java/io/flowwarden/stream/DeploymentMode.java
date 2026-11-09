@@ -32,7 +32,11 @@ public enum DeploymentMode {
     /**
      * Only one instance (the leader) processes events.
      * Other instances are on standby and take over if the leader fails.
-     * Uses MongoDB-based distributed locking ({@code _fw_locks} collection).
+     * Coordinated through the {@link io.flowwarden.stream.spi.LockService}
+     * SPI ({@code _fw_locks} collection with the shipped MongoDB backend).
+     * Delivery stays at-least-once: after a failover or a restart the new
+     * leader resumes after the last processed anchor and may redeliver
+     * events the previous leader had already handled.
      */
     SINGLE_LEADER
 }

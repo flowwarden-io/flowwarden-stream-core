@@ -55,8 +55,9 @@ import java.lang.annotation.Target;
  * <ul>
  *   <li><strong>Signature</strong>: exactly one parameter of type
  *       {@link io.flowwarden.stream.HistoryLostContext}; returns {@code void}
- *       ({@code IMPERATIVE}), {@code void} or {@code Mono<Void>}
- *       ({@code REACTIVE}). At most one {@code @Reconcile} method per
+ *       in {@code IMPERATIVE} mode and {@code Mono<Void>} in {@code REACTIVE}
+ *       mode, like every other handler (the mode rule is enforced at
+ *       startup). At most one {@code @Reconcile} method per
  *       {@link ChangeStream} class.</li>
  *   <li><strong>Barrier</strong>: the hook runs after the resume position has
  *       been resolved and <em>before</em> the cursor opens and before any

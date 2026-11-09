@@ -27,7 +27,8 @@ import java.util.Optional;
  *
  * <p>Instances are created by the FlowWarden runtime and passed to handler
  * methods annotated with {@link io.flowwarden.stream.annotation.OnChange @OnChange}
- * (and future typed handlers like {@code @OnInsert}, {@code @OnUpdate}, etc.).</p>
+ * and to the typed handlers ({@code @OnInsert}, {@code @OnUpdate},
+ * {@code @OnReplace}, {@code @OnDelete}) that declare a context parameter.</p>
  *
  * @param <T> the document type
  */
@@ -68,7 +69,10 @@ public interface ChangeStreamContext<T> {
      */
     Optional<TransactionInfo> getTransactionInfo();
 
-    /** Current retry attempt number (1-based, always 1 until retry is implemented). */
+    /**
+     * Current attempt number for this event, 1-based: {@code 1} on first
+     * delivery, incremented on every {@code @RetryPolicy} retry.
+     */
     int getAttemptNumber();
 
     /** Returns a human-readable summary of this event, suitable for logging. */

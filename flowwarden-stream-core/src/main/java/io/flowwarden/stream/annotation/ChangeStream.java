@@ -86,7 +86,7 @@ public @interface ChangeStream {
     /** Enable/disable this stream. */
     boolean enabled() default true;
 
-    /** Automatically start the stream on context refresh. */
+    /** Automatically start the stream on {@code ApplicationReadyEvent}. */
     boolean autoStart() default true;
 
     /** Name of the MongoTemplate/ReactiveMongoTemplate bean to use. */
