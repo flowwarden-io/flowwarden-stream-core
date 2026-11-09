@@ -40,7 +40,8 @@ import java.util.Map;
  * @param firstAttemptAt  timestamp of the first attempt
  * @param lastAttemptAt   timestamp of the last attempt
  * @param createdAt       timestamp when the DLQ entry was created
- * @param expiresAt       optional expiry timestamp (nullable, computed with ttlDays)
+ * @param expiresAt       optional expiry timestamp (nullable, computed from
+ *                        {@link DlqPolicy#retentionDays()})
  * @param metadata        additional key-value data
  */
 public record FailedEvent(

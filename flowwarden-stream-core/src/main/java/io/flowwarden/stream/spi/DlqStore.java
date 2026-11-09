@@ -26,7 +26,10 @@ import java.util.Optional;
  * Users may provide their own implementation as a Spring bean.</p>
  *
  * <p>The contract has two halves. The <strong>hot path</strong> is
- * {@link #save}: the runtime invokes it on every handler failure. The
+ * {@link #save}: the runtime invokes it when an event settles to the DLQ —
+ * retry budget exhausted, {@code @OnError} returning {@code DLQ}, or a manual
+ * {@code ctx.sendToDlq(...)}; a failure that will be retried never reaches
+ * the store. The
  * <strong>cold path</strong> is the {@code find*} read methods: they exist
  * for downstream consumers (forensics, a replay UI) and are never called by
  * the runtime itself. The reads are {@code default} and return empty so a

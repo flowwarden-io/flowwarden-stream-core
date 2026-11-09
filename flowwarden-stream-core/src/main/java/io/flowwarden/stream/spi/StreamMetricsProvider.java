@@ -39,7 +39,7 @@ public interface StreamMetricsProvider {
     /**
      * Called when a Change Stream stops, for any reason.
      *
-     * <p>Emitted in three situations:</p>
+     * <p>Emitted in two situations:</p>
      * <ul>
      *   <li>{@link StopReason#GRACEFUL} &mdash; explicit {@code stopStream()},
      *       JVM shutdown, leadership loss. {@code cause} is {@code null}.</li>
@@ -84,9 +84,10 @@ public interface StreamMetricsProvider {
     /**
      * Called when the watched collection was invalidated (dropped, its
      * database dropped, or renamed) — MongoDB closed the underlying change
-     * stream cursor. Always followed by an
-     * {@code onStreamStopped(streamName, CRASHED, cause)} for the cursor
-     * death itself.
+     * stream cursor. Followed by an
+     * {@code onStreamStopped(streamName, CRASHED, null)} for the cursor
+     * death itself, unless that death was already reported for the same
+     * stream generation.
      *
      * <p>What happens next depends on the cause and the stream's
      * {@code onHistoryLost} strategy: a drop under a self-repairing strategy
@@ -220,11 +221,16 @@ public interface StreamMetricsProvider {
      * carrying a null post-batch resume token, or a chained resume token that
      * has already aged out of the oplog ({@code ChangeStreamHistoryLost}).
      *
-     * <p>A probe failure never stops the stream and never writes to the
-     * checkpoint — {@code lastHeartbeatTimestamp} does not move. Repeated
-     * failures therefore surface as an aging heartbeat; this callback carries
-     * the cause so monitoring can distinguish a transient outage from a
-     * resume point that is no longer recoverable.</p>
+     * <p>A probe failure never stops the stream. It does not write to the
+     * checkpoint either — {@code lastHeartbeatTimestamp} does not move — with
+     * one exception: when an <em>idle</em> probe finds that the chained
+     * position has rolled out of the oplog, the heartbeat repairs the
+     * position in place (fresh server-certified position, dead tokens
+     * purged), which refreshes {@code lastHeartbeatTimestamp} and emits
+     * {@link #onCheckpoint(String, String)}. Otherwise repeated failures
+     * surface as an aging heartbeat; this callback carries the cause so
+     * monitoring can distinguish a transient outage from a resume point that
+     * is no longer recoverable.</p>
      *
      * <p>Distinct from {@link #onResumeHistoryLost(String)}, which describes
      * the startup resume cascade: a heartbeat failure happens while a live
@@ -236,7 +242,9 @@ public interface StreamMetricsProvider {
     default void onHeartbeatProbeFailed(String streamName, Throwable cause) {}
 
     /**
-     * Called when the internal event buffer status changes.
+     * Reserved for buffer observability. <strong>Not emitted by stream-core
+     * today</strong>: no code path reports buffer status yet. Implementations
+     * should treat it as a no-op until a release documents its emission.
      *
      * @param streamName  stream identifier
      * @param currentSize current number of events in the buffer
@@ -245,7 +253,9 @@ public interface StreamMetricsProvider {
     void onBufferStatus(String streamName, int currentSize, int maxSize);
 
     /**
-     * Called when a backpressure action is triggered.
+     * Reserved for backpressure observability. <strong>Not emitted by
+     * stream-core today</strong>: no code path triggers a
+     * {@link BackpressureAction} yet.
      *
      * @param streamName stream identifier
      * @param action     the backpressure action taken
@@ -287,10 +297,11 @@ public interface StreamMetricsProvider {
      *
      * <p>Stream-core collects this by reading the first and last timestamps from
      * {@code local.oplog.rs}. If the collection is inaccessible (e.g. Atlas shared tier),
-     * {@code status} will be {@code "UNAVAILABLE"}.</p>
+     * {@code status} will be {@code "UNAVAILABLE"}; any failure while reading
+     * it is reported the same way.</p>
      *
      * @param logLengthHours oplog window duration in hours (0 if unavailable)
-     * @param status         "OK", "UNAVAILABLE", or "ERROR"
+     * @param status         {@code "OK"} or {@code "UNAVAILABLE"}
      */
     void onOplogStats(double logLengthHours, String status);
 
@@ -313,10 +324,12 @@ public interface StreamMetricsProvider {
     }
 
     /**
-     * Called when this instance's leadership role changes for a stream.
+     * Called when this instance's leadership role changes for a
+     * {@code SINGLE_LEADER} stream. Never called for {@code ALL_INSTANCES}
+     * streams, which do not take part in an election.
      *
      * @param streamName the stream name
-     * @param role       "LEADER", "STANDBY", or "NOT_APPLICABLE"
+     * @param role       {@code "LEADER"} or {@code "STANDBY"}
      * @param instanceId the instance ID
      */
     default void onLeadershipChange(String streamName, String role, String instanceId) {}

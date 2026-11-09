@@ -46,9 +46,9 @@ import java.util.function.Supplier;
  * via {@link io.flowwarden.stream.annotation.ChangeStream @ChangeStream}.
  *
  * <p>Immutable and built only through {@link Builder}, obtained from
- * {@link StreamRegistration#stream(String, Class)}. Covers a deliberate <strong>subset</strong>
- * of the annotation model — not every {@code @ChangeStream} class can be expressed as a
- * {@code StreamSpec} yet:</p>
+ * {@link StreamRegistration#stream(String, Class)}. Covers the annotation model with the
+ * same defaults and handler shapes; the only {@code @ChangeStream} attribute without a
+ * builder method is {@code description}, which the runtime does not read:</p>
  *
  * <ul>
  *   <li>Covered, with the same defaults and handler shapes as the corresponding annotation:
