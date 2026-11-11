@@ -17,6 +17,7 @@ package io.flowwarden.stream.internal.dlq;
 
 import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
+import io.flowwarden.stream.spi.DlqStreamRegistration;
 import io.flowwarden.stream.spi.FailedEvent;
 import org.bson.Document;
 import org.slf4j.Logger;
@@ -58,6 +59,20 @@ public class ReactiveMongoDlqStore implements DlqStore {
         this.defaultCollection = properties.getCollection();
     }
 
+    @Override
+    public void onStreamRegistered(DlqStreamRegistration registration) {
+        registerStream(registration.streamName(), registration.mongoCollection());
+    }
+
+    /**
+     * Registers a stream → collection binding and creates the indexes on
+     * first registration. Superseded by the SPI hook
+     * {@link #onStreamRegistered(DlqStreamRegistration)} — see
+     * {@link MongoDlqStore#registerStream(String, String)}.
+     *
+     * @param streamName  stream identifier
+     * @param collection  resolved Mongo collection name (empty/null → default)
+     */
     public void registerStream(String streamName, String collection) {
         String resolved = (collection == null || collection.isEmpty())
                 ? defaultCollection : collection;

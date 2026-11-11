@@ -34,7 +34,6 @@ import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.internal.DefaultChangeStreamContext;
 import io.flowwarden.stream.internal.MongoTemplateRegistry;
 import io.flowwarden.stream.internal.discovery.ChangeStreamDefinition;
-import io.flowwarden.stream.internal.dlq.ReactiveMongoDlqStore;
 import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
 import reactor.core.publisher.Mono;
 import reactor.util.retry.Retry;
@@ -59,6 +58,7 @@ import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
+import io.flowwarden.stream.spi.DlqStreamRegistration;
 import io.flowwarden.stream.spi.FailedEvent;
 import io.flowwarden.stream.spi.StopReason;
 import io.flowwarden.stream.spi.StreamConfiguration;
@@ -512,17 +512,13 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                         degradeOplogStart.add(streamName);
                     }
                 })
-                .onErrorResume(e -> {
-                    try {
-                        // Observational only — a throwing provider must not
-                        // replace the original cause nor break termination.
-                        FlowWardenMetrics.get().onEventError(streamName, e, true, 0, null);
-                    } catch (Exception metricsError) {
-                        log.warn("Metrics provider failed on event error for stream '{}': {}",
-                                streamName, metricsError.getMessage());
-                    }
-                    return Mono.empty();
-                })
+                // A cursor death is a stream-level failure: it is reported
+                // once, as onStreamStopped(CRASHED, cause) from doFinally —
+                // never as onEventError, whose contract is a handler failure
+                // with a 1-based attempt and non-null event metadata. The
+                // error is swallowed here so the pipeline completes and the
+                // lifecycle commit below runs.
+                .onErrorResume(e -> Mono.empty())
                 .doFinally(signal -> {
                     // Lock-free termination signal FIRST: a startStream
                     // holding the lifecycle lock through subscribe() must be
@@ -1372,17 +1368,31 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         }
     }
 
+    /**
+     * Announces every DLQ-enabled stream to the {@code DlqStore} bean through
+     * the SPI startup hook, whatever its concrete type — a composite or a
+     * decorator forwards it to the Mongo store it wraps, which binds the
+     * stream to its {@code @MongoDlqOptions} collection and creates the TTL
+     * index there. A hook that throws is logged and skipped: the stream
+     * still starts.
+     */
     private void registerDlqCollections() {
-        if (!(dlqWriter instanceof ReactiveMongoDlqStore reactiveStore)) {
-            return;
-        }
         for (ChangeStreamDefinition def : registry.getDefinitions()) {
-            if (def.deadLetterQueueAnnotation() == null) {
+            DeadLetterQueue dlqAnn = def.deadLetterQueueAnnotation();
+            if (dlqAnn == null) {
                 continue;
             }
             MongoDlqOptions opts = def.mongoDlqOptionsAnnotation();
             String collection = opts != null ? opts.collection() : "";
-            reactiveStore.registerStream(def.streamName(), collection);
+            DlqStreamRegistration registration = new DlqStreamRegistration(
+                    def.streamName(), DlqPolicy.fromAnnotation(dlqAnn), collection);
+            try {
+                dlqWriter.onStreamRegistered(registration);
+            } catch (Exception e) {
+                log.warn("DlqStore {} failed to register stream '{}' (collection hint '{}'): {}",
+                        dlqWriter.getClass().getName(), def.streamName(), collection,
+                        e.getMessage(), e);
+            }
         }
     }
 
