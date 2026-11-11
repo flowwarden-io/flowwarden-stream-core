@@ -80,7 +80,7 @@ class ImperativeStuckStreamTest {
 
     @Test
     @SuppressWarnings({"unchecked", "rawtypes"})
-    void hungCursor_isDeclaredStuck_crashedWithVerdict_cancelledAndResubscribed() {
+    void hungCursor_isDeclaredStuck_crashedWithVerdict_cancelledAndResubscribed() throws Exception {
         FlowWardenMetrics.setProvider(metrics);
 
         MongoTemplate template = mock(MongoTemplate.class);
@@ -95,6 +95,10 @@ class ImperativeStuckStreamTest {
         // connection.
         Subscription hungSubscription = mock(Subscription.class);
         when(hungSubscription.isActive()).thenReturn(true);
+        // The reading task completed its start (the cursor opened), then
+        // hung: the generation's proof of life, read lock-free by the
+        // manager's open watch.
+        when(hungSubscription.await(any(Duration.class))).thenReturn(true);
         MessageListenerContainer container = mock(MessageListenerContainer.class);
         List<Object> requests = new CopyOnWriteArrayList<>();
         when(container.register(any(), any(Class.class), any(ErrorHandler.class)))
@@ -157,6 +161,10 @@ class ImperativeStuckStreamTest {
 
         Subscription hungSubscription = mock(Subscription.class);
         when(hungSubscription.isActive()).thenReturn(true);
+        // The reading task completed its start (the cursor opened), then
+        // hung: the generation's proof of life, read lock-free by the
+        // manager's open watch.
+        when(hungSubscription.await(any(Duration.class))).thenReturn(true);
         MessageListenerContainer container = mock(MessageListenerContainer.class);
         List<Object> requests = new CopyOnWriteArrayList<>();
         when(container.register(any(), any(Class.class), any(ErrorHandler.class)))

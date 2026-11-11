@@ -247,6 +247,11 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                 }
 
                 @Override
+                public Object installedGeneration(String streamName) {
+                    return streams.get(streamName); // the StreamState IS the generation's identity
+                }
+
+                @Override
                 public void onTerminalGiveUp(String streamName) {
                     // The lease must not be renewed for a stream the loop
                     // gave up on — release it so a standby's operator at
@@ -639,17 +644,36 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
      * Proof that this generation's OWN cursor opened on the server: its
      * first delivered event, or the reading task completing its start
      * ({@link #watchCursorOpen}). Only such a generation closes the
-     * restart cycle — at its death, which reads the flag after claiming the
-     * termination. The synchronous return of {@code startStream} proves
-     * nothing: Spring opens the cursor on the reading thread, and a refused
-     * open reaches the error handler after the subscription was installed —
-     * resetting there would log every refusal of a loop as a first death.
-     * A heartbeat probe proves nothing either: it opens its own cursor, and
-     * its success says nothing about the main one, which the server may
-     * keep refusing for a reason specific to the main request.
+     * log-throttling cycle — at its death, which reads the flag after
+     * claiming the termination — and only such a generation ends the
+     * restart loop's cycle: the proof is handed to the restarter, which
+     * resets its attempt counter and emits {@code onStreamRestarted}. The
+     * synchronous return of {@code startStream} proves nothing: Spring
+     * opens the cursor on the reading thread, and a refused open reaches
+     * the error handler after the subscription was installed — resetting
+     * there would log every refusal of a loop as a first death and retry
+     * it at {@code initialDelay} forever. A heartbeat probe proves nothing
+     * either: it opens its own cursor, and its success says nothing about
+     * the main one, which the server may keep refusing for a reason
+     * specific to the main request.
+     *
+     * <p>Fenced by generation: a late signal from a terminated generation,
+     * or from one a newer registration already replaced, must never end
+     * the cycle of the generation that succeeded it. The lock-free check
+     * here is a cheap early exit only — it can be overtaken by a stop, a
+     * death and a new attempt between the read and the call. The binding
+     * guarantee is the state object passed as the generation's identity,
+     * which the restarter compares under its monitor with the identity it
+     * recorded when the attempt committed.</p>
      */
     private void noteGenerationProven(StreamState state) {
-        state.proven().set(true);
+        if (!state.proven().compareAndSet(false, true)) {
+            return;
+        }
+        String streamName = state.definition().streamName();
+        if (!state.terminated().get() && streams.get(streamName) == state) {
+            restarter.onGenerationProven(streamName, state);
+        }
     }
 
     private static final long OPEN_WATCH_INITIAL_MILLIS = 100;
@@ -928,6 +952,11 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
 
     boolean isRestartPending(String streamName) {
         return restarter.isRestartPending(streamName);
+    }
+
+    /** Whether the restart loop installed a generation whose proof of life is still awaited. */
+    boolean isAwaitingProof(String streamName) {
+        return restarter.isAwaitingProof(streamName);
     }
 
     /** Whether the installed generation's own cursor is known to have opened. */

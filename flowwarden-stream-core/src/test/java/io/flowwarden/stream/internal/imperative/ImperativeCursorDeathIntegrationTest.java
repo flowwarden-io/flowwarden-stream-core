@@ -320,7 +320,7 @@ class ImperativeCursorDeathIntegrationTest {
 
             // The failpoint is consumed: the third generation opens and
             // proves itself by delivering an event.
-            awaitResubscribedAndDeliver(2);
+            awaitResubscribedAndDeliver(1); // the two refused generations never were reported
 
             enableFailPointOnce();
             await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
@@ -332,7 +332,7 @@ class ImperativeCursorDeathIntegrationTest {
 
             // Same cause as the previous death — but that generation proved
             // itself too, so this is again a new incident.
-            awaitResubscribedAndDeliver(3);
+            awaitResubscribedAndDeliver(2);
             enableFailPointOnce();
             await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
                     assertThat(deathLogs(logs)).hasSize(4));
