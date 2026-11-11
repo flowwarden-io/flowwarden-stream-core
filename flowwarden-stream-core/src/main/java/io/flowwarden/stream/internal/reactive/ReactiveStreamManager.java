@@ -229,6 +229,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                 }
 
                 @Override
+                public Object installedGeneration(String streamName) {
+                    return streams.get(streamName); // the ReactiveStreamState IS the generation's identity
+                }
+
+                @Override
                 public void onTerminalGiveUp(String streamName) {
                     // The lease must not be renewed for a stream the loop
                     // gave up on — release it so a standby's operator at
@@ -628,11 +633,30 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
      * idle generation therefore stays unproven until it delivers, which can
      * only throttle a repeat of the previous cause to one WARN line — never
      * the reverse. A heartbeat probe proves nothing: it opens its own
-     * cursor. Only a proven generation closes the restart cycle, at its
-     * death; see the imperative manager's twin method.
+     * cursor. Only a proven generation closes the log-throttling cycle, at
+     * its death, and only a proven generation ends the restart loop's
+     * cycle: the proof is handed to the restarter, which resets its attempt
+     * counter and emits {@code onStreamRestarted}. An idle resubscribed
+     * generation that never delivers is <em>assumed</em> alive by the
+     * restarter once it outlives the policy's {@code maxDelay} — a
+     * heuristic, not a guarantee. See the imperative manager's twin method.
+     *
+     * <p>Fenced by generation: Reactor serializes a subscription's signals,
+     * so no event of this generation can follow its error — but a newer
+     * registration may already have replaced it, and the lock-free check
+     * here can be overtaken by a stop, a death and a new attempt. The
+     * binding guarantee is the state object passed as the generation's
+     * identity, which the restarter compares under its monitor with the
+     * identity it recorded when the attempt committed.</p>
      */
     private void noteGenerationProven(ReactiveStreamState state) {
-        state.proven().set(true);
+        if (!state.proven().compareAndSet(false, true)) {
+            return;
+        }
+        String streamName = state.definition().streamName();
+        if (!state.terminated().get() && streams.get(streamName) == state) {
+            restarter.onGenerationProven(streamName, state);
+        }
     }
 
     /**
@@ -792,6 +816,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
     boolean isRestartPending(String streamName) {
         return restarter.isRestartPending(streamName);
+    }
+
+    /** Whether the restart loop installed a generation whose proof of life is still awaited. */
+    boolean isAwaitingProof(String streamName) {
+        return restarter.isAwaitingProof(streamName);
     }
 
     /** Whether the installed generation's own cursor is known to have opened. */

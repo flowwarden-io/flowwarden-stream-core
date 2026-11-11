@@ -146,16 +146,19 @@ class ReactiveCursorDeathIntegrationTest {
         assertThat(streamManager.hasHeartbeat(STREAM)).isFalse();
         assertThat(streamManager.isRestartPending(STREAM)).isTrue();
 
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
-                assertThat(metrics.restarts)
-                        .as("previously: permanent silent death — now a managed resubscribe")
-                        .anyMatch(s -> s.startsWith(STREAM + ":1:")));
-        await().atMost(Duration.ofSeconds(5))
+        await().atMost(Duration.ofSeconds(15))
                 .until(() -> streamManager.isRunning(STREAM));
 
         reactiveMongoTemplate.insert(new Document("seq", 2), COLLECTION).block();
         await().atMost(Duration.ofSeconds(10))
                 .untilAsserted(() -> assertThat(handler.count()).isEqualTo(2));
+        // The restart is reported on the new cursor's proof of life — in
+        // reactive mode its first delivered event — not on the return of
+        // the start, which proves nothing about the cursor.
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertThat(metrics.restarts)
+                        .as("previously: permanent silent death — now a managed resubscribe")
+                        .anyMatch(s -> s.startsWith(STREAM + ":1:")));
     }
 
     @Test
@@ -185,7 +188,9 @@ class ReactiveCursorDeathIntegrationTest {
         enableFailPointOnce();
 
         await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
-                assertThat(metrics.restarts).anyMatch(s -> s.startsWith(POISON_STREAM + ":")));
+                assertThat(metrics.stops).anyMatch(s -> s.startsWith(POISON_STREAM + ":CRASHED")));
+        await().atMost(Duration.ofSeconds(15))
+                .until(() -> streamManager.isRunning(POISON_STREAM));
         assertThat(metrics.historyLostCount.get())
                 .as("cascade level 3 must fire at resubscribe time")
                 .isEqualTo(1);
@@ -195,10 +200,13 @@ class ReactiveCursorDeathIntegrationTest {
                 .as("the self-repair clears the dead processed token")
                 .isNull();
 
-        // Delivery continues on the repaired stream.
+        // Delivery continues on the repaired stream — and proves the new
+        // cursor alive, which is when the restart is reported.
         reactiveMongoTemplate.insert(new Document("seq", 2), POISON_COLLECTION).block();
         await().atMost(Duration.ofSeconds(10))
                 .untilAsserted(() -> assertThat(poisonHandler.count()).isEqualTo(2));
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertThat(metrics.restarts).anyMatch(s -> s.startsWith(POISON_STREAM + ":")));
     }
 
     @Test
@@ -267,10 +275,10 @@ class ReactiveCursorDeathIntegrationTest {
 
         enableFailPointOnce();
 
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
-                assertThat(metrics.restarts)
-                        .as("the restart must be scheduled despite the throwing provider")
-                        .anyMatch(s -> s.startsWith(STREAM + ":")));
+        await().atMost(Duration.ofSeconds(15))
+                .until(() -> streamManager.isRestartPending(STREAM));
+        await().atMost(Duration.ofSeconds(15))
+                .until(() -> streamManager.isRunning(STREAM));
         assertThat(streamManager.hasIntervalTask(STREAM) && !streamManager.isRunning(STREAM))
                 .as("no zombie timer may survive the throwing provider")
                 .isFalse();
@@ -278,6 +286,10 @@ class ReactiveCursorDeathIntegrationTest {
         reactiveMongoTemplate.insert(new Document("seq", 2), COLLECTION).block();
         await().atMost(Duration.ofSeconds(10))
                 .untilAsserted(() -> assertThat(handler.count()).isEqualTo(2));
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertThat(metrics.restarts)
+                        .as("the restart must happen despite the throwing provider")
+                        .anyMatch(s -> s.startsWith(STREAM + ":")));
     }
 
     @Test
@@ -305,8 +317,9 @@ class ReactiveCursorDeathIntegrationTest {
             assertThat(deaths.get(1).getThrowableProxy()).isNull();
 
             // The failpoint is consumed: the third generation opens and
-            // proves itself by delivering an event.
-            awaitResubscribedAndDeliver(2);
+            // proves itself by delivering an event — the first restart
+            // reported (the two refused generations never were).
+            awaitResubscribedAndDeliver(1);
 
             enableFailPointOnce();
             await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
@@ -318,7 +331,7 @@ class ReactiveCursorDeathIntegrationTest {
 
             // Same cause as the previous death — but that generation proved
             // itself too, so this is again a new incident.
-            awaitResubscribedAndDeliver(3);
+            awaitResubscribedAndDeliver(2);
             enableFailPointOnce();
             await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
                     assertThat(deathLogs(logs)).hasSize(4));
@@ -340,20 +353,22 @@ class ReactiveCursorDeathIntegrationTest {
     }
 
     /**
-     * Waits for the {@code n}-th resubscription of the ghost stream to be
-     * running, then inserts until the handler sees one more event: the
+     * Inserts until the ghost stream's handler sees one more event — the
      * cursor open is asynchronous, so a single insert right after
-     * {@code isRunning} could precede it and be invisible to a LATEST start.
+     * {@code isRunning} could precede it and be invisible to a LATEST start
+     * — then waits for the {@code n}-th restart report: in reactive mode
+     * the delivered event is the resubscribed cursor's proof of life, and
+     * the restart is reported on that proof.
      */
     private void awaitResubscribedAndDeliver(int n) {
-        await().atMost(Duration.ofSeconds(30)).until(() ->
-                metrics.restarts.stream().filter(s -> s.startsWith(GHOST_STREAM + ":")).count() >= n
-                        && streamManager.isRunning(GHOST_STREAM));
         int before = ghostHandler.count();
-        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(300)).until(() -> {
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(300)).until(() -> {
             reactiveMongoTemplate.insert(new Document("seq", before + 1), GHOST_COLLECTION).block();
             return ghostHandler.count() > before;
         });
+        await().atMost(Duration.ofSeconds(10)).until(() ->
+                metrics.restarts.stream().filter(s -> s.startsWith(GHOST_STREAM + ":")).count() >= n
+                        && streamManager.isRunning(GHOST_STREAM));
     }
 
     private void enableFailPointOnce() {

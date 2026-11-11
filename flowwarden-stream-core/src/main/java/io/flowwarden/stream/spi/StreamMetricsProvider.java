@@ -64,7 +64,9 @@ public interface StreamMetricsProvider {
     /**
      * Called when a stream that died at runtime (cursor death — network
      * outage, primary stepdown, non-resumable server error) has been
-     * successfully resubscribed by the managed restart loop.
+     * successfully resubscribed by the managed restart loop — meaning the
+     * new cursor is known, or after a bounded wait assumed, to be alive, not
+     * merely that the start method returned.
      *
      * <p>Always follows an {@code onStreamStopped(streamName, CRASHED, cause)}
      * for the same incident, and an {@link #onStreamStarted} fires for the
@@ -73,6 +75,20 @@ public interface StreamMetricsProvider {
      * previous subscription. A recurring stream of these is an operational
      * signal (flaky network, undersized oplog) even though each individual
      * incident healed itself.</p>
+     *
+     * <p>The cursor opens asynchronously after {@code onStreamStarted}, so
+     * this signal is emitted on the generation's proof of life — the cursor
+     * is <em>known alive</em>: its first delivered event, or (IMPERATIVE)
+     * the reading task's completed start. A resubscribed generation whose
+     * open is refused dies without ever emitting it — the loop continues its
+     * attempt count instead. As a heuristic applied in both modes, an idle
+     * generation that outlives the stream's {@code @RestartPolicy}
+     * {@code maxDelay} (60s by default) without dying is <em>assumed
+     * alive</em> and emits it then: in REACTIVE mode, where the first event
+     * is the only open signal, this is the earliest an idle restart can be
+     * reported. That bound is configured independently of the driver's
+     * timeouts, so nothing guarantees an open fails within it; an open that
+     * fails later is counted as a fresh death at attempt 1.</p>
      *
      * @param streamName stream identifier
      * @param attempt    the attempt number that succeeded (1 = first try)

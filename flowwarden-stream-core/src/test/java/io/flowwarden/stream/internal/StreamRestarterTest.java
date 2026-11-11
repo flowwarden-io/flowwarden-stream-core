@@ -39,7 +39,10 @@ import static org.awaitility.Awaitility.await;
  * (backoff cadence and attempt ceiling), indefinite retry on transient
  * failures by default, terminal give-up on {@link HistoryLostException} or
  * on an exhausted ceiling, stand-down when the stream was restarted
- * manually, and cancellation by a graceful stop.
+ * manually, and cancellation by a graceful stop — and the cycle's end: the
+ * synchronous return of {@code startStream} proves nothing (the cursor opens
+ * asynchronously), only the manager's proof of life resets the attempt
+ * counter and emits the restart signal.
  */
 class StreamRestarterTest {
 
@@ -58,6 +61,13 @@ class StreamRestarterTest {
         FlowWardenMetrics.setProvider(metrics);
     }
 
+    /** Restarter whose scripted callbacks prove each installed generation from inside {@code startStream}. */
+    private StreamRestarter restarter(RecordingCallbacks callbacks) {
+        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        callbacks.restarter = restarter;
+        return restarter;
+    }
+
     @AfterEach
     void tearDown() {
         if (restarter != null) {
@@ -71,7 +81,7 @@ class StreamRestarterTest {
         RecordingCallbacks callbacks = new RecordingCallbacks();
         callbacks.policy = FAST_UNBOUNDED;
         callbacks.failStartsUntilAttempt = 2;
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
 
@@ -89,7 +99,7 @@ class StreamRestarterTest {
         RecordingCallbacks callbacks = new RecordingCallbacks();
         callbacks.policy = new RestartPolicyConfig(2, Duration.ofMillis(100), Duration.ofSeconds(1), 2.0, false);
         callbacks.failStartsUntilAttempt = Integer.MAX_VALUE; // the server never comes back
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
         RuntimeException death = new RuntimeException("cursor died");
 
         restarter.onRuntimeDeath(STREAM, death);
@@ -114,7 +124,7 @@ class StreamRestarterTest {
         // after another backoff.
         RecordingCallbacks callbacks = new RecordingCallbacks();
         callbacks.policy = new RestartPolicyConfig(1, Duration.ofSeconds(30), Duration.ofSeconds(30), 2.0, false);
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
         restarter.onRuntimeDeath(STREAM, new RuntimeException("second death"));
@@ -130,7 +140,7 @@ class StreamRestarterTest {
         RecordingCallbacks callbacks = new RecordingCallbacks();
         callbacks.policy = new RestartPolicyConfig(1, Duration.ofSeconds(30), Duration.ofSeconds(30), 2.0, false);
         callbacks.installed.set(true); // the operator restarted it in the meantime
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
         restarter.onRuntimeDeath(STREAM, new RuntimeException("second death"));
@@ -148,7 +158,7 @@ class StreamRestarterTest {
         RecordingCallbacks callbacks = new RecordingCallbacks();
         callbacks.policy = new RestartPolicyConfig(2, Duration.ofMillis(100), Duration.ofSeconds(1), 2.0, false);
         callbacks.failStartsUntilAttempt = 2; // first lifecycle: fail once, then succeed
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
         await().atMost(Duration.ofSeconds(5))
@@ -166,7 +176,7 @@ class StreamRestarterTest {
     @Test
     void runtimeDeath_restartsTheStream_emitsRestartSignalWithAttemptAndCause() {
         RecordingCallbacks callbacks = new RecordingCallbacks();
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
         RuntimeException cause = new RuntimeException("cursor died");
 
         restarter.onRuntimeDeath(STREAM, cause);
@@ -182,7 +192,7 @@ class StreamRestarterTest {
     void transientStartFailures_retryIndefinitely_untilSuccess() {
         RecordingCallbacks callbacks = new RecordingCallbacks();
         callbacks.failStartsUntilAttempt = 3; // first two startStream calls throw
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
 
@@ -199,7 +209,7 @@ class StreamRestarterTest {
     void historyLostAtRestart_isTerminal_givesUpAndSurfacesCrash() {
         RecordingCallbacks callbacks = new RecordingCallbacks();
         callbacks.startFailure = new HistoryLostException(STREAM, Instant.now());
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
 
@@ -218,7 +228,7 @@ class StreamRestarterTest {
     void manuallyRestartedStream_winsOverTheLoop() {
         RecordingCallbacks callbacks = new RecordingCallbacks();
         callbacks.installed.set(true); // the operator restarted it during the backoff
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
 
@@ -260,6 +270,11 @@ class StreamRestarterTest {
             }
 
             @Override
+            public Object installedGeneration(String streamName) {
+                return started.contains(streamName) ? streamName : null;
+            }
+
+            @Override
             public void onTerminalGiveUp(String streamName) {
             }
         };
@@ -290,7 +305,7 @@ class StreamRestarterTest {
         RecordingCallbacks callbacks = new RecordingCallbacks();
         callbacks.startEntered = new java.util.concurrent.CountDownLatch(1);
         callbacks.startGate = new java.util.concurrent.CountDownLatch(1);
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
         assertThat(callbacks.startEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
@@ -322,7 +337,7 @@ class StreamRestarterTest {
         // The old attempt's startStream fails transiently (its subscription
         // never took); the fresh generation's attempt succeeds.
         callbacks.failStartsUntilAttempt = 2;
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
         assertThat(callbacks.startEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
@@ -348,7 +363,7 @@ class StreamRestarterTest {
         // attempt must leave exactly ONE valid, cancellable future — never an
         // orphaned handle that could fire after a stop or a success.
         RecordingCallbacks callbacks = new RecordingCallbacks();
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
         restarter.onRuntimeDeath(STREAM, new RuntimeException("second death"));
@@ -363,10 +378,430 @@ class StreamRestarterTest {
                 .isEqualTo(1);
     }
 
+    // --- the cycle ends on the proof of life, not on the return of startStream ---
+
+    @Test
+    void startReturn_endsNothing_deathBeforeProofContinuesTheAttemptCount() {
+        // A refused open: startStream returns normally (the cursor opens
+        // asynchronously), then the manager reports the death. The attempt
+        // count must go on — attempt 2 after initialDelay * multiplier —
+        // instead of a fresh attempt 1 at initialDelay forever.
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = FAST_UNBOUNDED; // 100ms, 200ms, 400ms …
+        callbacks.proveOnInstall = false;
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("open refused"));
+        await().atMost(Duration.ofSeconds(5))
+                .until(() -> restarter.isAwaitingProof(STREAM));
+        assertThat(callbacks.startCalls.get()).isEqualTo(1);
+        assertThat(restarter.isRestartPending(STREAM))
+                .as("the stream is installed — no restart pending, the proof is awaited")
+                .isFalse();
+        assertThat(metrics.restarts)
+                .as("the return of startStream is not a resubscription")
+                .isEmpty();
+
+        callbacks.installed.set(false); // the manager evicted the dead generation
+        long death = System.nanoTime();
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("open refused"));
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(callbacks.startCalls.get()).isEqualTo(2));
+        assertThat(Duration.ofNanos(callbacks.startTimes.get(1) - death))
+                .as("attempt 2 waits initialDelay * multiplier, not initialDelay")
+                .isGreaterThanOrEqualTo(Duration.ofMillis(190));
+
+        callbacks.installed.set(false);
+        death = System.nanoTime();
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("open refused"));
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(callbacks.startCalls.get()).isEqualTo(3));
+        assertThat(Duration.ofNanos(callbacks.startTimes.get(2) - death))
+                .as("attempt 3 waits initialDelay * multiplier^2")
+                .isGreaterThanOrEqualTo(Duration.ofMillis(390));
+        assertThat(metrics.restarts).isEmpty();
+        assertThat(callbacks.terminalGiveUps).as("unbounded policy").isEmpty();
+    }
+
+    @Test
+    void boundedPolicy_exhaustedByUnprovenGenerations_givesUp_neverEmitsRestarted() {
+        // Every start "succeeds" synchronously and dies asynchronously: a
+        // bounded policy must still reach its ceiling and release the lease.
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = new RestartPolicyConfig(2, Duration.ofMillis(100), Duration.ofSeconds(1), 2.0, false);
+        callbacks.proveOnInstall = false;
+        restarter(callbacks);
+        RuntimeException death = new RuntimeException("open refused");
+
+        for (int i = 1; i <= 2; i++) {
+            callbacks.installed.set(false);
+            restarter.onRuntimeDeath(STREAM, death);
+            await().atMost(Duration.ofSeconds(5))
+                    .until(() -> restarter.isAwaitingProof(STREAM));
+        }
+        callbacks.installed.set(false);
+        restarter.onRuntimeDeath(STREAM, death); // attempt 3 > maxAttempts
+
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(callbacks.terminalGiveUps).containsExactly(STREAM));
+        assertThat(callbacks.startCalls.get())
+                .as("exactly maxAttempts resubscriptions were tried")
+                .isEqualTo(2);
+        assertThat(restarter.isRestartPending(STREAM)).isFalse();
+        assertThat(restarter.isAwaitingProof(STREAM)).isFalse();
+        assertThat(metrics.stops).containsExactly(STREAM + ":CRASHED:RuntimeException");
+        assertThat(metrics.restarts)
+                .as("a generation that never proved itself is never reported as restarted")
+                .isEmpty();
+    }
+
+    @Test
+    void proofAfterReturn_endsTheCycle_emitsRestarted_nextDeathIsAttemptOne() {
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = FAST_UNBOUNDED;
+        callbacks.proveOnInstall = false;
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        callbacks.installed.set(false);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death")); // unproven: attempt 2
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(callbacks.startCalls.get()).isEqualTo(2));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        assertThat(metrics.restarts).isEmpty();
+
+        // The manager reports the cursor alive: the signal carries the
+        // attempt that succeeded, the state is gone.
+        restarter.onGenerationProven(STREAM, callbacks.generation);
+        assertThat(metrics.restarts).containsExactly(STREAM + ":2:first death");
+        assertThat(restarter.isAwaitingProof(STREAM)).isFalse();
+        assertThat(restarter.isRestartPending(STREAM)).isFalse();
+
+        // A later death is a new incident: attempt 1 again.
+        callbacks.installed.set(false);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("second death"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        restarter.onGenerationProven(STREAM, callbacks.generation);
+        assertThat(metrics.restarts)
+                .containsExactly(STREAM + ":2:first death", STREAM + ":1:second death");
+        assertThat(callbacks.terminalGiveUps).isEmpty();
+    }
+
+    @Test
+    void proofDuringInFlightStart_isHonouredWhenTheAttemptCommits() throws Exception {
+        // An event delivered on the reading thread before startStream
+        // returned: the proof lands while the attempt is in flight and must
+        // end the cycle as soon as the attempt commits — never be lost.
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = FAST_UNBOUNDED;
+        callbacks.proveOnInstall = false;
+        callbacks.startEntered = new java.util.concurrent.CountDownLatch(1);
+        callbacks.startGate = new java.util.concurrent.CountDownLatch(1);
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
+        assertThat(callbacks.startEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        restarter.onGenerationProven(STREAM, callbacks.generation); // in flight, this generation
+        assertThat(metrics.restarts).as("not committed yet").isEmpty();
+
+        callbacks.startGate.countDown();
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(metrics.restarts).containsExactly(STREAM + ":1:cursor died"));
+        assertThat(restarter.isAwaitingProof(STREAM)).isFalse();
+        assertThat(restarter.isRestartPending(STREAM)).isFalse();
+    }
+
+    @Test
+    void strayProofWhileAnAttemptIsPending_isIgnored() {
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = new RestartPolicyConfig(0, Duration.ofSeconds(30), Duration.ofSeconds(30), 2.0, false);
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
+        restarter.onGenerationProven(STREAM, new Object()); // a late signal of the dead generation
+
+        assertThat(restarter.isRestartPending(STREAM))
+                .as("the pending attempt still owns the next step")
+                .isTrue();
+        assertThat(metrics.restarts).isEmpty();
+        assertThat(callbacks.startCalls.get()).isZero();
+    }
+
+    @Test
+    void proofOutsideARestartCycle_isNoOp() {
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        restarter(callbacks);
+
+        restarter.onGenerationProven(STREAM, new Object()); // boot start, manual start: no cycle
+
+        assertThat(metrics.restarts).isEmpty();
+        assertThat(restarter.isRestartPending(STREAM)).isFalse();
+        assertThat(restarter.isAwaitingProof(STREAM)).isFalse();
+    }
+
+    @Test
+    void installedGeneration_outlivingMaxDelay_countsAsAlive() {
+        // Reactive streams prove themselves on their first event only: an
+        // idle resubscribed generation that outlives the policy's maxDelay
+        // without dying is counted as alive — the restart is reported and
+        // the next death starts a fresh cycle.
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = new RestartPolicyConfig(0, Duration.ofMillis(100), Duration.ofMillis(400), 2.0, false);
+        callbacks.proveOnInstall = false;
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        callbacks.installed.set(false);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death")); // attempt 2
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(callbacks.startCalls.get()).isEqualTo(2));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        long installedAt = callbacks.startTimes.get(1); // the install follows the start's return
+        assertThat(metrics.restarts).isEmpty();
+
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(metrics.restarts).containsExactly(STREAM + ":2:first death"));
+        assertThat(Duration.ofNanos(System.nanoTime() - installedAt))
+                .as("not before maxDelay")
+                .isGreaterThanOrEqualTo(Duration.ofMillis(390));
+        assertThat(restarter.isAwaitingProof(STREAM)).isFalse();
+
+        callbacks.installed.set(false);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("second death"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        restarter.onGenerationProven(STREAM, callbacks.generation);
+        assertThat(metrics.restarts)
+                .containsExactly(STREAM + ":2:first death", STREAM + ":1:second death");
+    }
+
+    @Test
+    void deathBeforeMaxDelay_cancelsTheAgeProof() throws Exception {
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = new RestartPolicyConfig(0, Duration.ofMillis(100), Duration.ofMillis(300), 2.0, false);
+        callbacks.proveOnInstall = false;
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("open refused"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        callbacks.installed.set(false);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("open refused")); // within maxDelay
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(callbacks.startCalls.get()).isEqualTo(2));
+
+        // Past both would-be age proofs: the dead generation's timer was
+        // cancelled by its death (it would have reported attempt 1); only
+        // the installed generation's fires, with the continued count.
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(metrics.restarts).isNotEmpty());
+        Thread.sleep(400);
+        assertThat(metrics.restarts)
+                .as("one age proof, for the living generation, carrying attempt 2")
+                .containsExactly(STREAM + ":2:open refused");
+    }
+
+    @Test
+    void cancelWhileAwaitingProof_clearsTheState() {
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = FAST_UNBOUNDED;
+        callbacks.proveOnInstall = false;
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+
+        Object stopped = callbacks.generation;
+        restarter.cancel(STREAM); // operator stop
+        assertThat(restarter.isAwaitingProof(STREAM)).isFalse();
+        restarter.onGenerationProven(STREAM, stopped); // late, after the stop
+        assertThat(metrics.restarts).isEmpty();
+    }
+
+    // --- the proof is bound to its generation ---
+
+    @Test
+    void staleProofOfAReplacedGeneration_whileTheNextIsInstalledUnproven_isIgnored() {
+        // Generation A is proven; its manager thread passes its lock-free
+        // fence and is suspended before reaching the restarter. Meanwhile an
+        // operator stops A (cycle cancelled), a later start dies, and the
+        // new cycle's attempt installs B, unproven. A's late proof must not
+        // end B's cycle: B stays awaiting proof, nothing is reported, and
+        // B's death continues B's count.
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = FAST_UNBOUNDED;
+        callbacks.proveOnInstall = false;
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        Object generationA = callbacks.generation;
+
+        restarter.cancel(STREAM); // operator stop of A
+        callbacks.installed.set(false);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("later death")); // new cycle
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        assertThat(callbacks.generation).isNotSameAs(generationA);
+
+        restarter.onGenerationProven(STREAM, generationA); // A's thread resumes
+        assertThat(restarter.isAwaitingProof(STREAM))
+                .as("B's cycle is untouched by a proof about A")
+                .isTrue();
+        assertThat(metrics.restarts).isEmpty();
+
+        callbacks.installed.set(false);
+        long death = System.nanoTime();
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("later death")); // B dies unproven
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(callbacks.startCalls.get()).isEqualTo(3));
+        assertThat(Duration.ofNanos(callbacks.startTimes.get(2) - death))
+                .as("B's death is attempt 2 of B's cycle, not a fresh attempt 1")
+                .isGreaterThanOrEqualTo(Duration.ofMillis(190));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        restarter.onGenerationProven(STREAM, callbacks.generation); // the real proof
+        assertThat(metrics.restarts).containsExactly(STREAM + ":2:later death");
+    }
+
+    @Test
+    void staleProofWhileTheNextAttemptIsInFlight_isNotHonoured_itsOwnProofIs() throws Exception {
+        // Same race, with B's startStream still in flight when A's late
+        // proof lands: it must not be remembered as B's proof. B commits
+        // unproven; B's own proof then ends the cycle.
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = FAST_UNBOUNDED;
+        callbacks.proveOnInstall = false;
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        Object generationA = callbacks.generation;
+
+        restarter.cancel(STREAM); // operator stop of A
+        callbacks.installed.set(false);
+        callbacks.startEntered = new java.util.concurrent.CountDownLatch(1);
+        callbacks.startGate = new java.util.concurrent.CountDownLatch(1);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("later death")); // new cycle
+        assertThat(callbacks.startEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        restarter.onGenerationProven(STREAM, generationA); // A's late proof, B in flight
+        callbacks.startGate.countDown();
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        assertThat(metrics.restarts)
+                .as("B committed unproven: A's proof was about another generation")
+                .isEmpty();
+
+        restarter.onGenerationProven(STREAM, callbacks.generation); // B's own proof
+        assertThat(metrics.restarts).containsExactly(STREAM + ":1:later death");
+        assertThat(restarter.isAwaitingProof(STREAM)).isFalse();
+    }
+
+    @Test
+    void staleProofAfterTheInFlightProof_cannotOverwriteIt() throws Exception {
+        // B delivers before its startStream returns (its proof is recorded
+        // in flight — and the manager's CAS will never resend it), THEN A's
+        // late proof lands, still before the commit. A stale proof must not
+        // overwrite B's: B's restart is reported when the start completes.
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = FAST_UNBOUNDED;
+        callbacks.proveOnInstall = false;
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        Object generationA = callbacks.generation;
+
+        restarter.cancel(STREAM); // operator stop of A
+        callbacks.installed.set(false);
+        callbacks.startEntered = new java.util.concurrent.CountDownLatch(1);
+        callbacks.startGate = new java.util.concurrent.CountDownLatch(1);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("later death")); // new cycle
+        assertThat(callbacks.startEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        restarter.onGenerationProven(STREAM, callbacks.generation); // B delivers, in flight
+        restarter.onGenerationProven(STREAM, generationA); // A's stale proof, after it
+        callbacks.startGate.countDown();
+
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(metrics.restarts).containsExactly(STREAM + ":1:later death"));
+        assertThat(restarter.isAwaitingProof(STREAM))
+                .as("B's cycle is over — no state left awaiting a proof that will never be resent")
+                .isFalse();
+        assertThat(restarter.isRestartPending(STREAM)).isFalse();
+
+        // B's next death is a new incident: attempt 1.
+        callbacks.installed.set(false);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("next death"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        restarter.onGenerationProven(STREAM, callbacks.generation);
+        assertThat(metrics.restarts)
+                .containsExactly(STREAM + ":1:later death", STREAM + ":1:next death");
+    }
+
+    @Test
+    void staleProofBeforeTheInFlightProof_isNotKeptEither() throws Exception {
+        // Same two proofs, the other way round: A's stale proof first, then
+        // B's real one, both before the commit. The order must not matter —
+        // the stale one is never recorded, the real one always is.
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = FAST_UNBOUNDED;
+        callbacks.proveOnInstall = false;
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("first death"));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        Object generationA = callbacks.generation;
+
+        restarter.cancel(STREAM); // operator stop of A
+        callbacks.installed.set(false);
+        callbacks.startEntered = new java.util.concurrent.CountDownLatch(1);
+        callbacks.startGate = new java.util.concurrent.CountDownLatch(1);
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("later death")); // new cycle
+        assertThat(callbacks.startEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        restarter.onGenerationProven(STREAM, generationA); // A's stale proof first
+        restarter.onGenerationProven(STREAM, callbacks.generation); // then B delivers, in flight
+        callbacks.startGate.countDown();
+
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(metrics.restarts).containsExactly(STREAM + ":1:later death"));
+        assertThat(restarter.isAwaitingProof(STREAM)).isFalse();
+        assertThat(restarter.isRestartPending(STREAM)).isFalse();
+    }
+
+    @Test
+    void staleProofWhileNothingIsInstalledYet_isIgnored() throws Exception {
+        // The attempt is in flight but has not installed anything (the
+        // manager reports no generation): a proof carrying any identity is
+        // a stray and must not be recorded against this attempt.
+        RecordingCallbacks callbacks = new RecordingCallbacks();
+        callbacks.policy = FAST_UNBOUNDED;
+        callbacks.proveOnInstall = false;
+        callbacks.failStartsUntilAttempt = 2; // attempt 1 installs nothing and fails
+        callbacks.startEntered = new java.util.concurrent.CountDownLatch(1);
+        callbacks.startGate = new java.util.concurrent.CountDownLatch(1);
+        restarter(callbacks);
+
+        restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
+        assertThat(callbacks.startEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        assertThat(callbacks.installedGeneration(STREAM)).isNull();
+        restarter.onGenerationProven(STREAM, new Object()); // stray, nothing installed
+        callbacks.startGate.countDown();
+
+        // Attempt 1 fails; attempt 2 installs — and must be awaiting ITS
+        // proof, not already proven by the stray.
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(callbacks.startCalls.get()).isEqualTo(2));
+        await().atMost(Duration.ofSeconds(5)).until(() -> restarter.isAwaitingProof(STREAM));
+        assertThat(metrics.restarts).isEmpty();
+
+        restarter.onGenerationProven(STREAM, callbacks.generation);
+        assertThat(metrics.restarts).containsExactly(STREAM + ":2:cursor died");
+    }
+
     @Test
     void cancel_preventsTheScheduledAttempt() throws Exception {
         RecordingCallbacks callbacks = new RecordingCallbacks();
-        restarter = new StreamRestarter("fw-restart-test", callbacks);
+        restarter(callbacks);
 
         restarter.onRuntimeDeath(STREAM, new RuntimeException("cursor died"));
         assertThat(restarter.isRestartPending(STREAM)).isTrue();
@@ -382,7 +817,24 @@ class StreamRestarterTest {
         final AtomicBoolean installed = new AtomicBoolean(false);
         final List<String> terminalGiveUps = new CopyOnWriteArrayList<>();
         final List<String> policyLookups = new CopyOnWriteArrayList<>();
+        /** Nanotime of each {@code startStream} call, in order. */
+        final List<Long> startTimes = new CopyOnWriteArrayList<>();
         volatile RestartPolicyConfig policy = RestartPolicyConfig.DEFAULTS;
+        /**
+         * Whether an installing start proves its generation before returning
+         * (an event delivered on the reading thread during the start). Off,
+         * the test reports the proof itself — or never does.
+         */
+        volatile boolean proveOnInstall = true;
+        volatile StreamRestarter restarter;
+        /**
+         * Identity of the installed generation — what a manager's state
+         * object is to the restarter. A manager registers its state inside
+         * the start, before the subscription opens, so an installing start
+         * sets it on entry: an event delivered before the return already
+         * carries it, and {@link #installedGeneration} already returns it.
+         */
+        volatile Object generation;
         volatile RuntimeException startFailure;
         volatile int failStartsUntilAttempt;
         volatile java.util.concurrent.CountDownLatch startEntered;
@@ -396,7 +848,16 @@ class StreamRestarterTest {
 
         @Override
         public void startStream(String streamName) {
+            startTimes.add(System.nanoTime());
             int call = startCalls.incrementAndGet();
+            boolean willFail = startFailure != null || call < failStartsUntilAttempt;
+            if (!willFail) {
+                // Installed on entry, like a manager registering its state
+                // before the subscription opens: the generation exists — and
+                // can deliver — while the start is still in flight.
+                generation = new Object();
+                installed.set(true);
+            }
             if (startEntered != null) {
                 startEntered.countDown();
                 try {
@@ -411,12 +872,19 @@ class StreamRestarterTest {
             if (call < failStartsUntilAttempt) {
                 throw new RuntimeException("server still down");
             }
-            installed.set(true);
+            if (proveOnInstall && restarter != null) {
+                restarter.onGenerationProven(streamName, generation);
+            }
         }
 
         @Override
         public boolean isInstalled(String streamName) {
             return installed.get();
+        }
+
+        @Override
+        public Object installedGeneration(String streamName) {
+            return installed.get() ? generation : null;
         }
 
         @Override

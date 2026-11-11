@@ -118,14 +118,18 @@ class ReactiveInvalidateIntegrationTest {
                 assertThat(metrics.invalidations)
                         .contains(DROP_STREAM + ":DROP"));
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
-                assertThat(metrics.restarts)
-                        .anyMatch(s -> s.startsWith(DROP_STREAM + ":")));
-        await().atMost(Duration.ofSeconds(10))
+                assertThat(metrics.stops)
+                        .anyMatch(s -> s.startsWith(DROP_STREAM + ":CRASHED")));
+        await().atMost(Duration.ofSeconds(30))
                 .until(() -> streamManager.isRunning(DROP_STREAM));
 
         reactiveMongoTemplate.insert(new Document("seq", 2), DROP_COLLECTION).block();
         await().atMost(Duration.ofSeconds(10))
                 .untilAsserted(() -> assertThat(dropHandler.count()).isEqualTo(2));
+        // Reported on the resubscribed cursor's proof of life (its first event).
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertThat(metrics.restarts)
+                        .anyMatch(s -> s.startsWith(DROP_STREAM + ":")));
     }
 
     @Test
