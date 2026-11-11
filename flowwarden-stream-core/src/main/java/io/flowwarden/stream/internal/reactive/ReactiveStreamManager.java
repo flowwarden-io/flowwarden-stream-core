@@ -507,17 +507,13 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                         degradeOplogStart.add(streamName);
                     }
                 })
-                .onErrorResume(e -> {
-                    try {
-                        // Observational only — a throwing provider must not
-                        // replace the original cause nor break termination.
-                        FlowWardenMetrics.get().onEventError(streamName, e, true, 0, null);
-                    } catch (Exception metricsError) {
-                        log.warn("Metrics provider failed on event error for stream '{}': {}",
-                                streamName, metricsError.getMessage());
-                    }
-                    return Mono.empty();
-                })
+                // A cursor death is a stream-level failure: it is reported
+                // once, as onStreamStopped(CRASHED, cause) from doFinally —
+                // never as onEventError, whose contract is a handler failure
+                // with a 1-based attempt and non-null event metadata. The
+                // error is swallowed here so the pipeline completes and the
+                // lifecycle commit below runs.
+                .onErrorResume(e -> Mono.empty())
                 .doFinally(signal -> {
                     // Lock-free termination signal FIRST: a startStream
                     // holding the lifecycle lock through subscribe() must be

@@ -125,6 +125,13 @@ public interface StreamMetricsProvider {
 
     /**
      * Called when a handler throws an exception.
+     * <p>
+     * Always about one event: {@code attemptNumber} is 1-based and
+     * {@code metadata} is never {@code null}. Stream-level failures — a
+     * cursor death, a refused open, a collection invalidation — are not
+     * reported here; they reach the provider through
+     * {@link #onStreamStopped(String, StopReason, Throwable)} with
+     * {@link StopReason#CRASHED} (or {@link #onStreamInvalidated}).
      *
      * @param streamName    stream identifier
      * @param error         the exception thrown
