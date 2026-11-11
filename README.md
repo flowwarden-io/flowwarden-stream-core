@@ -31,7 +31,7 @@ The library automatically handles **checkpoint/resume**, **retry with exponentia
 - **Application-side filtering** — `@Filter` runs Java predicates on each event before dispatching to handlers
 - **Dual execution mode** — `IMPERATIVE` (`MongoTemplate`) or `REACTIVE` (`ReactiveMongoTemplate`)
 - **Multi-instance deployment** — `SINGLE_LEADER`, `ALL_INSTANCES` strategies
-- **No extra runtime stack** — uses Spring Data MongoDB (already in your classpath); in `REACTIVE` mode the default `LockService` also needs the synchronous Mongo driver (`spring-boot-starter-data-mongodb`) unless you provide your own `LockService` bean
+- **No extra runtime stack** — uses Spring Data MongoDB (already in your classpath): `spring-boot-starter-data-mongodb` for `IMPERATIVE` mode, `spring-boot-starter-data-mongodb-reactive` for `REACTIVE` mode, and only the one you use
 - **Spring Boot auto-configuration** — just add the dependency and annotate
 
 ## Quick Start

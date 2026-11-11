@@ -21,7 +21,7 @@ import io.flowwarden.stream.internal.dlq.MongoDlqProperties;
 import io.flowwarden.stream.internal.dlq.ReactiveMongoDlqStore;
 import io.flowwarden.stream.internal.MongoTemplateRegistry;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
-import io.flowwarden.stream.internal.lock.MongoLockService;
+import io.flowwarden.stream.internal.lock.ReactiveMongoLockService;
 import io.flowwarden.stream.internal.reactive.ReactiveStreamManager;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqStore;
@@ -33,14 +33,13 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.env.Environment;
-import org.springframework.data.mongodb.MongoDatabaseFactory;
-import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
 
 /**
  * Auto-configuration for FlowWarden in REACTIVE mode.
  *
- * <p>Activated when {@code flowwarden.default-mode=REACTIVE}.</p>
+ * <p>Activated when {@code flowwarden.default-mode=REACTIVE}. Every default bean is
+ * built on {@link ReactiveMongoTemplate}: the synchronous Mongo driver is not required.</p>
  */
 @AutoConfiguration(after = FlowWardenAutoConfiguration.class)
 @ConditionalOnProperty(name = "flowwarden.default-mode", havingValue = "REACTIVE")
@@ -62,10 +61,10 @@ public class ReactiveFlowWardenAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public LockService lockService(MongoDatabaseFactory factory) {
-        // The default Mongo-backed lock service uses a blocking MongoTemplate
-        // (constructed from the shared factory) to keep lock operations atomic.
-        return new MongoLockService(new MongoTemplate(factory));
+    public LockService lockService(ReactiveMongoTemplate reactiveMongoTemplate) {
+        // Built on the reactive driver like the checkpoint and DLQ stores, so a pure
+        // WebFlux application needs no synchronous Mongo driver on its classpath.
+        return new ReactiveMongoLockService(reactiveMongoTemplate);
     }
 
     @Bean
