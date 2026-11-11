@@ -36,8 +36,46 @@ import java.util.Optional;
  * publish-only backend (message queue, log sink — anywhere consumed means
  * gone) can implement {@code save} honestly without faking reads it cannot
  * serve. Stateful backends that can replay override them.</p>
+ *
+ * <p>A third, optional, <strong>startup</strong> hook —
+ * {@link #onStreamRegistered(DlqStreamRegistration)} — tells the store which
+ * streams will write to it before any of them starts, so a backend can
+ * provision per-stream resources (a collection and its TTL index, a queue,
+ * a topic) once instead of lazily on the first {@code save}. The default
+ * does nothing.</p>
  */
 public interface DlqStore {
+
+    /**
+     * Startup hook: called once per DLQ-enabled stream (a stream carrying
+     * {@code @DeadLetterQueue}, or a contributed one with a
+     * {@code DeadLetterQueueSpec}) when the application is ready, before
+     * that stream starts and therefore before any of its events can reach
+     * {@link #save}. Streams without a dead letter queue are not announced.
+     *
+     * <p>The default is a no-op: a backend that resolves everything from
+     * {@code event.streamName()} inside {@code save} needs nothing here.
+     * The core's MongoDB stores use it to bind the stream to its
+     * {@code @MongoDlqOptions} collection and create the TTL / status
+     * indexes there — which is why a store that <em>wraps</em> another one
+     * (a composite routing to several backends, a decorator adding
+     * metrics) <strong>must forward this call to every delegate</strong>;
+     * otherwise the wrapped Mongo store writes every stream to the default
+     * collection and enforces no retention.</p>
+     *
+     * <p>Implementations should be idempotent — the runtime calls the hook
+     * once per stream per application start, but a restart of the same
+     * JVM context, or a composite forwarding to a delegate that is also a
+     * bean on its own, may announce the same stream twice. An exception
+     * thrown here is logged at WARN and does not prevent the stream from
+     * starting: a DLQ that cannot be provisioned must not take the
+     * consumer down with it.</p>
+     *
+     * @param registration the stream, its policy and the backend hints the
+     *                     runtime resolved for it; never {@code null}
+     */
+    default void onStreamRegistered(DlqStreamRegistration registration) {
+    }
 
     /**
      * Persists a failed event into the DLQ.

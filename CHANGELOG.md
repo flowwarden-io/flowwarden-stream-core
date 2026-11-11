@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `DlqStore.onStreamRegistered(DlqStreamRegistration)`: a `default` (no-op) startup hook on the SPI, called by both stream managers on the `DlqStore` bean once per DLQ-enabled stream when the application is ready, before that stream starts. The new `DlqStreamRegistration` record carries the stream name, its `DlqPolicy` and the MongoDB collection hint from `@MongoDlqOptions` / `MongoDlqOptionsSpec` (empty when the backend default applies). `MongoDlqStore` and `ReactiveMongoDlqStore` implement it with what `registerStream` did — bind the collection, create the TTL and `streamName + status` indexes — so a user-provided store that *wraps* the Mongo store (the hybrid Mongo + AMQP composite, a metrics decorator) now gets per-stream collections and `retentionDays` enforced by forwarding the hook to its delegates, with no manual `registerStream` call. The hook is idempotent by contract, a backend that ignores the Mongo hint keeps the default, and an implementation that throws is logged at WARN without preventing the stream from starting. Covered by a new always-on test in the testkit's `DlqStoreContractTest`. (#134)
+
+### Changed
+- The managers no longer bind DLQ collections through an `instanceof MongoDlqStore` / `ReactiveMongoDlqStore` check: the SPI hook subsumes it and is the only path. `registerStream(streamName, collection)` on both Mongo stores stays public for code that binds a stream by hand, but is no longer something the runtime calls. (#134)
+
 - `@EnableFlowWarden(enabled = false)` now does what it says: every stream is discovered and validated as usual but none starts on `ApplicationReadyEvent` — a maintenance switch for an application that must come up without consuming. Streams can still be started one by one through `FlowWardenStreamManager.startStream(name)` or the actuator endpoint. The attribute existed since 1.0.0-rc.1 but was never read. (#128)
 
 ### Removed
