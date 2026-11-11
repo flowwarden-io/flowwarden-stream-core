@@ -45,7 +45,32 @@ import java.util.concurrent.TimeUnit;
  * ({@code @RestartPolicy}, or {@link RestartPolicyConfig#DEFAULTS} without
  * it). By default transient failures are retried indefinitely — a database
  * down for two hours must not leave every stream dead once it comes back.
- * The backoff attempt counter resets on the first successful resubscription.
+ * The backoff attempt counter resets once a resubscribed generation
+ * <em>proves alive</em> — never on the synchronous return of
+ * {@link Callbacks#startStream}: the cursor opens asynchronously (on
+ * Spring's reading thread, or in the reactive driver's callbacks), so a
+ * refused open reaches the manager's death path after that return. Resetting
+ * there would retry a persistently refused open at {@code initialDelay}
+ * forever, never ramp up, never exhaust a bounded {@code maxAttempts}, and
+ * report a successful restart per turn. The state therefore survives the
+ * return as <em>installed, unproven</em>: a death for such a generation
+ * continues the attempt count, and the manager's
+ * {@link #onGenerationProven proof of life} (first delivered event, or the
+ * imperative reading task's completed start) ends the cycle — that is also
+ * when {@code onStreamRestarted} is emitted. The proof is bound to the
+ * generation it is about: the manager passes the identity of its installed
+ * state, compared under the monitor with the one recorded when the attempt
+ * committed, so a late proof of a stopped or replaced generation can never
+ * end the cycle of the one that succeeded it. A reactive stream proves
+ * itself on its first event only, so an idle generation would otherwise keep
+ * the cycle open indefinitely; as a <em>heuristic</em>, in both modes, an
+ * installed generation that outlives the policy's {@code maxDelay} without
+ * a death notification is <em>assumed</em> alive and ends the cycle the
+ * same way. This is an assumption, not a guarantee: {@code maxDelay} is
+ * configured independently of the driver's timeouts, so an open that fails
+ * later than {@code maxDelay} is counted as a fresh death at attempt 1 — the
+ * price for a bounded policy that must not give up on a merely idle stream
+ * after N transient deaths spread over days.
  * A {@link HistoryLostException} escaping the restart (the resume cascade
  * escalated to {@code OnHistoryLost.FAIL}) is terminal: the loop stops for
  * that stream, the crash is surfaced, and the manager's terminal callback
@@ -104,9 +129,22 @@ public final class StreamRestarter {
          * Whether the stream's state is currently installed in the manager
          * (i.e. the last {@code startStream} took — a reactive subscription
          * that terminated synchronously does not count and reports its own
-         * death through {@code onRuntimeDeath} again).
+         * death through {@code onRuntimeDeath} again). Installed is not
+         * alive: the manager reports the latter through
+         * {@link StreamRestarter#onGenerationProven}.
          */
         boolean isInstalled(String streamName);
+
+        /**
+         * The identity of the stream's currently installed generation — the
+         * manager's own per-generation state object, the same one it later
+         * passes to {@link StreamRestarter#onGenerationProven} — or
+         * {@code null} when nothing is installed. Read under the restarter's
+         * monitor when an attempt commits, so a proof of life can be matched
+         * to the generation the attempt actually installed (identity
+         * comparison, never {@code equals}).
+         */
+        Object installedGeneration(String streamName);
 
         /**
          * Terminal give-up hook: the restart loop stops for this stream.
@@ -122,7 +160,35 @@ public final class StreamRestarter {
         final RestartPolicyConfig policy;
         int attempt;
         Throwable cause;
+        /**
+         * The only valid pending step: the next attempt (or the give-up)
+         * while the stream is down, the age-based proof timer once
+         * {@link #installed}.
+         */
         ScheduledFuture<?> future;
+        /**
+         * The current attempt's {@code startStream} returned and installed a
+         * generation whose proof of life is awaited. A death notification
+         * continues this state's attempt count instead of starting over.
+         */
+        boolean installed;
+        /**
+         * Identity of the generation the current attempt installed
+         * ({@link Callbacks#installedGeneration}), recorded at commit. A
+         * proof of life is honoured only for this identity — a late proof of
+         * a stopped or replaced generation must never end this cycle.
+         */
+        Object installedId;
+        /**
+         * Identity carried by a proof of life that arrived while the
+         * attempt's {@code startStream} was still in flight (an event
+         * delivered before the start method returned). Recorded only when
+         * it is the identity the manager has installed at that moment
+         * ({@link Callbacks#installedGeneration}, read under the monitor),
+         * so a stale proof can never overwrite a real one; honoured at
+         * commit only if it is still the identity the attempt installed.
+         */
+        Object provenInFlightId;
 
         RestartState(long generation, RestartPolicyConfig policy) {
             this.generation = generation;
@@ -186,6 +252,11 @@ public final class StreamRestarter {
             if (cause != null) {
                 state.cause = cause;
             }
+            // An installed-but-unproven generation died: its attempt was
+            // not a resubscription, the count goes on.
+            state.installed = false;
+            state.installedId = null;
+            state.provenInFlightId = null;
             state.attempt++;
             attempt = state.attempt;
             maxAttempts = state.policy.maxAttempts();
@@ -216,9 +287,84 @@ public final class StreamRestarter {
         }
     }
 
-    /** Whether a restart is scheduled or in flight for the stream (test/diagnostic hook). */
+    /**
+     * Proof that the generation installed by the last restart attempt is
+     * alive — reported by the manager on the first delivered event or, in
+     * imperative mode, on the reading task's completed start, with the
+     * identity of the generation it is about (the manager's own state
+     * object, as returned by {@link Callbacks#installedGeneration}). Ends
+     * the restart cycle when that identity is the one the attempt
+     * installed: the state is cleared (the next death starts at attempt 1)
+     * and {@code onStreamRestarted} is emitted with the attempt that
+     * succeeded. Any other proof is a late signal of a stopped or replaced
+     * generation and changes nothing — the manager's own fence
+     * (terminated flag, current-state check) runs outside any lock and can
+     * be overtaken by a stop, a death and a new attempt; the identity
+     * comparison under the monitor is what makes the proof safe. A proof
+     * for a stream outside a restart cycle (boot start, manual start) is a
+     * no-op; one arriving while the attempt's {@code startStream} is still
+     * in flight is kept until the attempt commits — but only if its identity
+     * is the generation the manager has installed at that moment, checked
+     * under the monitor: a stale proof is rejected on arrival, so it cannot
+     * overwrite a real in-flight proof whatever the order the two land in
+     * (the manager sends each generation's proof once). The commit then
+     * re-checks the kept identity against what the attempt installed.
+     */
+    public void onGenerationProven(String streamName, Object generationId) {
+        int attempt;
+        Throwable cause;
+        synchronized (this) {
+            RestartState state = states.get(streamName);
+            if (state == null || generationId == null) {
+                return; // not in a restart cycle
+            }
+            if (!state.installed) {
+                if (state.future == null
+                        && generationId == callbacks.installedGeneration(streamName)) {
+                    // Attempt in flight, and the proof is about the generation
+                    // the manager currently has installed — the one this
+                    // startStream registered, which delivered before
+                    // returning. Validated HERE, not only at commit: a stale
+                    // proof (its generation stopped or replaced, so never the
+                    // installed one) must not overwrite a real one recorded
+                    // earlier, whatever the arrival order — the manager sends
+                    // each generation's proof once and never resends it.
+                    state.provenInFlightId = generationId;
+                }
+                return; // else pending, or a stray proof of another generation
+            }
+            if (state.installedId != generationId) {
+                return; // a late proof of a stopped or replaced generation
+            }
+            if (state.future != null) {
+                state.future.cancel(false); // the age-based proof timer
+            }
+            states.remove(streamName);
+            attempt = state.attempt;
+            cause = state.cause;
+        }
+        emitRestarted(streamName, attempt, cause);
+    }
+
+    /**
+     * Whether a restart is scheduled or in flight for the stream — the
+     * stream is down and the loop owns its next step (test/diagnostic
+     * hook). {@code false} once the attempt installed a generation, even
+     * while its proof of life is still awaited; see {@link #isAwaitingProof}.
+     */
     public synchronized boolean isRestartPending(String streamName) {
-        return states.containsKey(streamName);
+        RestartState state = states.get(streamName);
+        return state != null && !state.installed;
+    }
+
+    /**
+     * Whether the last attempt installed a generation whose proof of life is
+     * still awaited — the restart cycle is open, a death would continue its
+     * attempt count (test/diagnostic hook).
+     */
+    public synchronized boolean isAwaitingProof(String streamName) {
+        RestartState state = states.get(streamName);
+        return state != null && state.installed;
     }
 
     public void shutdown() {
@@ -325,6 +471,7 @@ public final class StreamRestarter {
                 if (state == null || state.generation != generation) {
                     return; // cancelled mid-flight
                 }
+                state.provenInFlightId = null; // whatever delivered, the start failed
                 state.attempt++;
                 long delay = scheduleNextLocked(streamName, state);
                 if (delay < 0) {
@@ -339,6 +486,7 @@ public final class StreamRestarter {
         }
 
         Outcome outcome;
+        boolean proven = false;
         synchronized (this) {
             RestartState state = states.get(streamName);
             if (state == null || state.generation != generation) {
@@ -356,7 +504,26 @@ public final class StreamRestarter {
                 // the lifecycle: the newer future owns the next step.
                 outcome = Outcome.REARMED;
             } else {
-                states.remove(streamName);
+                // The identity of what this attempt installed, read under the
+                // monitor: every later proof of life is matched against it.
+                Object installedId = callbacks.installedGeneration(streamName);
+                if (installedId != null && state.provenInFlightId == installedId) {
+                    // This very generation delivered before startStream
+                    // returned: the cycle ends here.
+                    states.remove(streamName);
+                    proven = true;
+                } else {
+                    // The return proves nothing about the cursor, which opens
+                    // asynchronously: keep the state, installed and unproven,
+                    // until the manager reports this generation's proof of
+                    // life — or the generation outlives the policy's
+                    // maxDelay. A proof carried in flight for another
+                    // identity was a stray and is dropped.
+                    state.installed = true;
+                    state.installedId = installedId;
+                    state.provenInFlightId = null;
+                    scheduleAgeProofLocked(streamName, state);
+                }
                 outcome = Outcome.CURRENT;
             }
         }
@@ -366,9 +533,78 @@ public final class StreamRestarter {
         if (!callbacks.isInstalled(streamName)) {
             // Defensive: returned without installing and without a death
             // notification — nothing left to own.
+            clearIfInstalled(streamName, generation);
             return;
         }
-        log.info("Stream '{}' resubscribed after runtime death (attempt {})",
+        if (proven) {
+            emitRestarted(streamName, attempt, cause);
+            return;
+        }
+        log.info("Stream '{}' resubscribed after runtime death (attempt {}) — "
+                + "awaiting the cursor's proof of life", streamName, attempt);
+    }
+
+    /**
+     * Arms the age-based proof — a <em>heuristic</em>, armed in both modes:
+     * an installed generation that outlives the policy's {@code maxDelay}
+     * without a death notification is <em>assumed</em> alive and ends the
+     * cycle as a proof of life would. A reactive stream only proves itself
+     * through its first event, so without this an idle reactive generation
+     * would keep the cycle open indefinitely and a death hours later would
+     * count as attempt N+1 — and, under a bounded policy, eventually give
+     * up on a stream that was merely idle. Nothing guarantees that an open
+     * fails within {@code maxDelay}: it is configured independently of the
+     * driver's timeouts (server selection, a {@code socketTimeoutMS} of 0).
+     * An open that fails later is simply counted as a fresh death at
+     * attempt 1 — the loop still backs off, it only forgets the previous
+     * attempts. Caller holds the monitor.
+     */
+    private void scheduleAgeProofLocked(String streamName, RestartState state) {
+        long generation = state.generation;
+        try {
+            state.future = scheduler.schedule(
+                    () -> proveByAge(streamName, generation),
+                    state.policy.maxDelay().toMillis(), TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            // Scheduler shut down — the application is going away.
+            states.remove(streamName);
+        }
+    }
+
+    private void proveByAge(String streamName, long generation) {
+        int attempt;
+        Throwable cause;
+        synchronized (this) {
+            RestartState state = states.get(streamName);
+            if (state == null || state.generation != generation || !state.installed) {
+                return; // died, cancelled, or proven in the meantime
+            }
+            states.remove(streamName);
+            attempt = state.attempt;
+            cause = state.cause;
+        }
+        log.info("Stream '{}' outlived the restart policy's maxDelay without dying — "
+                + "assumed alive, counted as resubscribed (attempt {})", streamName, attempt);
+        emitRestarted(streamName, attempt, cause);
+    }
+
+    /**
+     * Removes the installed-unproven state of this generation; a state a
+     * death notification already re-armed (pending attempt) is left alone.
+     */
+    private synchronized void clearIfInstalled(String streamName, long generation) {
+        RestartState state = states.get(streamName);
+        if (state == null || state.generation != generation || !state.installed) {
+            return;
+        }
+        if (state.future != null) {
+            state.future.cancel(false);
+        }
+        states.remove(streamName);
+    }
+
+    private void emitRestarted(String streamName, int attempt, Throwable cause) {
+        log.info("Stream '{}' resubscribed after runtime death (attempt {}) — cursor alive",
                 streamName, attempt);
         try {
             FlowWardenMetrics.get().onStreamRestarted(streamName, attempt, cause);

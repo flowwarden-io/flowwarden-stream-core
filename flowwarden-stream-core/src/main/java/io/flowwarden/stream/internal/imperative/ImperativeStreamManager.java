@@ -35,7 +35,6 @@ import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.internal.DefaultChangeStreamContext;
 import io.flowwarden.stream.internal.MongoTemplateRegistry;
 import io.flowwarden.stream.internal.discovery.ChangeStreamDefinition;
-import io.flowwarden.stream.internal.dlq.MongoDlqStore;
 import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
 import io.flowwarden.stream.internal.discovery.StreamRegistry;
 import io.flowwarden.stream.internal.discovery.HandlerMethod;
@@ -60,6 +59,7 @@ import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
+import io.flowwarden.stream.spi.DlqStreamRegistration;
 import io.flowwarden.stream.spi.FailedEvent;
 import jakarta.annotation.PreDestroy;
 import org.bson.BsonDocument;
@@ -244,6 +244,11 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                 @Override
                 public boolean isInstalled(String streamName) {
                     return streams.containsKey(streamName);
+                }
+
+                @Override
+                public Object installedGeneration(String streamName) {
+                    return streams.get(streamName); // the StreamState IS the generation's identity
                 }
 
                 @Override
@@ -639,17 +644,36 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
      * Proof that this generation's OWN cursor opened on the server: its
      * first delivered event, or the reading task completing its start
      * ({@link #watchCursorOpen}). Only such a generation closes the
-     * restart cycle — at its death, which reads the flag after claiming the
-     * termination. The synchronous return of {@code startStream} proves
-     * nothing: Spring opens the cursor on the reading thread, and a refused
-     * open reaches the error handler after the subscription was installed —
-     * resetting there would log every refusal of a loop as a first death.
-     * A heartbeat probe proves nothing either: it opens its own cursor, and
-     * its success says nothing about the main one, which the server may
-     * keep refusing for a reason specific to the main request.
+     * log-throttling cycle — at its death, which reads the flag after
+     * claiming the termination — and only such a generation ends the
+     * restart loop's cycle: the proof is handed to the restarter, which
+     * resets its attempt counter and emits {@code onStreamRestarted}. The
+     * synchronous return of {@code startStream} proves nothing: Spring
+     * opens the cursor on the reading thread, and a refused open reaches
+     * the error handler after the subscription was installed — resetting
+     * there would log every refusal of a loop as a first death and retry
+     * it at {@code initialDelay} forever. A heartbeat probe proves nothing
+     * either: it opens its own cursor, and its success says nothing about
+     * the main one, which the server may keep refusing for a reason
+     * specific to the main request.
+     *
+     * <p>Fenced by generation: a late signal from a terminated generation,
+     * or from one a newer registration already replaced, must never end
+     * the cycle of the generation that succeeded it. The lock-free check
+     * here is a cheap early exit only — it can be overtaken by a stop, a
+     * death and a new attempt between the read and the call. The binding
+     * guarantee is the state object passed as the generation's identity,
+     * which the restarter compares under its monitor with the identity it
+     * recorded when the attempt committed.</p>
      */
     private void noteGenerationProven(StreamState state) {
-        state.proven().set(true);
+        if (!state.proven().compareAndSet(false, true)) {
+            return;
+        }
+        String streamName = state.definition().streamName();
+        if (!state.terminated().get() && streams.get(streamName) == state) {
+            restarter.onGenerationProven(streamName, state);
+        }
     }
 
     private static final long OPEN_WATCH_INITIAL_MILLIS = 100;
@@ -928,6 +952,11 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
 
     boolean isRestartPending(String streamName) {
         return restarter.isRestartPending(streamName);
+    }
+
+    /** Whether the restart loop installed a generation whose proof of life is still awaited. */
+    boolean isAwaitingProof(String streamName) {
+        return restarter.isAwaitingProof(streamName);
     }
 
     /** Whether the installed generation's own cursor is known to have opened. */
@@ -1550,17 +1579,31 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         }
     }
 
+    /**
+     * Announces every DLQ-enabled stream to the {@code DlqStore} bean through
+     * the SPI startup hook, whatever its concrete type — a composite or a
+     * decorator forwards it to the Mongo store it wraps, which binds the
+     * stream to its {@code @MongoDlqOptions} collection and creates the TTL
+     * index there. A hook that throws is logged and skipped: the stream
+     * still starts.
+     */
     private void registerDlqCollections() {
-        if (!(dlqWriter instanceof MongoDlqStore mongoStore)) {
-            return;
-        }
         for (ChangeStreamDefinition def : registry.getDefinitions()) {
-            if (def.deadLetterQueueAnnotation() == null) {
+            DeadLetterQueue dlqAnn = def.deadLetterQueueAnnotation();
+            if (dlqAnn == null) {
                 continue;
             }
             MongoDlqOptions opts = def.mongoDlqOptionsAnnotation();
             String collection = opts != null ? opts.collection() : "";
-            mongoStore.registerStream(def.streamName(), collection);
+            DlqStreamRegistration registration = new DlqStreamRegistration(
+                    def.streamName(), DlqPolicy.fromAnnotation(dlqAnn), collection);
+            try {
+                dlqWriter.onStreamRegistered(registration);
+            } catch (Exception e) {
+                log.warn("DlqStore {} failed to register stream '{}' (collection hint '{}'): {}",
+                        dlqWriter.getClass().getName(), def.streamName(), collection,
+                        e.getMessage(), e);
+            }
         }
     }
 

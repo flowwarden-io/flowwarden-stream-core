@@ -15,6 +15,7 @@
  */
 package io.flowwarden.stream.internal.lock;
 
+import com.mongodb.MongoWriteException;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
@@ -28,22 +29,25 @@ import org.springframework.data.mongodb.core.MongoTemplate;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Date;
-import java.util.List;
 import java.util.Optional;
 
 /**
- * MongoDB-backed {@link LockService}, used by default for
- * {@code DeploymentMode.SINGLE_LEADER}.
+ * MongoDB-backed {@link LockService} on the synchronous driver, used by default for
+ * {@code DeploymentMode.SINGLE_LEADER} in IMPERATIVE mode.
  *
  * <p>Uses an atomic {@code findOneAndUpdate} on the {@code _fw_locks} collection so only
  * one instance holds a lock for a given stream at any time. The collection name is internal
  * to this implementation — the SPI does not expose it.</p>
+ *
+ * <p>Shares its document layout and lease protocol ({@link MongoLockDocuments}) with
+ * {@link ReactiveMongoLockService}: instances of both implementations can contend for the
+ * same lease on the same collection.</p>
  */
 public class MongoLockService implements LockService {
 
     private static final Logger log = LoggerFactory.getLogger(MongoLockService.class);
 
-    static final String COLLECTION = "_fw_locks";
+    static final String COLLECTION = MongoLockDocuments.COLLECTION;
 
     private final MongoTemplate mongoTemplate;
 
@@ -58,22 +62,14 @@ public class MongoLockService implements LockService {
             Date now = new Date();
             Date expiresAt = Date.from(Instant.now().plus(ttl));
 
-            Document filter = new Document("_id", streamName)
-                    .append("$or", List.of(
-                            new Document("instanceId", instanceId),          // I already own it
-                            new Document("expiresAt", new Document("$lt", now))  // Lock expired
-                    ));
-
-            Document update = new Document("$set", new Document()
-                    .append("instanceId", instanceId)
-                    .append("acquiredAt", now)
-                    .append("expiresAt", expiresAt));
-
             FindOneAndUpdateOptions options = new FindOneAndUpdateOptions()
                     .upsert(false)
                     .returnDocument(ReturnDocument.AFTER);
 
-            Document result = collection.findOneAndUpdate(filter, update, options);
+            Document result = collection.findOneAndUpdate(
+                    MongoLockDocuments.acquirableFilter(streamName, instanceId, now),
+                    MongoLockDocuments.acquireUpdate(instanceId, now, expiresAt),
+                    options);
 
             if (result != null) {
                 log.info("Acquired lock for stream '{}' (instanceId={})", streamName, instanceId);
@@ -82,14 +78,11 @@ public class MongoLockService implements LockService {
 
             // Lock doesn't exist yet — try to insert it
             try {
-                collection.insertOne(new Document("_id", streamName)
-                        .append("instanceId", instanceId)
-                        .append("acquiredAt", now)
-                        .append("expiresAt", expiresAt));
+                collection.insertOne(MongoLockDocuments.newLease(streamName, instanceId, now, expiresAt));
                 log.info("Created and acquired lock for stream '{}' (instanceId={})", streamName, instanceId);
                 return true;
-            } catch (com.mongodb.MongoWriteException e) {
-                if (e.getCode() == 11000) {
+            } catch (MongoWriteException e) {
+                if (e.getCode() == MongoLockDocuments.DUPLICATE_KEY) {
                     // Duplicate key — another instance just created it
                     log.debug("Lock for stream '{}' already held by another instance", streamName);
                     return false;
@@ -106,15 +99,12 @@ public class MongoLockService implements LockService {
     public boolean renew(String streamName, String instanceId, Duration ttl) {
         try {
             MongoCollection<Document> collection = getCollection();
+            Date now = new Date();
             Date expiresAt = Date.from(Instant.now().plus(ttl));
 
-            Document filter = new Document("_id", streamName)
-                    .append("instanceId", instanceId);
-
-            Document update = new Document("$set", new Document()
-                    .append("expiresAt", expiresAt));
-
-            Document result = collection.findOneAndUpdate(filter, update);
+            Document result = collection.findOneAndUpdate(
+                    MongoLockDocuments.renewableFilter(streamName, instanceId, now),
+                    MongoLockDocuments.renewUpdate(expiresAt));
             return result != null;
         } catch (Exception e) {
             log.warn("Failed to renew lock for stream '{}': {}", streamName, e.getMessage());
@@ -126,9 +116,9 @@ public class MongoLockService implements LockService {
     public void release(String streamName, String instanceId) {
         try {
             MongoCollection<Document> collection = getCollection();
-            Document filter = new Document("_id", streamName)
-                    .append("instanceId", instanceId);
-            long deleted = collection.deleteOne(filter).getDeletedCount();
+            long deleted = collection
+                    .deleteOne(MongoLockDocuments.ownedFilter(streamName, instanceId))
+                    .getDeletedCount();
             if (deleted > 0) {
                 log.info("Released lock for stream '{}' (instanceId={})", streamName, instanceId);
             }
@@ -141,23 +131,10 @@ public class MongoLockService implements LockService {
     public Optional<LockState> getLockState(String streamName) {
         try {
             MongoCollection<Document> collection = getCollection();
-            Document doc = collection.find(new Document("_id", streamName)
-                            .append("expiresAt", new Document("$gt", new Date())))
+            Document doc = collection
+                    .find(MongoLockDocuments.activeFilter(streamName, new Date()))
                     .first();
-            if (doc == null) {
-                return Optional.empty();
-            }
-            String instanceId = doc.getString("instanceId");
-            Date acquiredAt = doc.getDate("acquiredAt");
-            Date expiresAt = doc.getDate("expiresAt");
-            if (instanceId == null || acquiredAt == null || expiresAt == null) {
-                return Optional.empty();
-            }
-            return Optional.of(new LockState(
-                    streamName,
-                    instanceId,
-                    acquiredAt.toInstant(),
-                    expiresAt.toInstant()));
+            return MongoLockDocuments.toLockState(streamName, doc);
         } catch (Exception e) {
             return Optional.empty();
         }

@@ -120,6 +120,9 @@ class ReactiveStuckStreamTest {
         // …and the restart loop resubscribes: a second change stream.
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
                 assertThat(sinks).hasSizeGreaterThanOrEqualTo(2));
+        // The restart is reported on the new cursor's proof of life — its
+        // first delivered event — not on the return of the start.
+        sinks.get(1).tryEmitNext(insertEvent());
         await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                 assertThat(metrics.restarts).contains(STREAM + ":1"));
 
