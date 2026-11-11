@@ -23,6 +23,7 @@ import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
 import io.flowwarden.stream.DeploymentMode;
 import io.flowwarden.stream.ErrorAction;
 import io.flowwarden.stream.FlowWardenMetrics;
+import io.flowwarden.stream.HistoryLostException;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.FullDocumentMode;
 import io.flowwarden.stream.OnHistoryLost;
@@ -54,6 +55,7 @@ import io.flowwarden.stream.internal.checkpoint.CheckpointHeartbeat;
 import io.flowwarden.stream.internal.checkpoint.ProcessedAnchorPolicy;
 import io.flowwarden.stream.internal.checkpoint.ResumeCascade;
 import io.flowwarden.stream.internal.checkpoint.ResumeContext;
+import io.flowwarden.stream.internal.discovery.ReconcileMethod;
 import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqPolicy;
@@ -273,6 +275,13 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
     @EventListener(ApplicationReadyEvent.class)
     public void onApplicationReady() {
         registerDlqCollections();
+        if (!registry.isAutoStartEnabled()) {
+            log.info("FlowWarden auto-start is disabled (@EnableFlowWarden(enabled = false)): "
+                    + "{} registered stream(s) stay stopped until started explicitly",
+                    registry.getDefinitions().size());
+            scheduleStatsRefresh();
+            return;
+        }
         for (ChangeStreamDefinition def : registry.getDefinitions()) {
             if (!def.config().autoStart() || !def.config().enabled()) {
                 continue;
@@ -283,10 +292,56 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                         () -> startStream(name),
                         () -> stopStream(name));
             } else {
-                startStream(def.streamName());
+                startAtBoot(def.streamName());
             }
         }
         scheduleStatsRefresh();
+    }
+
+    /**
+     * Boot start of an {@code ALL_INSTANCES} stream, under the same contract
+     * as the leader callback of a {@code SINGLE_LEADER} stream: a failure is
+     * this stream's problem, never the application's. A terminal failure
+     * (the resume cascade escalated to {@code OnHistoryLost.FAIL}, or a
+     * {@code @Reconcile} hook failed) is reported as {@code CRASHED} and left
+     * to an operator; any other failure (backend unreachable, probe timeout)
+     * is handed to the restart loop exactly like a runtime death. Either way
+     * the next stream starts and the application comes up, with this stream
+     * reported DOWN by the health indicator. Letting the exception escape
+     * the {@code ApplicationReadyEvent} listener would instead fail the whole
+     * startup and leave every following stream unstarted and unreported.
+     */
+    private void startAtBoot(String streamName) {
+        try {
+            startStream(streamName);
+        } catch (HistoryLostException e) {
+            log.error("Stream '{}' failed to start at boot terminally — not retried, "
+                    + "operator action required: {}", streamName, e.getMessage(), e);
+            emitBootCrash(streamName, e);
+        } catch (RuntimeException e) {
+            log.warn("Stream '{}' failed to start at boot — handing it to the restart loop: {}",
+                    streamName, e.getMessage(), e);
+            emitBootCrash(streamName, e);
+            restarter.onRuntimeDeath(streamName, e);
+        }
+    }
+
+    private void emitBootCrash(String streamName, Throwable cause) {
+        try {
+            FlowWardenMetrics.get().onStreamStopped(streamName, StopReason.CRASHED, cause);
+        } catch (Exception metricsError) {
+            log.warn("Metrics provider failed on crash signal for stream '{}': {}",
+                    streamName, metricsError.getMessage());
+        }
+    }
+
+    /**
+     * The stream's {@code @Reconcile} hook bound to its bean, for the resume
+     * cascade — {@code null} when the stream declares none.
+     */
+    private static ResumeCascade.ReconcileHook reconcileHookFor(ChangeStreamDefinition def) {
+        ReconcileMethod hook = def.reconcileMethod();
+        return hook == null ? null : ctx -> hook.invoke(def.bean(), ctx);
     }
 
     /**
@@ -385,7 +440,8 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                     checkpointStore, probe,
                     token -> isTokenValid(def.collection(), token, streamTemplate, streamName),
                     () -> getOldestOplogTimestamp(streamTemplate),
-                    !degradeOplogStart.contains(streamName));
+                    !degradeOplogStart.contains(streamName),
+                    reconcileHookFor(def));
             if (resumeContext.seedToken() != null) {
                 optionsBuilder.resumeAfter(resumeContext.seedToken());
             } else if (resumeContext.initialOperationTime() != null) {

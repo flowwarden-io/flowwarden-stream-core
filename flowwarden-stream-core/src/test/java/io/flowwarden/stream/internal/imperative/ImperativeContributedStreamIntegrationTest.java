@@ -16,6 +16,13 @@
 package io.flowwarden.stream.internal.imperative;
 
 import io.flowwarden.stream.ChangeStreamContext;
+import java.util.Collections;
+import java.time.Instant;
+import org.bson.BsonDocument;
+import io.flowwarden.stream.spi.CheckpointStore;
+import io.flowwarden.stream.registration.CheckpointSpec;
+import io.flowwarden.stream.OnHistoryLost;
+import io.flowwarden.stream.HistoryLostContext;
 import io.flowwarden.stream.ErrorAction;
 import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.EnableFlowWarden;
@@ -69,6 +76,36 @@ class ImperativeContributedStreamIntegrationTest {
 
     @Autowired
     ImperativeStreamManager streamManager;
+
+    @Autowired
+    CheckpointStore checkpointStore;
+
+    @Test
+    void contributedReconcileHook_runsBeforeTheStreamResumesAfterAHistoryLoss() {
+        String stream = "contributed-reconcile-watcher";
+        checkpointStore.delete(stream);
+        Instant past = Instant.now().minusSeconds(86_400);
+        BsonDocument dead = BsonDocument.parse("{\"_data\": \"DEADBEEF\"}");
+        checkpointStore.save(new io.flowwarden.stream.spi.Checkpoint(
+                stream, null, dead, past, dead, past, Collections.emptyMap()));
+        try {
+            streamManager.startStream(stream);
+
+            await().atMost(Duration.ofSeconds(5)).until(() -> streamManager.isRunning(stream));
+            assertThat(testHandler.reconciliations).hasSize(1);
+            HistoryLostContext ctx = testHandler.reconciliations.get(0);
+            assertThat(ctx.streamName()).isEqualTo(stream);
+            assertThat(ctx.strategy()).isEqualTo(OnHistoryLost.RESUME_FROM_NOW);
+            assertThat(ctx.lostWindowStart()).isPresent();
+
+            mongoTemplate.insert(new Document("amount", 7), "contributed_reconcile_orders");
+            await().atMost(Duration.ofSeconds(10))
+                    .untilAsserted(() -> assertThat(testHandler.reconciledStreamEvents).hasSize(1));
+        } finally {
+            try { streamManager.stopStream(stream); } catch (Exception ignored) {}
+            checkpointStore.delete(stream);
+        }
+    }
 
     @Test
     void contributedStreamAutoStartsAndProcessesInsert() {
@@ -196,6 +233,16 @@ class ImperativeContributedStreamIntegrationTest {
         }
 
         @Bean
+        StreamDefinitionContributor reconcileContributor(ContributedOrderHandler handler) {
+            return registration -> registration.stream("contributed-reconcile-watcher", Document.class)
+                    .collection("contributed_reconcile_orders")
+                    .autoStart(false)
+                    .checkpoint(CheckpointSpec.builder().onHistoryLost(OnHistoryLost.RESUME_FROM_NOW).build())
+                    .reconcile(handler.reconciliations::add)
+                    .onInsert((order, ctx) -> handler.reconciledStreamEvents.add(ctx));
+        }
+
+        @Bean
         StreamDefinitionContributor onErrorContributor(ContributedOrderHandler handler) {
             return registration -> registration.stream("contributed-onerror-watcher", Document.class)
                     .collection("contributed_error_orders")
@@ -218,5 +265,7 @@ class ImperativeContributedStreamIntegrationTest {
         final List<ChangeStreamContext<?>> pipelineFilteredEvents = new CopyOnWriteArrayList<>();
         final List<ChangeStreamContext<?>> processedEvents = new CopyOnWriteArrayList<>();
         final List<Throwable> caughtErrors = new CopyOnWriteArrayList<>();
+        final List<HistoryLostContext> reconciliations = new CopyOnWriteArrayList<>();
+        final List<ChangeStreamContext<?>> reconciledStreamEvents = new CopyOnWriteArrayList<>();
     }
 }

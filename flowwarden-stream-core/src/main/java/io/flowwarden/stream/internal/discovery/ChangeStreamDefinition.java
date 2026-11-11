@@ -38,6 +38,7 @@ import java.util.Map;
  * @param config                  the stream configuration (extracted from annotation or builder)
  * @param pipelineMethod          the {@code @Pipeline} method (nullable if no pipeline defined)
  * @param filterMethod            the {@code @Filter} method (nullable if no filter defined)
+ * @param reconcileMethod         the {@code @Reconcile} hook (nullable if none declared)
  * @param checkpointAnnotation    the {@code @Checkpoint} annotation (nullable if not present)
  * @param retryPolicyAnnotation   the {@code @RetryPolicy} annotation (nullable if not present)
  * @param restartPolicyAnnotation the {@code @RestartPolicy} annotation (nullable if not present)
@@ -57,6 +58,7 @@ public record ChangeStreamDefinition(
         StreamConfig config,
         PipelineMethod pipelineMethod,
         FilterMethod filterMethod,
+        ReconcileMethod reconcileMethod,
         Checkpoint checkpointAnnotation,
         RetryPolicy retryPolicyAnnotation,
         RestartPolicy restartPolicyAnnotation,
@@ -64,6 +66,33 @@ public record ChangeStreamDefinition(
         MongoDlqOptions mongoDlqOptionsAnnotation,
         ErrorHandlerResolver errorHandlerResolver,
         Map<String, Object> metadata) {
+
+    /**
+     * Definition without a {@code @Reconcile} hook — the shape every caller
+     * built before the hook existed.
+     */
+    public ChangeStreamDefinition(String streamName,
+                                  String collection,
+                                  String database,
+                                  String zone,
+                                  Object bean,
+                                  HandlerMethod onChangeHandler,
+                                  Map<OperationType, HandlerMethod> typedHandlers,
+                                  StreamConfig config,
+                                  PipelineMethod pipelineMethod,
+                                  FilterMethod filterMethod,
+                                  Checkpoint checkpointAnnotation,
+                                  RetryPolicy retryPolicyAnnotation,
+                                  RestartPolicy restartPolicyAnnotation,
+                                  DeadLetterQueue deadLetterQueueAnnotation,
+                                  MongoDlqOptions mongoDlqOptionsAnnotation,
+                                  ErrorHandlerResolver errorHandlerResolver,
+                                  Map<String, Object> metadata) {
+        this(streamName, collection, database, zone, bean, onChangeHandler, typedHandlers, config,
+                pipelineMethod, filterMethod, null, checkpointAnnotation, retryPolicyAnnotation,
+                restartPolicyAnnotation, deadLetterQueueAnnotation, mongoDlqOptionsAnnotation,
+                errorHandlerResolver, metadata);
+    }
 
     /**
      * Resolves the best handler for a given operation type.

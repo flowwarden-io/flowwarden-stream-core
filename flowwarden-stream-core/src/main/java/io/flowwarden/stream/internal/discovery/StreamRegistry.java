@@ -48,4 +48,14 @@ public interface StreamRegistry {
      * @return the definition, or empty if not found
      */
     Optional<ChangeStreamDefinition> findByName(String streamName);
+
+    /**
+     * Whether registered streams may start automatically on
+     * {@code ApplicationReadyEvent}. {@code false} when a configuration class
+     * declares {@code @EnableFlowWarden(enabled = false)}: every stream then
+     * stays stopped until started explicitly.
+     */
+    default boolean isAutoStartEnabled() {
+        return true;
+    }
 }

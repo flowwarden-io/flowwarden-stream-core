@@ -78,6 +78,10 @@ final class StreamSpecConverter {
 
         PipelineMethod pipelineMethod = spec.pipeline().map(PipelineMethod::fromSupplier).orElse(null);
         FilterMethod filterMethod = toFilterMethod(spec);
+        ReconcileMethod reconcileMethod = spec.reconcile()
+                .map(ReconcileMethod::fromHandler)
+                .or(() -> spec.reconcileReactive().map(ReconcileMethod::fromReactiveHandler))
+                .orElse(null);
 
         List<ErrorHandlerMethod> errorHandlerMethods = new ArrayList<>();
         for (ErrorHandlerBinding binding : spec.errorHandlers()) {
@@ -95,6 +99,7 @@ final class StreamSpecConverter {
                 config,
                 pipelineMethod,
                 filterMethod,
+                reconcileMethod,
                 checkpoint,
                 retryPolicy,
                 restartPolicy,

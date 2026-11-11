@@ -31,7 +31,7 @@ The library automatically handles **checkpoint/resume**, **retry with exponentia
 - **Application-side filtering** — `@Filter` runs Java predicates on each event before dispatching to handlers
 - **Dual execution mode** — `IMPERATIVE` (`MongoTemplate`) or `REACTIVE` (`ReactiveMongoTemplate`)
 - **Multi-instance deployment** — `SINGLE_LEADER`, `ALL_INSTANCES` strategies
-- **Zero additional dependencies** — uses only Spring Data MongoDB (already in your classpath)
+- **No extra runtime stack** — uses Spring Data MongoDB (already in your classpath); in `REACTIVE` mode the default `LockService` also needs the synchronous Mongo driver (`spring-boot-starter-data-mongodb`) unless you provide your own `LockService` bean
 - **Spring Boot auto-configuration** — just add the dependency and annotate
 
 ## Quick Start
@@ -142,22 +142,22 @@ public class OrderStreamHandler {
     /** Application-side: refine with Java logic (e.g., service calls). */
     @Filter
     boolean filter(ChangeStreamContext<Order> ctx) {
-        return ctx.getFullDocument(Order.class).getTotal() > 0;
+        return ctx.getFullDocument(Order.class).map(o -> o.getTotal() > 0).orElse(false);
     }
 
     @OnInsert
     void onNewOrder(ChangeStreamContext<Order> ctx) {
-        Order order = ctx.getFullDocument(Order.class);
-        log.info("New order created: {} — total: {}", order.getId(), order.getTotal());
+        ctx.getFullDocument(Order.class).ifPresent(order ->
+                log.info("New order created: {} — total: {}", order.getId(), order.getTotal()));
     }
 
     @OnUpdate
     void onOrderUpdated(ChangeStreamContext<Order> ctx) {
-        UpdateDescription update = ctx.getUpdateDescription();
-        if (update.hasFieldChanged("status")) {
-            String newStatus = update.getUpdatedFieldValue("status", String.class);
-            log.info("Order {} status changed to {}", ctx.getDocumentKey(), newStatus);
-        }
+        ctx.getUpdateDescription()
+                .filter(update -> update.hasFieldChanged("status"))
+                .flatMap(update -> update.getUpdatedFieldValue("status", String.class))
+                .ifPresent(newStatus ->
+                        log.info("Order {} status changed to {}", ctx.getDocumentKey(), newStatus));
     }
 
     @OnDelete
@@ -176,7 +176,7 @@ public class OrderStreamHandler {
 
 ## Handler Signatures
 
-Handler methods annotated with `@OnChange`, `@OnInsert`, `@OnUpdate`, `@OnReplace`, or `@OnDelete` support the following signatures:
+Handler methods annotated with `@OnInsert`, `@OnUpdate`, `@OnReplace`, or `@OnDelete` support the following signatures (`@OnChange` accepts the `ChangeStreamContext<T> ctx` forms only):
 
 | Signature | Mode | Description |
 |-----------|------|-------------|
@@ -192,7 +192,7 @@ For other Spring beans (e.g., a `MongoTemplate`), inject them via the handler cl
 | Mode | Description | Use Case |
 |------|-------------|----------|
 | `ALL_INSTANCES` | Every instance receives every event independently. No coordination. | **Default.** Cache invalidation, local state refresh, read-model projections. |
-| `SINGLE_LEADER` | One active instance processes events; others are on standby. Automatic leader election via MongoDB distributed locks (`_fw_locks`). | Order processing, billing, notifications — anything requiring exactly-once semantics. |
+| `SINGLE_LEADER` | One active instance processes events; others are on standby. Automatic leader election via MongoDB distributed locks (`_fw_locks`). | Order processing, billing, notifications — anything that needs a single active consumer. Delivery stays at-least-once: keep handlers idempotent. |
 
 ## Compatibility
 
@@ -208,7 +208,7 @@ For other Spring beans (e.g., a `MongoTemplate`), inject them via the handler cl
 
 ## Configuration
 
-The only `application.yml` property is the execution mode:
+The main `application.yml` property is the execution mode (the other one, `flowwarden.dlq.mongo.collection`, is covered under `@MongoDlqOptions` below):
 
 ```yaml
 flowwarden:
@@ -223,13 +223,13 @@ All stream-level settings are configured via annotations on your `@ChangeStream`
 | `@RetryPolicy` | Exponential backoff on failure | `maxAttempts = 3`, `initialDelay = "500ms"`, `multiplier = 2.0`, `maxDelay = "30s"`, `jitter = true` |
 | `@RestartPolicy` | Backoff and ceiling of the managed restart loop after a runtime cursor death | `maxAttempts = 0` (unlimited), `initialDelay = "1s"`, `multiplier = 2.0`, `maxDelay = "60s"`, `jitter = false` |
 | `@DeadLetterQueue` | Route failed events to a DLQ (backend-agnostic) | `enabled = true`, `retentionDays = 30` |
-| `@MongoDlqOptions` | MongoDB-specific DLQ tuning (collection override) | `collection = "_fw_dlq"` (overrides `flowwarden.dlq.mongo.collection`) |
+| `@MongoDlqOptions` | MongoDB-specific DLQ tuning (collection override) | `collection = ""` (empty = the global `flowwarden.dlq.mongo.collection`, itself `_fw_dlq` by default) |
 
 See the [Comprehensive Example](#comprehensive-example) above for usage, or the [documentation](https://docs.flowwarden.io) for the full reference.
 
 ### Streams without annotations
 
-When the stream catalog lives outside the JVM — a YAML file, a database table, a feature-flag service — declare streams programmatically instead. A `StreamDefinitionContributor` bean is called once at bootstrap and describes each stream with the `StreamSpec` builder; every builder call maps 1:1 to an annotation (`.pipeline(...)`, `.filter(...)`, `.onError(...)`, `.checkpoint(...)`, `.retryPolicy(...)`, `.restartPolicy(...)`, `.deadLetterQueue(...)`), with the same defaults and the same fail-fast validation. Both styles coexist in one application.
+When the stream catalog lives outside the JVM — a YAML file, a database table, a feature-flag service — declare streams programmatically instead. A `StreamDefinitionContributor` bean is called once at bootstrap and describes each stream with the `StreamSpec` builder; every builder call maps 1:1 to an annotation (`.pipeline(...)`, `.filter(...)`, `.onError(...)`, `.reconcile(...)`, `.checkpoint(...)`, `.retryPolicy(...)`, `.restartPolicy(...)`, `.deadLetterQueue(...)`), with the same defaults and the same fail-fast validation. Both styles coexist in one application.
 
 ```java
 @Component
@@ -256,6 +256,26 @@ If a stream stays down (or its resume point cannot be maintained) longer than th
 - **`FAIL`** (default) — a terminal stop: the stream refuses to start until an operator either deletes the stream's document from the checkpoint collection (`_fw_checkpoints` with the built-in Mongo stores) to restart from a fresh position, or switches the strategy. Choose it when losing events must never go unnoticed.
 - **`RESUME_FROM_NOW`** — the recovery abandons the lost history explicitly: a fresh server-certified position is persisted (clearing the expired tokens) and the stream resumes from it. Recommended for rebuildable projections (search models, caches) — reindex the gap after recovery.
 - **`RESUME_FROM_OPLOG_START`** — replays whatever history is still readable from the oldest oplog entry. Inherently racy on a tight oplog; falls back to the `RESUME_FROM_NOW` behavior if the oplog boundary cannot be read.
+
+Under either self-repairing strategy the events of the lost window are gone — MongoDB discarded them. A stream that maintains a **derived view** (a search model, a cache, a projection aggregated from several collections) declares a `@Reconcile` method (or `.reconcile(...)` on a contributed stream): it receives the bound of the lost window and runs **before** the stream resumes and before any checkpoint write, so the reconciliation never interleaves with live events. A hook that throws stops the start like `FAIL`; the expired tokens are kept, and the next start reconciles again.
+
+```java
+@ChangeStream(collection = "dossiers")
+@Checkpoint(onHistoryLost = OnHistoryLost.RESUME_FROM_OPLOG_START)
+public class DossierSearchProjection {
+
+    @OnInsert @OnUpdate
+    public void project(Dossier d, ChangeStreamContext<Dossier> ctx) { /* update the search model */ }
+
+    @Reconcile
+    public void rebuild(HistoryLostContext ctx) {
+        // [lostWindowStart, lostWindowEnd]: the window to re-synchronize; everything after it is replayed by the stream
+        searchModel.resyncDossiersTouchedSince(ctx.lostWindowStart().orElse(Instant.EPOCH));
+    }
+}
+```
+
+If the reconciliation outlives the oplog window, the hook is called once more on the small residual window; if that rolls out too, the start fails with a message saying the reconciliation does not fit in the oplog — grow it, or make the reconciliation faster. Sizing the oplog for the longest expected downtime remains the operator's job; the idle heartbeat's probe warning is the signal that it is too small.
 
 
 ## FlowWarden Ecosystem

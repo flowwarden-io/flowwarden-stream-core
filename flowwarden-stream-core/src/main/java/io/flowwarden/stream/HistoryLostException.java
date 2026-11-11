@@ -18,8 +18,11 @@ package io.flowwarden.stream;
 import java.time.Instant;
 
 /**
- * Thrown when {@link OnHistoryLost#FAIL} is in effect and the saved resume token
- * has expired from the MongoDB oplog.
+ * Thrown when the saved resume token has expired from the MongoDB oplog and
+ * the stream cannot start: under {@link OnHistoryLost#FAIL}, or — as the
+ * {@link ReconciliationFailedException} subclass — when the stream's
+ * {@code @Reconcile} hook failed under a self-repairing strategy. Terminal
+ * for the restart loop in both cases.
  */
 public class HistoryLostException extends RuntimeException {
 
@@ -35,6 +38,22 @@ public class HistoryLostException extends RuntimeException {
                 + "(_fw_checkpoints with the shipped Mongo stores) to restart from a fresh "
                 + "position, or set @Checkpoint(onHistoryLost = RESUME_FROM_NOW) / "
                 + "RESUME_FROM_OPLOG_START to recover automatically.");
+        this.streamName = streamName;
+        this.lastCheckpointTimestamp = lastCheckpointTimestamp;
+    }
+
+    /**
+     * For subclasses that describe a specific history-lost outcome with their
+     * own message, such as {@link ReconciliationFailedException}.
+     *
+     * @param streamName              the stream
+     * @param lastCheckpointTimestamp last known checkpoint activity, may be null
+     * @param message                 the operator-facing message
+     * @param cause                   the underlying failure, may be null
+     */
+    protected HistoryLostException(String streamName, Instant lastCheckpointTimestamp,
+                                   String message, Throwable cause) {
+        super(message, cause);
         this.streamName = streamName;
         this.lastCheckpointTimestamp = lastCheckpointTimestamp;
     }

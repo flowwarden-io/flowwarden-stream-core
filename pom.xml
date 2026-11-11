@@ -166,6 +166,11 @@
                             -->
                             <excludes>
                                 <exclude>io.flowwarden.stream.internal.*</exclude>
+                                <!--
+                                    Removed in 1.0.0-rc.8 (release candidates, no deprecation
+                                    cycle): the attribute was never read by the runtime.
+                                -->
+                                <exclude>io.flowwarden.stream.annotation.EnableFlowWarden#propertyPrefix()</exclude>
                             </excludes>
                             <postAnalysisScript>${maven.multiModuleProjectDirectory}/.japicmp-post-analysis.groovy</postAnalysisScript>
                         </parameter>

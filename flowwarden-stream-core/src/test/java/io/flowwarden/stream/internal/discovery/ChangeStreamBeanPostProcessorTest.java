@@ -30,6 +30,11 @@ import io.flowwarden.stream.annotation.OnReplace;
 import io.flowwarden.stream.annotation.OnUpdate;
 import io.flowwarden.stream.annotation.Filter;
 import io.flowwarden.stream.annotation.Pipeline;
+import io.flowwarden.stream.annotation.Checkpoint;
+import io.flowwarden.stream.annotation.Reconcile;
+import io.flowwarden.stream.HistoryLostContext;
+import io.flowwarden.stream.OnHistoryLost;
+import io.flowwarden.stream.StartPosition;
 import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Filters;
 import org.bson.Document;
@@ -1129,5 +1134,169 @@ class ChangeStreamBeanPostProcessorTest {
     static class FullDocBeforeChangeHandler {
         @OnUpdate
         void onUpdate(ChangeStreamContext<?> ctx) {}
+    }
+
+    // --- @Reconcile ---
+
+    @Test
+    void discoversReconcileMethod() {
+        ReconcileBean bean = new ReconcileBean();
+        processor.postProcessAfterInitialization(bean, "reconcile");
+
+        ChangeStreamDefinition def = processor.getDefinitions().get(0);
+        assertNotNull(def.reconcileMethod());
+        assertEquals("rebuild", def.reconcileMethod().method().getName());
+        assertFalse(def.reconcileMethod().isReactiveReturn());
+    }
+
+    @Test
+    void reconcileMethodIsNullWhenAbsent() {
+        processor.postProcessAfterInitialization(new ValidHandler(), "validHandler");
+        assertNull(processor.getDefinitions().get(0).reconcileMethod());
+    }
+
+    @Test
+    void detectsReactiveReconcileReturn() {
+        ReactiveReconcileBean bean = new ReactiveReconcileBean();
+        processor.postProcessAfterInitialization(bean, "reactiveReconcile");
+
+        assertTrue(processor.getDefinitions().get(0).reconcileMethod().isReactiveReturn());
+    }
+
+    @Test
+    void throwsWhenMultipleReconcileMethods() {
+        assertThrows(BeanCreationException.class,
+                () -> processor.postProcessAfterInitialization(new DuplicateReconcileBean(), "dupReconcile"));
+    }
+
+    @Test
+    void throwsWhenReconcileHasWrongParameterType() {
+        assertThrows(BeanCreationException.class,
+                () -> processor.postProcessAfterInitialization(new ReconcileWrongParamBean(), "reconcileWrongParam"));
+    }
+
+    @Test
+    void throwsWhenReconcileHasNoParameter() {
+        assertThrows(BeanCreationException.class,
+                () -> processor.postProcessAfterInitialization(new ReconcileNoParamBean(), "reconcileNoParam"));
+    }
+
+    @Test
+    void throwsWhenReconcileHasUnsupportedReturnType() {
+        assertThrows(BeanCreationException.class,
+                () -> processor.postProcessAfterInitialization(new ReconcileBadReturnBean(), "reconcileBadReturn"));
+    }
+
+    @Test
+    void throwsWhenReconcileWithoutCheckpoint() {
+        BeanCreationException e = assertThrows(BeanCreationException.class,
+                () -> processor.postProcessAfterInitialization(new ReconcileWithoutCheckpointBean(), "reconcileNoCp"));
+        assertTrue(e.getMessage().contains("requires a @Checkpoint"));
+    }
+
+    @Test
+    void throwsWhenReconcileWithFailStrategy() {
+        BeanCreationException e = assertThrows(BeanCreationException.class,
+                () -> processor.postProcessAfterInitialization(new ReconcileWithFailBean(), "reconcileFail"));
+        assertTrue(e.getMessage().contains("onHistoryLost = FAIL"));
+    }
+
+    @Test
+    void throwsWhenReconcileWithLatestStartPosition() {
+        BeanCreationException e = assertThrows(BeanCreationException.class,
+                () -> processor.postProcessAfterInitialization(new ReconcileWithLatestBean(), "reconcileLatest"));
+        assertTrue(e.getMessage().contains("startPosition = LATEST"));
+    }
+
+    @ChangeStream(collection = "orders")
+    @Checkpoint(onHistoryLost = OnHistoryLost.RESUME_FROM_NOW)
+    static class ReconcileBean {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {}
+
+        @Reconcile
+        void rebuild(HistoryLostContext ctx) {}
+    }
+
+    @ChangeStream(collection = "orders")
+    @Checkpoint(onHistoryLost = OnHistoryLost.RESUME_FROM_OPLOG_START)
+    static class ReactiveReconcileBean {
+        @OnChange
+        Mono<Void> handle(ChangeStreamContext<?> ctx) { return Mono.empty(); }
+
+        @Reconcile
+        Mono<Void> rebuild(HistoryLostContext ctx) { return Mono.empty(); }
+    }
+
+    @ChangeStream(collection = "orders")
+    @Checkpoint(onHistoryLost = OnHistoryLost.RESUME_FROM_NOW)
+    static class DuplicateReconcileBean {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {}
+
+        @Reconcile
+        void one(HistoryLostContext ctx) {}
+
+        @Reconcile
+        void two(HistoryLostContext ctx) {}
+    }
+
+    @ChangeStream(collection = "orders")
+    @Checkpoint(onHistoryLost = OnHistoryLost.RESUME_FROM_NOW)
+    static class ReconcileWrongParamBean {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {}
+
+        @Reconcile
+        void rebuild(String streamName) {}
+    }
+
+    @ChangeStream(collection = "orders")
+    @Checkpoint(onHistoryLost = OnHistoryLost.RESUME_FROM_NOW)
+    static class ReconcileNoParamBean {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {}
+
+        @Reconcile
+        void rebuild() {}
+    }
+
+    @ChangeStream(collection = "orders")
+    @Checkpoint(onHistoryLost = OnHistoryLost.RESUME_FROM_NOW)
+    static class ReconcileBadReturnBean {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {}
+
+        @Reconcile
+        boolean rebuild(HistoryLostContext ctx) { return true; }
+    }
+
+    @ChangeStream(collection = "orders")
+    static class ReconcileWithoutCheckpointBean {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {}
+
+        @Reconcile
+        void rebuild(HistoryLostContext ctx) {}
+    }
+
+    @ChangeStream(collection = "orders")
+    @Checkpoint
+    static class ReconcileWithFailBean {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {}
+
+        @Reconcile
+        void rebuild(HistoryLostContext ctx) {}
+    }
+
+    @ChangeStream(collection = "orders")
+    @Checkpoint(startPosition = StartPosition.LATEST, onHistoryLost = OnHistoryLost.RESUME_FROM_NOW)
+    static class ReconcileWithLatestBean {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {}
+
+        @Reconcile
+        void rebuild(HistoryLostContext ctx) {}
     }
 }

@@ -16,6 +16,7 @@
 package io.flowwarden.stream.internal.discovery;
 
 import io.flowwarden.stream.ChangeStreamContext;
+import io.flowwarden.stream.OnHistoryLost;
 import io.flowwarden.stream.annotation.ChangeStream;
 import io.flowwarden.stream.annotation.OnChange;
 import io.flowwarden.stream.autoconfigure.FlowWardenAutoConfiguration;
@@ -84,6 +85,54 @@ class StreamContributorProcessorTest {
                     assertThat(context).hasFailed();
                     assertThat(context.getStartupFailure())
                             .hasMessageContaining("at least one handler");
+                });
+    }
+
+    @Test
+    void registersAContributedReconcileHook() {
+        contextRunner
+                .withUserConfiguration(ReconcileContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    StreamRegistry registry = context.getBean(StreamRegistry.class);
+                    assertThat(registry.findByName("reconcile-stream").orElseThrow().reconcileMethod())
+                            .isNotNull();
+                });
+    }
+
+    @Test
+    void failsWhenReconcileDeclaredWithFailStrategySameAsAnnotationPath() {
+        contextRunner
+                .withUserConfiguration(ReconcileWithFailContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@Reconcile")
+                            .hasMessageContaining("onHistoryLost = FAIL");
+                });
+    }
+
+    @Test
+    void failsWhenReconcileDeclaredWithoutCheckpointSameAsAnnotationPath() {
+        contextRunner
+                .withUserConfiguration(ReconcileWithoutCheckpointContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("@Reconcile")
+                            .hasMessageContaining("requires a @Checkpoint");
+                });
+    }
+
+    @Test
+    void failsWhenReactiveReconcileDeclaredInImperativeMode() {
+        contextRunner
+                .withUserConfiguration(ReactiveReconcileContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("reconcileReactive")
+                            .hasMessageContaining("IMPERATIVE");
                 });
     }
 
@@ -364,6 +413,53 @@ class StreamContributorProcessorTest {
             return registration -> registration.stream("invalid-retry-stream", Order.class)
                     .collection("orders")
                     .retryPolicy(RetryPolicySpec.builder().multiplier(-1.0).build())
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ReconcileContributorConfig {
+        @Bean
+        StreamDefinitionContributor reconcileContributor() {
+            return registration -> registration.stream("reconcile-stream", Order.class)
+                    .collection("orders")
+                    .checkpoint(CheckpointSpec.builder().onHistoryLost(OnHistoryLost.RESUME_FROM_NOW).build())
+                    .reconcile(ctx -> { })
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ReconcileWithFailContributorConfig {
+        @Bean
+        StreamDefinitionContributor reconcileWithFailContributor() {
+            return registration -> registration.stream("reconcile-fail-stream", Order.class)
+                    .collection("orders")
+                    .checkpoint(CheckpointSpec.defaults())
+                    .reconcile(ctx -> { })
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ReconcileWithoutCheckpointContributorConfig {
+        @Bean
+        StreamDefinitionContributor reconcileWithoutCheckpointContributor() {
+            return registration -> registration.stream("reconcile-nocp-stream", Order.class)
+                    .collection("orders")
+                    .reconcile(ctx -> { })
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ReactiveReconcileContributorConfig {
+        @Bean
+        StreamDefinitionContributor reactiveReconcileContributor() {
+            return registration -> registration.stream("reconcile-reactive-stream", Order.class)
+                    .collection("orders")
+                    .checkpoint(CheckpointSpec.builder().onHistoryLost(OnHistoryLost.RESUME_FROM_NOW).build())
+                    .reconcileReactive(ctx -> reactor.core.publisher.Mono.empty())
                     .onChange(ctx -> { });
         }
     }

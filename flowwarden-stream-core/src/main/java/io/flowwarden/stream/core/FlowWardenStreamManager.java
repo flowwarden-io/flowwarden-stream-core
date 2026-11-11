@@ -44,8 +44,11 @@ public interface FlowWardenStreamManager {
     boolean isRunning(String streamName);
 
     /**
-     * Returns the time of the last event processed by the given stream,
-     * or {@code null} if no event has been processed yet.
+     * Returns the time of the last event that reached a handler of the given
+     * stream, or {@code null} if none has yet. In imperative mode the time is
+     * recorded whatever the handler outcome; in reactive mode only after a
+     * successful handler. Events rejected by {@code @Filter} or without a
+     * matching handler do not update it.
      *
      * @param streamName unique stream identifier
      */

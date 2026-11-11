@@ -18,6 +18,7 @@ package io.flowwarden.stream.internal.discovery;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.FullDocumentMode;
 import io.flowwarden.stream.OperationType;
+import io.flowwarden.stream.registration.CheckpointSpec;
 import io.flowwarden.stream.registration.ErrorHandlerBinding;
 import io.flowwarden.stream.registration.StreamDefinitionContributor;
 import io.flowwarden.stream.registration.StreamRegistration;
@@ -144,6 +145,18 @@ public class StreamContributorProcessor implements SmartInitializingSingleton {
                 isReactive(handler)));
         spec.onChangeHandler().ifPresent(handler -> StreamDefinitionValidator.validateHandlerReturnMode(
                 beanName, subject, "onChange", mode, isReactive(handler)));
+
+        boolean hasReconcile = spec.reconcile().isPresent() || spec.reconcileReactive().isPresent();
+        StreamDefinitionValidator.validateReconcile(beanName, subject, hasReconcile,
+                spec.checkpoint().isPresent(),
+                spec.checkpoint().map(CheckpointSpec::onHistoryLost).orElse(null),
+                spec.checkpoint().map(CheckpointSpec::startPosition).orElse(null));
+        if (spec.reconcile().isPresent()) {
+            StreamDefinitionValidator.validateHandlerReturnMode(beanName, subject, "reconcile", mode, false);
+        }
+        if (spec.reconcileReactive().isPresent()) {
+            StreamDefinitionValidator.validateHandlerReturnMode(beanName, subject, "reconcileReactive", mode, true);
+        }
     }
 
     private static boolean expectsDocument(TypedHandler<?> handler) {
