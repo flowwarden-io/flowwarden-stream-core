@@ -79,13 +79,15 @@ public final class CursorCommentStamping {
         @Override
         public com.mongodb.client.MongoDatabase getMongoDatabase() {
             return (com.mongodb.client.MongoDatabase) stampingProxy(
-                    com.mongodb.client.MongoDatabase.class, delegate.getMongoDatabase(), comment);
+                    com.mongodb.client.MongoDatabase.class, delegate.getMongoDatabase(), comment,
+                    CursorCommentStamping::stampSyncWatch);
         }
 
         @Override
         public com.mongodb.client.MongoDatabase getMongoDatabase(String dbName) {
             return (com.mongodb.client.MongoDatabase) stampingProxy(
-                    com.mongodb.client.MongoDatabase.class, delegate.getMongoDatabase(dbName), comment);
+                    com.mongodb.client.MongoDatabase.class, delegate.getMongoDatabase(dbName), comment,
+                    CursorCommentStamping::stampSyncWatch);
         }
 
         @Override
@@ -122,14 +124,16 @@ public final class CursorCommentStamping {
         public Mono<com.mongodb.reactivestreams.client.MongoDatabase> getMongoDatabase() {
             return delegate.getMongoDatabase().map(db ->
                     (com.mongodb.reactivestreams.client.MongoDatabase) stampingProxy(
-                            com.mongodb.reactivestreams.client.MongoDatabase.class, db, comment));
+                            com.mongodb.reactivestreams.client.MongoDatabase.class, db, comment,
+                            CursorCommentStamping::stampReactiveWatch));
         }
 
         @Override
         public Mono<com.mongodb.reactivestreams.client.MongoDatabase> getMongoDatabase(String dbName) {
             return delegate.getMongoDatabase(dbName).map(db ->
                     (com.mongodb.reactivestreams.client.MongoDatabase) stampingProxy(
-                            com.mongodb.reactivestreams.client.MongoDatabase.class, db, comment));
+                            com.mongodb.reactivestreams.client.MongoDatabase.class, db, comment,
+                            CursorCommentStamping::stampReactiveWatch));
         }
 
         @Override
@@ -168,8 +172,16 @@ public final class CursorCommentStamping {
      * {@code withReadPreference}, …) are re-proxied so the stamping survives,
      * and everything else delegates untouched. Reflective on purpose: driver
      * interface additions never break the decoration.
+     *
+     * <p>The {@code watch} stamping is supplied by the caller, one
+     * {@link WatchStamper} per driver family: the JVM resolves the type named
+     * by an {@code instanceof} when the instruction runs, so a shared check
+     * against the synchronous {@code ChangeStreamIterable} would load the
+     * synchronous driver on the reactive path — and a reactive-only
+     * application has none to load.</p>
      */
-    private static Object stampingProxy(Class<?> iface, Object target, String comment) {
+    private static Object stampingProxy(Class<?> iface, Object target, String comment,
+                                        WatchStamper stamper) {
         return Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface},
                 (proxy, method, args) -> {
                     Object result;
@@ -182,22 +194,37 @@ public final class CursorCommentStamping {
                         return null;
                     }
                     if ("watch".equals(method.getName())) {
-                        if (result instanceof com.mongodb.client.ChangeStreamIterable<?> iterable) {
-                            return iterable.comment(comment);
-                        }
-                        if (result instanceof
-                                com.mongodb.reactivestreams.client.ChangeStreamPublisher<?> publisher) {
-                            return publisher.comment(comment);
-                        }
-                        return result;
+                        return stamper.stamp(result, comment);
                     }
                     if ("getCollection".equals(method.getName())) {
-                        return stampingProxy(method.getReturnType(), result, comment);
+                        return stampingProxy(method.getReturnType(), result, comment, stamper);
                     }
                     if (method.getReturnType().equals(iface)) {
-                        return stampingProxy(iface, result, comment);
+                        return stampingProxy(iface, result, comment, stamper);
                     }
                     return result;
                 });
+    }
+
+    /** Applies the comment to the result of a {@code watch(...)} call of one driver family. */
+    @FunctionalInterface
+    private interface WatchStamper {
+        Object stamp(Object watchResult, String comment);
+    }
+
+    /** Synchronous driver only — never executed on the reactive path. */
+    private static Object stampSyncWatch(Object result, String comment) {
+        if (result instanceof com.mongodb.client.ChangeStreamIterable<?> iterable) {
+            return iterable.comment(comment);
+        }
+        return result;
+    }
+
+    /** Reactive Streams driver only — never executed on the imperative path. */
+    private static Object stampReactiveWatch(Object result, String comment) {
+        if (result instanceof com.mongodb.reactivestreams.client.ChangeStreamPublisher<?> publisher) {
+            return publisher.comment(comment);
+        }
+        return result;
     }
 }
