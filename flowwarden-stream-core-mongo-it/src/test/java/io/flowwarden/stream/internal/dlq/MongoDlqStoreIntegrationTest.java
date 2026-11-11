@@ -17,6 +17,7 @@ package io.flowwarden.stream.internal.dlq;
 
 import com.mongodb.client.MongoClients;
 import io.flowwarden.stream.spi.DlqStore;
+import io.flowwarden.stream.spi.DlqStreamRegistration;
 import io.flowwarden.stream.spi.FailedEvent;
 import io.flowwarden.stream.spi.testkit.DlqStoreContractTest;
 import io.flowwarden.stream.test.SharedMongoContainer;
@@ -94,6 +95,23 @@ class MongoDlqStoreIntegrationTest extends DlqStoreContractTest {
         List<FailedEvent> found = mongoStore.findByStreamName("orders-stream");
         assertEquals(1, found.size());
         assertEquals("evt-orders", found.get(0).id());
+    }
+
+    @Test
+    void onStreamRegisteredBindsTheCollectionAndCreatesTheTtlIndex() {
+        // The SPI hook is the path the stream manager takes — it must do
+        // exactly what the hand-called registerStream does.
+        mongoStore.onStreamRegistered(
+                new DlqStreamRegistration("hook-stream", DEFAULT_POLICY, CUSTOM_COLLECTION));
+
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        mongoStore.save(makeEvent("evt-hook", "hook-stream", now), DEFAULT_POLICY);
+
+        assertThat(mongoTemplate.findAll(Document.class, CUSTOM_COLLECTION)).hasSize(1);
+        assertThat(mongoTemplate.findAll(Document.class, DEFAULT_COLLECTION)).isEmpty();
+        assertThat(mongoTemplate.indexOps(CUSTOM_COLLECTION).getIndexInfo())
+                .anyMatch(idx -> idx.getExpireAfter().isPresent()
+                        && idx.getIndexFields().stream().anyMatch(f -> "expiresAt".equals(f.getKey())));
     }
 
     @Test

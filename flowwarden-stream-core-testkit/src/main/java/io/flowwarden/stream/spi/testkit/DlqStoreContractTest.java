@@ -17,6 +17,7 @@ package io.flowwarden.stream.spi.testkit;
 
 import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
+import io.flowwarden.stream.spi.DlqStreamRegistration;
 import io.flowwarden.stream.spi.FailedEvent;
 import org.bson.BsonDocument;
 import org.bson.BsonString;
@@ -142,6 +143,35 @@ public abstract class DlqStoreContractTest {
         );
 
         store.save(event, DEFAULT_POLICY);
+    }
+
+    // --- Startup hook: always runs ---------------------------------------
+
+    /**
+     * {@code onStreamRegistered} is optional: the runtime calls it once per
+     * DLQ-enabled stream before that stream starts, so every backend must
+     * accept it — before any write, with or without a backend hint it
+     * understands, and more than once for the same stream — without
+     * throwing and without breaking a later {@code save}. What a backend
+     * <em>does</em> with the registration (bind a collection, create a TTL
+     * index, declare a queue) is its own business and is asserted in its
+     * own tests.
+     */
+    @Test
+    void onStreamRegisteredIsOptionalAndIdempotent() {
+        var registration = new DlqStreamRegistration("registered-stream", DEFAULT_POLICY, "");
+
+        store.onStreamRegistered(registration);
+        store.onStreamRegistered(registration);
+
+        var now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        store.save(makeEvent("evt-registered", "registered-stream", now), DEFAULT_POLICY);
+
+        if (supportsReplay()) {
+            var found = store.findByStreamName("registered-stream");
+            assertEquals(1, found.size());
+            assertEquals("evt-registered", found.get(0).id());
+        }
     }
 
     // --- Read contract: requires overridden cold-path reads -------------

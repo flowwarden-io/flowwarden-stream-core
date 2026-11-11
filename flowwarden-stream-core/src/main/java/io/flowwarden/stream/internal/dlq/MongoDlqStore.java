@@ -17,6 +17,7 @@ package io.flowwarden.stream.internal.dlq;
 
 import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
+import io.flowwarden.stream.spi.DlqStreamRegistration;
 import io.flowwarden.stream.spi.FailedEvent;
 import org.bson.BsonDocument;
 import org.bson.BsonValue;
@@ -41,11 +42,13 @@ import java.util.concurrent.ConcurrentMap;
  * MongoDB-backed implementation of {@link DlqStore}.
  *
  * <p>Each stream may write to its own collection. The mapping is populated at
- * startup via {@link #registerStream(String, String)} (called by the stream
- * manager once per discovered {@code @ChangeStream} bean), with a default
- * collection name resolved from {@link MongoDlqProperties}. Registering a
- * stream also creates the TTL index on {@code expiresAt} for that
- * collection.</p>
+ * startup through the SPI hook
+ * {@link #onStreamRegistered(DlqStreamRegistration)} (called by the stream
+ * manager once per DLQ-enabled stream, whether this store is the
+ * {@code DlqStore} bean itself or a delegate of a composite that forwards
+ * the hook), with a default collection name resolved from
+ * {@link MongoDlqProperties}. Registering a stream also creates the TTL
+ * index on {@code expiresAt} for that collection.</p>
  *
  * <p>This class is internal and not part of the public API.</p>
  */
@@ -63,10 +66,20 @@ public class MongoDlqStore implements DlqStore {
         this.defaultCollection = properties.getCollection();
     }
 
+    @Override
+    public void onStreamRegistered(DlqStreamRegistration registration) {
+        registerStream(registration.streamName(), registration.mongoCollection());
+    }
+
     /**
-     * Registers a stream → collection binding. Called once per discovered
-     * {@code @ChangeStream} at startup. Creates the TTL index on
+     * Registers a stream → collection binding and creates the TTL index on
      * {@code expiresAt} for the resolved collection on first registration.
+     *
+     * <p>Superseded by the SPI hook
+     * {@link #onStreamRegistered(DlqStreamRegistration)}, which the stream
+     * manager now calls on every {@code DlqStore} bean: an application no
+     * longer needs to call this method itself when it wraps the store.
+     * Kept public for code that binds a stream by hand.</p>
      *
      * @param streamName  stream identifier
      * @param collection  resolved Mongo collection name (empty/null → default)

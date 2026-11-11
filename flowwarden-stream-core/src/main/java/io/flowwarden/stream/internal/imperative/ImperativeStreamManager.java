@@ -35,7 +35,6 @@ import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.internal.DefaultChangeStreamContext;
 import io.flowwarden.stream.internal.MongoTemplateRegistry;
 import io.flowwarden.stream.internal.discovery.ChangeStreamDefinition;
-import io.flowwarden.stream.internal.dlq.MongoDlqStore;
 import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
 import io.flowwarden.stream.internal.discovery.StreamRegistry;
 import io.flowwarden.stream.internal.discovery.HandlerMethod;
@@ -60,6 +59,7 @@ import io.flowwarden.stream.internal.checkpoint.TokenSnapshot;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
+import io.flowwarden.stream.spi.DlqStreamRegistration;
 import io.flowwarden.stream.spi.FailedEvent;
 import jakarta.annotation.PreDestroy;
 import org.bson.BsonDocument;
@@ -1550,17 +1550,31 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
         }
     }
 
+    /**
+     * Announces every DLQ-enabled stream to the {@code DlqStore} bean through
+     * the SPI startup hook, whatever its concrete type — a composite or a
+     * decorator forwards it to the Mongo store it wraps, which binds the
+     * stream to its {@code @MongoDlqOptions} collection and creates the TTL
+     * index there. A hook that throws is logged and skipped: the stream
+     * still starts.
+     */
     private void registerDlqCollections() {
-        if (!(dlqWriter instanceof MongoDlqStore mongoStore)) {
-            return;
-        }
         for (ChangeStreamDefinition def : registry.getDefinitions()) {
-            if (def.deadLetterQueueAnnotation() == null) {
+            DeadLetterQueue dlqAnn = def.deadLetterQueueAnnotation();
+            if (dlqAnn == null) {
                 continue;
             }
             MongoDlqOptions opts = def.mongoDlqOptionsAnnotation();
             String collection = opts != null ? opts.collection() : "";
-            mongoStore.registerStream(def.streamName(), collection);
+            DlqStreamRegistration registration = new DlqStreamRegistration(
+                    def.streamName(), DlqPolicy.fromAnnotation(dlqAnn), collection);
+            try {
+                dlqWriter.onStreamRegistered(registration);
+            } catch (Exception e) {
+                log.warn("DlqStore {} failed to register stream '{}' (collection hint '{}'): {}",
+                        dlqWriter.getClass().getName(), def.streamName(), collection,
+                        e.getMessage(), e);
+            }
         }
     }
 
