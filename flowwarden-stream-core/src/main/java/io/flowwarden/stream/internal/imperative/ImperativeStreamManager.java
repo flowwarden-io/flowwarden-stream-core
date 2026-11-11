@@ -23,6 +23,7 @@ import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
 import io.flowwarden.stream.DeploymentMode;
 import io.flowwarden.stream.ErrorAction;
 import io.flowwarden.stream.FlowWardenMetrics;
+import io.flowwarden.stream.HistoryLostException;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.FullDocumentMode;
 import io.flowwarden.stream.OnHistoryLost;
@@ -274,6 +275,13 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
     @EventListener(ApplicationReadyEvent.class)
     public void onApplicationReady() {
         registerDlqCollections();
+        if (!registry.isAutoStartEnabled()) {
+            log.info("FlowWarden auto-start is disabled (@EnableFlowWarden(enabled = false)): "
+                    + "{} registered stream(s) stay stopped until started explicitly",
+                    registry.getDefinitions().size());
+            scheduleStatsRefresh();
+            return;
+        }
         for (ChangeStreamDefinition def : registry.getDefinitions()) {
             if (!def.config().autoStart() || !def.config().enabled()) {
                 continue;
@@ -284,10 +292,47 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
                         () -> startStream(name),
                         () -> stopStream(name));
             } else {
-                startStream(def.streamName());
+                startAtBoot(def.streamName());
             }
         }
         scheduleStatsRefresh();
+    }
+
+    /**
+     * Boot start of an {@code ALL_INSTANCES} stream, under the same contract
+     * as the leader callback of a {@code SINGLE_LEADER} stream: a failure is
+     * this stream's problem, never the application's. A terminal failure
+     * (the resume cascade escalated to {@code OnHistoryLost.FAIL}, or a
+     * {@code @Reconcile} hook failed) is reported as {@code CRASHED} and left
+     * to an operator; any other failure (backend unreachable, probe timeout)
+     * is handed to the restart loop exactly like a runtime death. Either way
+     * the next stream starts and the application comes up, with this stream
+     * reported DOWN by the health indicator. Letting the exception escape
+     * the {@code ApplicationReadyEvent} listener would instead fail the whole
+     * startup and leave every following stream unstarted and unreported.
+     */
+    private void startAtBoot(String streamName) {
+        try {
+            startStream(streamName);
+        } catch (HistoryLostException e) {
+            log.error("Stream '{}' failed to start at boot terminally — not retried, "
+                    + "operator action required: {}", streamName, e.getMessage(), e);
+            emitBootCrash(streamName, e);
+        } catch (RuntimeException e) {
+            log.warn("Stream '{}' failed to start at boot — handing it to the restart loop: {}",
+                    streamName, e.getMessage(), e);
+            emitBootCrash(streamName, e);
+            restarter.onRuntimeDeath(streamName, e);
+        }
+    }
+
+    private void emitBootCrash(String streamName, Throwable cause) {
+        try {
+            FlowWardenMetrics.get().onStreamStopped(streamName, StopReason.CRASHED, cause);
+        } catch (Exception metricsError) {
+            log.warn("Metrics provider failed on crash signal for stream '{}': {}",
+                    streamName, metricsError.getMessage());
+        }
     }
 
     /**

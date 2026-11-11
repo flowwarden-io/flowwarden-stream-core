@@ -46,8 +46,13 @@ class EnableFlowWardenTest {
     void defaultValues() {
         EnableFlowWarden ann = DefaultConfig.class.getAnnotation(EnableFlowWarden.class);
         assertNotNull(ann);
-        assertEquals("flowwarden.stream", ann.propertyPrefix());
         assertTrue(ann.enabled());
+    }
+
+    @Test
+    void hasNoPropertyPrefixElement() {
+        assertTrue(java.util.Arrays.stream(EnableFlowWarden.class.getDeclaredMethods())
+                .noneMatch(m -> m.getName().equals("propertyPrefix")));
     }
 
     @Test

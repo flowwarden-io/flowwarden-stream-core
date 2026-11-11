@@ -22,20 +22,28 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * Activates the FlowWarden framework. Place on a {@code @Configuration}
+ * Declares that the application uses FlowWarden. Place on a {@code @Configuration}
  * or {@code @SpringBootApplication} class.
  *
- * <p>At startup, FlowWarden discovers beans annotated with {@link ChangeStream}
- * via standard Spring component scanning and registers them in the stream registry.</p>
+ * <p>The auto-configuration activates from the classpath; this annotation is the
+ * declarative entry point and carries the one application-wide switch,
+ * {@link #enabled()}. At startup, FlowWarden discovers beans annotated with
+ * {@link ChangeStream} via standard Spring component scanning and registers them
+ * in the stream registry.</p>
  */
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 public @interface EnableFlowWarden {
 
-    /** Property prefix for configuration. */
-    String propertyPrefix() default "flowwarden.stream";
-
-    /** Globally enable/disable all streams. */
+    /**
+     * Whether registered streams start automatically on
+     * {@code ApplicationReadyEvent}. {@code false} is a maintenance switch:
+     * every stream is discovered and validated as usual but stays stopped,
+     * and can still be started explicitly through
+     * {@code FlowWardenStreamManager.startStream(name)} or the actuator
+     * endpoint. Per-stream control stays on {@link ChangeStream#enabled()}
+     * and {@link ChangeStream#autoStart()}.
+     */
     boolean enabled() default true;
 }
