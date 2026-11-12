@@ -115,7 +115,7 @@ class ImperativeOplogRolloverIntegrationTest {
         // server checks that the start position has not fallen off. Before
         // the fix, the imperative manager asked for (t, 0) — one increment
         // before the oldest entry — and looped on 286 at every attempt.
-        RollingOplogMongoContainer.rollOver(RollingOplogMongoContainer.newestOplogTimestamp());
+        RollingOplogMongoContainer.rollOverEverythingSoFar();
         mongoTemplate.insert(new Document("item", "survived"), "rollover_oplog_start");
         saveExpiredCheckpoint(OPLOG_START_STREAM);
 
@@ -240,7 +240,7 @@ class ImperativeOplogRolloverIntegrationTest {
             if (metrics.probeFailures.get() > 0) {
                 return true;
             }
-            RollingOplogMongoContainer.rollOver(RollingOplogMongoContainer.newestOplogTimestamp());
+            RollingOplogMongoContainer.rollOverEverythingSoFar();
             return false;
         });
     }
@@ -289,7 +289,7 @@ class ImperativeOplogRolloverIntegrationTest {
         void reconcile(HistoryLostContext ctx) {
             reconciliations.add(ctx);
             if (rollsRemaining.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
-                RollingOplogMongoContainer.rollOver(RollingOplogMongoContainer.newestOplogTimestamp());
+                RollingOplogMongoContainer.rollOverEverythingSoFar();
             }
         }
 

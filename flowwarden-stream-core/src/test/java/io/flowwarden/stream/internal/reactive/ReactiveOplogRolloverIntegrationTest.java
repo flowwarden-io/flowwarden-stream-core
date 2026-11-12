@@ -146,7 +146,7 @@ class ReactiveOplogRolloverIntegrationTest {
 
     @Test
     void oplogStart_afterARealRollover_resumesAtTheOldestEntry_andReplaysWhatSurvived() {
-        RollingOplogMongoContainer.rollOver(RollingOplogMongoContainer.newestOplogTimestamp());
+        RollingOplogMongoContainer.rollOverEverythingSoFar();
         reactiveMongoTemplate.insert(new Document("item", "survived"), "rollover_oplog_start_reactive").block();
         saveExpiredCheckpoint(OPLOG_START_STREAM);
 
@@ -226,7 +226,7 @@ class ReactiveOplogRolloverIntegrationTest {
             if (metrics.probeFailures.get() > 0) {
                 return true;
             }
-            RollingOplogMongoContainer.rollOver(RollingOplogMongoContainer.newestOplogTimestamp());
+            RollingOplogMongoContainer.rollOverEverythingSoFar();
             return false;
         });
     }
@@ -276,7 +276,7 @@ class ReactiveOplogRolloverIntegrationTest {
             return Mono.fromRunnable(() -> {
                 reconciliations.add(ctx);
                 if (rollsRemaining.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
-                    RollingOplogMongoContainer.rollOver(RollingOplogMongoContainer.newestOplogTimestamp());
+                    RollingOplogMongoContainer.rollOverEverythingSoFar();
                 }
             });
         }
