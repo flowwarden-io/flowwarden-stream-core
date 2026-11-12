@@ -36,7 +36,8 @@ import java.time.Instant;
  * the {@code initiating set} noop, which the server exempts from the check.
  * {@link #rollOver(BsonTimestamp)} writes to a filler collection until the
  * oplog has truncated past a given timestamp, so a position taken before the
- * call is really gone.</p>
+ * call is really gone — {@link #rollOverEverythingSoFar()} picks a mark that
+ * bounds every position the server may have certified before the call.</p>
  */
 public final class RollingOplogMongoContainer {
 
@@ -75,6 +76,36 @@ public final class RollingOplogMongoContainer {
     }
 
     /**
+     * An upper bound of every timestamp the server has handed out so far: the
+     * newest oplog entry, or the server's own time ({@code operationTime} and
+     * the gossiped {@code $clusterTime}) when it is ahead. A natural scan of
+     * the oplog can trail what the server certifies — the initial
+     * post-batch resume token of an aggregate derives from the node's applied
+     * time, and the latest entries need not be visible to the scan yet — so a
+     * roll past the newest <em>visible</em> entry can leave a position captured
+     * just before the call resumable. The server's time bounds them all.
+     */
+    public static BsonTimestamp serverTimeUpperBound() {
+        Document reply = CLIENT.getDatabase("admin").runCommand(new Document("hello", 1));
+        BsonTimestamp operationTime = reply.get("operationTime", BsonTimestamp.class);
+        Document clusterTime = reply.get("$clusterTime", Document.class);
+        BsonTimestamp gossiped = clusterTime == null ? null : clusterTime.get("clusterTime", BsonTimestamp.class);
+        if (operationTime == null && gossiped == null) {
+            throw new IllegalStateException("hello reply carries neither operationTime nor $clusterTime: " + reply);
+        }
+        return later(later(newestOplogTimestamp(), operationTime), gossiped);
+    }
+
+    /**
+     * Rolls the oplog past {@link #serverTimeUpperBound()}: every position
+     * certified before this call — resume tokens and post-batch resume tokens
+     * included — is gone when it returns.
+     */
+    public static void rollOverEverythingSoFar() {
+        rollOver(serverTimeUpperBound());
+    }
+
+    /**
      * Writes 100 KB documents to a filler collection (a noisy neighbour:
      * never a watched collection) until the oldest oplog entry is newer than
      * {@code mark} — every position at or before the mark has rolled out.
@@ -100,6 +131,16 @@ public final class RollingOplogMongoContainer {
                 throw new IllegalStateException("interrupted while rolling the oplog over", e);
             }
         }
+    }
+
+    private static BsonTimestamp later(BsonTimestamp a, BsonTimestamp b) {
+        if (a == null) {
+            return b;
+        }
+        if (b == null) {
+            return a;
+        }
+        return a.compareTo(b) >= 0 ? a : b;
     }
 
     private static MongoDatabase local() {
