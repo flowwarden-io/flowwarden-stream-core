@@ -30,6 +30,31 @@ public class FlowWardenConfigurationException extends RuntimeException {
         this.action = action;
     }
 
+    static final String MISSING_MONGO_TEMPLATE_DESCRIPTION =
+            "FlowWarden is configured in IMPERATIVE mode but MongoTemplate is not available.";
+    static final String MISSING_MONGO_TEMPLATE_ACTION =
+            "Either:\n"
+                    + "1. Add 'spring-boot-starter-data-mongodb' to your dependencies\n"
+                    + "2. Change 'flowwarden.default-mode' to REACTIVE in your configuration";
+    static final String MISSING_REACTIVE_MONGO_TEMPLATE_DESCRIPTION =
+            "FlowWarden is configured in REACTIVE mode but ReactiveMongoTemplate is not available.";
+    static final String MISSING_REACTIVE_MONGO_TEMPLATE_ACTION =
+            "Either:\n"
+                    + "1. Add 'spring-boot-starter-data-mongodb-reactive' to your dependencies\n"
+                    + "2. Change 'flowwarden.default-mode' to IMPERATIVE in your configuration";
+
+    /** IMPERATIVE mode configured, no {@code MongoTemplate} to run it on. */
+    public static FlowWardenConfigurationException missingMongoTemplate() {
+        return new FlowWardenConfigurationException(
+                MISSING_MONGO_TEMPLATE_DESCRIPTION, MISSING_MONGO_TEMPLATE_ACTION);
+    }
+
+    /** REACTIVE mode configured, no {@code ReactiveMongoTemplate} to run it on. */
+    public static FlowWardenConfigurationException missingReactiveMongoTemplate() {
+        return new FlowWardenConfigurationException(
+                MISSING_REACTIVE_MONGO_TEMPLATE_DESCRIPTION, MISSING_REACTIVE_MONGO_TEMPLATE_ACTION);
+    }
+
     public String getDescription() {
         return description;
     }
