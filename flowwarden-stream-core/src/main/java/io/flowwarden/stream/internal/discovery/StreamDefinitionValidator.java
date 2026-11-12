@@ -90,13 +90,10 @@ final class StreamDefinitionValidator {
                             + "regular traffic.",
                     subject);
         }
-        if (saveIntervalSeconds == 0 && saveEveryN > 1 && idleHeartbeatIntervalSeconds == 0) {
-            log.warn("@Checkpoint on {} has saveIntervalSeconds=0, idleHeartbeatIntervalSeconds=0 "
-                            + "and saveEveryN={} — lastSeenToken never advances, so the resume "
-                            + "cascade level-2 safety net (fallback to lastSeenToken when "
-                            + "lastProcessedToken ages out) will not work.",
-                    subject, saveEveryN);
-        }
+        // No warning ties saveEveryN / saveIntervalSeconds to lastSeenToken: those two only
+        // pace lastProcessedToken, and the idle heartbeat probe is the sole writer of
+        // lastSeenToken — the idleHeartbeatIntervalSeconds == 0 warning above is the one
+        // that matters for a position that must survive an idle period.
     }
 
     /**

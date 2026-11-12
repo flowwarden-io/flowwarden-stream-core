@@ -1,2 +1,3 @@
 org.springframework.boot.diagnostics.FailureAnalyzer=\
-  io.flowwarden.stream.autoconfigure.FlowWardenFailureAnalyzer
+  io.flowwarden.stream.autoconfigure.FlowWardenFailureAnalyzer,\
+  io.flowwarden.stream.autoconfigure.FlowWardenMissingTemplateFailureAnalyzer

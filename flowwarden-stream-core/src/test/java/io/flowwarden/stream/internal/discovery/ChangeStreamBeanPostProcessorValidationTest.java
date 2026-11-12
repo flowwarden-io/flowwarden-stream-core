@@ -22,6 +22,7 @@ import ch.qos.logback.core.read.ListAppender;
 import io.flowwarden.stream.ChangeStreamContext;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.annotation.ChangeStream;
+import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.OnChange;
 import io.flowwarden.stream.annotation.OnDelete;
 import io.flowwarden.stream.annotation.OnInsert;
@@ -203,6 +204,39 @@ class ChangeStreamBeanPostProcessorValidationTest {
         @OnInsert
         @OnUpdate
         void handle(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    // --- @Checkpoint cadence warnings ---
+
+    @Test
+    void checkpointWithoutIdleProbe_warnsOnceAboutTheIdleProbe_andNeverAboutLastSeenToken() {
+        // saveEveryN / saveIntervalSeconds pace lastProcessedToken only; the idle heartbeat probe
+        // is the sole writer of lastSeenToken. The warning set must say exactly that: one WARN on
+        // idleHeartbeatIntervalSeconds=0, and no obsolete line tying the save cadence to lastSeenToken.
+        Logger validatorLogger = (Logger) LoggerFactory.getLogger(StreamDefinitionValidator.class);
+        ListAppender<ILoggingEvent> listAppender = new ListAppender<>();
+        listAppender.start();
+        validatorLogger.addAppender(listAppender);
+
+        try {
+            contextRunner
+                    .withUserConfiguration(NoIdleProbeCheckpointConfig.class)
+                    .run(context -> {
+                        assertThat(context).hasNotFailed();
+
+                        var warnings = listAppender.list.stream()
+                                .filter(event -> event.getLevel() == Level.WARN)
+                                .map(ILoggingEvent::getFormattedMessage)
+                                .toList();
+                        assertThat(warnings)
+                                .hasSize(1)
+                                .allSatisfy(message -> assertThat(message)
+                                        .contains("idleHeartbeatIntervalSeconds=0")
+                                        .doesNotContain("lastSeenToken"));
+                    });
+        } finally {
+            validatorLogger.detachAppender(listAppender);
         }
     }
 
@@ -851,6 +885,22 @@ class ChangeStreamBeanPostProcessorValidationTest {
 
         @OnUpdate
         void onUpdate(ChangeStreamContext<?> ctx) {
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class NoIdleProbeCheckpointConfig {
+        @Bean
+        NoIdleProbeCheckpointHandler noIdleProbeCheckpointHandler() {
+            return new NoIdleProbeCheckpointHandler();
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    @Checkpoint(saveEveryN = 5, saveIntervalSeconds = 0, idleHeartbeatIntervalSeconds = 0)
+    static class NoIdleProbeCheckpointHandler {
+        @OnInsert
+        void onInsert(ChangeStreamContext<?> ctx) {
         }
     }
 }

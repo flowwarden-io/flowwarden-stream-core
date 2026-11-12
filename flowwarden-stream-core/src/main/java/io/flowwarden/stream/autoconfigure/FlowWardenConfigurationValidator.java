@@ -18,6 +18,7 @@ package io.flowwarden.stream.autoconfigure;
 import io.flowwarden.stream.config.ExecutionMode;
 import io.flowwarden.stream.config.FlowWardenProperties;
 import io.flowwarden.stream.internal.discovery.ChangeStreamBeanPostProcessor;
+import io.flowwarden.stream.registration.StreamDefinitionContributor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.SmartInitializingSingleton;
@@ -31,6 +32,18 @@ import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
  * <p>Checks that {@code flowwarden.default-mode} is set and that the corresponding
  * MongoDB template bean is available. Throws {@link FlowWardenConfigurationException}
  * with clear messages when validation fails.</p>
+ *
+ * <p>The checks run as soon as the application declares at least one stream, whether
+ * through a {@code @ChangeStream} bean or a {@link StreamDefinitionContributor} bean —
+ * the fail-fast exists for the application that has streams to run, not for a class
+ * path that merely carries the library.</p>
+ *
+ * <p>In an application assembled by the mode auto-configuration this callback is rarely the
+ * first to notice a missing template: the mode-specific defaults ({@code checkpointStore},
+ * {@code lockService}, …) are built on that template and fail first, with Spring's
+ * {@code NoSuchBeanDefinitionException}. {@link FlowWardenMissingTemplateFailureAnalyzer}
+ * explains that failure with the same description and action, so the user sees one
+ * diagnosis either way.</p>
  */
 public class FlowWardenConfigurationValidator implements SmartInitializingSingleton {
 
@@ -47,8 +60,8 @@ public class FlowWardenConfigurationValidator implements SmartInitializingSingle
 
     @Override
     public void afterSingletonsInstantiated() {
-        // Only validate if at least one @ChangeStream bean was discovered
-        if (!hasChangeStreamBeans()) {
+        // Only validate when the application declares streams — annotated or contributed.
+        if (!hasChangeStreamBeans() && !hasStreamContributors()) {
             return;
         }
 
@@ -62,22 +75,12 @@ public class FlowWardenConfigurationValidator implements SmartInitializingSingle
 
         if (mode == ExecutionMode.IMPERATIVE
                 && applicationContext.getBeanNamesForType(MongoTemplate.class).length == 0) {
-            throw new FlowWardenConfigurationException(
-                    "FlowWarden is configured in IMPERATIVE mode but MongoTemplate is not available.",
-                    "Either:\n"
-                            + "1. Add 'spring-boot-starter-data-mongodb' to your dependencies\n"
-                            + "2. Change 'flowwarden.default-mode' to REACTIVE in your configuration"
-            );
+            throw FlowWardenConfigurationException.missingMongoTemplate();
         }
 
         if (mode == ExecutionMode.REACTIVE
                 && applicationContext.getBeanNamesForType(ReactiveMongoTemplate.class).length == 0) {
-            throw new FlowWardenConfigurationException(
-                    "FlowWarden is configured in REACTIVE mode but ReactiveMongoTemplate is not available.",
-                    "Either:\n"
-                            + "1. Add 'spring-boot-starter-data-mongodb-reactive' to your dependencies\n"
-                            + "2. Change 'flowwarden.default-mode' to IMPERATIVE in your configuration"
-            );
+            throw FlowWardenConfigurationException.missingReactiveMongoTemplate();
         }
     }
 
@@ -90,5 +93,14 @@ public class FlowWardenConfigurationValidator implements SmartInitializingSingle
             }
         }
         return false;
+    }
+
+    /**
+     * A contributor bean is enough: its streams are only materialized later by
+     * {@code StreamContributorProcessor}, and the checks here depend on the
+     * configured mode, not on what it will contribute.
+     */
+    private boolean hasStreamContributors() {
+        return applicationContext.getBeanNamesForType(StreamDefinitionContributor.class).length > 0;
     }
 }
