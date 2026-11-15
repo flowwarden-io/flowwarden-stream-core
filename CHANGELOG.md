@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `flowwarden-bom` pins the satellites released on this core line: `flowwarden-javers`, `flowwarden-redis` and `flowwarden-amqp` `1.0.0-rc.4` (all built against stream-core `1.0.0-rc.8`), replacing the rc.3 pins that were built against rc.7.
+
 ## [1.0.0-rc.8] — 2026-11-15
 
 ### Added
