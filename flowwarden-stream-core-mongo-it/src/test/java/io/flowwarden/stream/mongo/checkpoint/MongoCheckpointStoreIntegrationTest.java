@@ -13,16 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.checkpoint;
+package io.flowwarden.stream.mongo.checkpoint;
 
-import com.mongodb.reactivestreams.client.MongoClients;
+import com.mongodb.client.MongoClients;
 import io.flowwarden.stream.spi.Checkpoint;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.testkit.CheckpointStoreContractTest;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.BsonDocument;
 import org.junit.jupiter.api.Test;
-import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
+import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.query.Query;
 
 import java.time.Instant;
@@ -32,21 +32,21 @@ import java.util.Collections;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 
-class ReactiveMongoCheckpointStoreIntegrationTest extends CheckpointStoreContractTest {
+class MongoCheckpointStoreIntegrationTest extends CheckpointStoreContractTest {
 
-    private ReactiveMongoTemplate reactiveMongoTemplate;
+    private MongoTemplate mongoTemplate;
 
     @Override
     protected CheckpointStore createCheckpointStore() {
-        return new ReactiveMongoCheckpointStore(reactiveMongoTemplate);
+        return new MongoCheckpointStore(mongoTemplate);
     }
 
     @Override
     protected void cleanState() {
-        reactiveMongoTemplate = new ReactiveMongoTemplate(
+        mongoTemplate = new MongoTemplate(
                 MongoClients.create(SharedMongoContainer.MONGO.getReplicaSetUrl()), "test"
         );
-        reactiveMongoTemplate.remove(new Query(), MongoCheckpointStore.COLLECTION).block();
+        mongoTemplate.remove(new Query(), MongoCheckpointStore.COLLECTION);
     }
 
     @Test

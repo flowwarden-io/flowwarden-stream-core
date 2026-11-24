@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.lock;
+package io.flowwarden.stream.mongo.lock;
 
 import io.flowwarden.stream.spi.LockService;
 import io.flowwarden.stream.test.SharedMongoContainer;

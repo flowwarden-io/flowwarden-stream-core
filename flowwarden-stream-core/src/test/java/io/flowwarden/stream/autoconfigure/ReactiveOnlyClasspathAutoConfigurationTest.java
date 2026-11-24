@@ -22,7 +22,7 @@ import io.flowwarden.stream.annotation.EnableFlowWarden;
 import io.flowwarden.stream.annotation.OnChange;
 import io.flowwarden.stream.core.FlowWardenStreamManager;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
-import io.flowwarden.stream.internal.lock.ReactiveMongoLockService;
+import io.flowwarden.stream.mongo.lock.ReactiveMongoLockService;
 import io.flowwarden.stream.internal.reactive.ReactiveStreamManager;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqStore;

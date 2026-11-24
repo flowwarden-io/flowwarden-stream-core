@@ -49,4 +49,9 @@ final class NoOpLockService implements LockService {
     public Optional<LockState> getLockState(String streamName) {
         return Optional.empty();
     }
+
+    @Override
+    public String backendDescription() {
+        return "none (no-op)";
+    }
 }

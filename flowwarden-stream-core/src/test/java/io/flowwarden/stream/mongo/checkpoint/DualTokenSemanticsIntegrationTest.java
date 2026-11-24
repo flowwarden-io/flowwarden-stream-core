@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.checkpoint;
+package io.flowwarden.stream.mongo.checkpoint;
 
 import com.mongodb.client.MongoClients;
 import io.flowwarden.stream.spi.Checkpoint;

@@ -50,4 +50,9 @@ final class NoOpDlqStore implements DlqStore {
         // SPI default (-1), which means "cannot count".
         return 0;
     }
+
+    @Override
+    public String backendDescription() {
+        return "none (no-op)";
+    }
 }

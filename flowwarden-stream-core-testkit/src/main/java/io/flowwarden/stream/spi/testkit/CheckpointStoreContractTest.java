@@ -28,6 +28,8 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -64,6 +66,23 @@ public abstract class CheckpointStoreContractTest {
     void setUpContract() {
         cleanState();
         store = createCheckpointStore();
+    }
+
+    /**
+     * The description feeds the {@code FlowWarden state: …} line logged at startup:
+     * it must be usable as one token of a log line, whatever the backend — the
+     * class-name default or an override naming the database, keyspace or exchange.
+     */
+    @Test
+    void backendDescription_isAStableSingleLine() {
+        String description = store.backendDescription();
+
+        assertNotNull(description, "the description is never null");
+        assertFalse(description.isBlank(), "the description is not blank");
+        assertFalse(description.contains("\n") || description.contains("\r"),
+                "the description is a single line");
+        assertEquals(description, store.backendDescription(),
+                "describing the store twice gives the same answer");
     }
 
     @Test

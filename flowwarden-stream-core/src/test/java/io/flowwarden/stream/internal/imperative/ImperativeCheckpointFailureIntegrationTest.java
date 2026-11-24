@@ -222,7 +222,7 @@ class ImperativeCheckpointFailureIntegrationTest {
         @Primary
         FailingCheckpointStore failingCheckpointStore(MongoTemplate template) {
             return new FailingCheckpointStore(
-                    new io.flowwarden.stream.internal.checkpoint.MongoCheckpointStore(template));
+                    new io.flowwarden.stream.mongo.checkpoint.MongoCheckpointStore(template));
         }
     }
 

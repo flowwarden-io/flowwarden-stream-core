@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.dlq;
+package io.flowwarden.stream.mongo.dlq;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
@@ -24,7 +24,10 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * stream class via {@code @MongoDlqOptions} — there is no per-stream YAML
  * configuration.</p>
  *
- * <p>This class is internal and not part of the public API.</p>
+ * <p>Public API: the auto-configuration registers it as a bean, and it is the
+ * second constructor argument of {@link MongoDlqStore} and
+ * {@link ReactiveMongoDlqStore} for an application that redeclares the
+ * {@code DlqStore} bean on another template.</p>
  */
 @ConfigurationProperties("flowwarden.dlq.mongo")
 public class MongoDlqProperties {

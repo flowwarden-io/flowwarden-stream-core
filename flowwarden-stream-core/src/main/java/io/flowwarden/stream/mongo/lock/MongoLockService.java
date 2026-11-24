@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.lock;
+package io.flowwarden.stream.mongo.lock;
 
 import com.mongodb.MongoWriteException;
 import com.mongodb.client.MongoCollection;
@@ -36,12 +36,32 @@ import java.util.Optional;
  * {@code DeploymentMode.SINGLE_LEADER} in IMPERATIVE mode.
  *
  * <p>Uses an atomic {@code findOneAndUpdate} on the {@code _fw_locks} collection so only
- * one instance holds a lock for a given stream at any time. The collection name is internal
- * to this implementation — the SPI does not expose it.</p>
+ * one instance holds a lock for a given stream at any time. The collection lives in the
+ * database of the {@link MongoTemplate} this service is built on; its name is a detail of
+ * this implementation — the SPI does not expose it.</p>
  *
- * <p>Shares its document layout and lease protocol ({@link MongoLockDocuments}) with
- * {@link ReactiveMongoLockService}: instances of both implementations can contend for the
- * same lease on the same collection.</p>
+ * <p>Shares its document layout and lease protocol with {@link ReactiveMongoLockService}:
+ * instances of both implementations can contend for the same lease on the same
+ * collection. Every instance of an application must therefore build its lock service on
+ * the same database — two instances looking at two databases would each elect a leader.</p>
+ *
+ * <p>Public API. The auto-configuration builds this service on the application's
+ * default {@code MongoTemplate}; to keep the FlowWarden state in another database,
+ * declare the bean yourself on the template of that database — the
+ * auto-configured one backs off:</p>
+ *
+ * <pre>{@code
+ * @Bean
+ * LockService lockService(@Qualifier("stateMongoTemplate") MongoTemplate template) {
+ *     return new MongoLockService(template);
+ * }
+ * }</pre>
+ *
+ * <p>The three state beans ({@code CheckpointStore}, {@code DlqStore},
+ * {@code LockService}) are independent: redeclare all three to move the whole
+ * state, and check the {@code FlowWarden state: …} line logged at startup.
+ * {@code @ChangeStream(mongoTemplateRef = …)} selects the template a stream
+ * <em>watches</em>; it does not move the state.</p>
  */
 public class MongoLockService implements LockService {
 
@@ -51,8 +71,23 @@ public class MongoLockService implements LockService {
 
     private final MongoTemplate mongoTemplate;
 
+    /**
+     * @param mongoTemplate the template whose database receives {@code _fw_locks}
+     */
     public MongoLockService(MongoTemplate mongoTemplate) {
         this.mongoTemplate = mongoTemplate;
+    }
+
+    /**
+     * {@code mongo[<database>]}: the database of the template this service was built on.
+     */
+    @Override
+    public String backendDescription() {
+        try {
+            return "mongo[" + mongoTemplate.getDb().getName() + "]";
+        } catch (RuntimeException e) {
+            return "mongo[?]";
+        }
     }
 
     @Override

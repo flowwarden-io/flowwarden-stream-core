@@ -13,39 +13,47 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.lock;
+package io.flowwarden.stream.mongo.lock;
 
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoClients;
+import com.mongodb.reactivestreams.client.MongoClient;
+import com.mongodb.reactivestreams.client.MongoClients;
 import io.flowwarden.stream.spi.LockService;
 import io.flowwarden.stream.spi.testkit.LockServiceContractTest;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
 import org.springframework.data.mongodb.core.query.Query;
+import reactor.core.publisher.Mono;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class MongoLockServiceIntegrationTest extends LockServiceContractTest {
+/**
+ * {@link ReactiveMongoLockService} against the shared {@link LockServiceContractTest},
+ * plus the expiry / takeover cases that need the backing document edited in place —
+ * the same extra cases as {@code MongoLockServiceIntegrationTest}.
+ */
+class ReactiveMongoLockServiceIntegrationTest extends LockServiceContractTest {
 
-    private MongoClient mongoClient;
-    private MongoTemplate mongoTemplate;
+    private final List<MongoClient> openClients = new ArrayList<>();
+    private ReactiveMongoTemplate reactiveMongoTemplate;
 
     @Override
     protected LockService createLockService() {
         ensureTemplate();
-        return new MongoLockService(mongoTemplate);
+        return new ReactiveMongoLockService(reactiveMongoTemplate);
     }
 
     @Override
     protected void cleanState() {
         ensureTemplate();
-        mongoTemplate.remove(new Query(), MongoLockService.COLLECTION);
+        reactiveMongoTemplate.remove(new Query(), ReactiveMongoLockService.COLLECTION).block();
     }
 
     @Override
@@ -55,24 +63,29 @@ class MongoLockServiceIntegrationTest extends LockServiceContractTest {
     }
 
     @AfterEach
-    void closeClient() {
-        if (mongoClient != null) {
-            mongoClient.close();
-            mongoClient = null;
-            mongoTemplate = null;
+    void closeClients() {
+        for (MongoClient client : openClients) {
+            client.close();
         }
+        openClients.clear();
+        reactiveMongoTemplate = null;
     }
 
     private void ensureTemplate() {
-        if (mongoTemplate == null) {
-            mongoClient = MongoClients.create(SharedMongoContainer.MONGO.getReplicaSetUrl());
-            mongoTemplate = new MongoTemplate(mongoClient, "test-locks");
+        if (reactiveMongoTemplate == null) {
+            reactiveMongoTemplate = new ReactiveMongoTemplate(
+                    openClient(SharedMongoContainer.MONGO.getReplicaSetUrl()), "test-locks-reactive");
         }
+    }
+
+    private MongoClient openClient(String connectionString) {
+        MongoClient client = MongoClients.create(connectionString);
+        openClients.add(client);
+        return client;
     }
 
     @Test
     void tryAcquire_succeedsIfLockExpired() {
-        // Acquire then manually expire by editing the document in place
         lockService.tryAcquire("my-stream", INSTANCE_A, TTL);
         expireInPlace("my-stream");
 
@@ -112,19 +125,35 @@ class MongoLockServiceIntegrationTest extends LockServiceContractTest {
         assertThat(lockService.getLockState("my-stream")).isEmpty();
     }
 
+    @Test
+    void tryAcquire_returnsFalseInsteadOfThrowingWhenTheBackendIsUnreachable() {
+        // Error contract of the SPI: a transient backend error is a false, not a throw.
+        ReactiveMongoTemplate unreachable = new ReactiveMongoTemplate(
+                openClient("mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200"),
+                "unreachable");
+        LockService service = new ReactiveMongoLockService(unreachable);
+
+        assertThat(service.tryAcquire("my-stream", INSTANCE_A, TTL)).isFalse();
+        assertThat(service.renew("my-stream", INSTANCE_A, TTL)).isFalse();
+        assertThat(service.getLockState("my-stream")).isEmpty();
+    }
+
     private void expireInPlace(String streamName) {
         updateInPlace(streamName,
                 new Document("expiresAt", Date.from(Instant.now().minusSeconds(10))));
     }
 
     private void updateInPlace(String streamName, Document fields) {
-        mongoTemplate.getDb().getCollection(MongoLockService.COLLECTION)
-                .updateOne(new Document("_id", streamName), new Document("$set", fields));
+        reactiveMongoTemplate.getCollection(ReactiveMongoLockService.COLLECTION)
+                .flatMap(collection -> Mono.from(collection.updateOne(
+                        new Document("_id", streamName),
+                        new Document("$set", fields))))
+                .block();
     }
 
     private Date storedExpiresAt(String streamName) {
-        Document doc = mongoTemplate.getDb().getCollection(MongoLockService.COLLECTION)
-                .find(new Document("_id", streamName)).first();
+        Document doc = reactiveMongoTemplate.findById(streamName, Document.class,
+                ReactiveMongoLockService.COLLECTION).block();
         assertThat(doc).isNotNull();
         return doc.getDate("expiresAt");
     }
