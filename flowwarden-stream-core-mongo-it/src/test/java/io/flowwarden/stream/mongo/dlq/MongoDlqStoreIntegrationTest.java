@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.dlq;
+package io.flowwarden.stream.mongo.dlq;
 
 import com.mongodb.client.MongoClients;
 import io.flowwarden.stream.spi.DlqStore;

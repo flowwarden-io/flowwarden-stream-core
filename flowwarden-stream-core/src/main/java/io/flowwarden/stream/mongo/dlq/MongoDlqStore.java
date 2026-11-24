@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.dlq;
+package io.flowwarden.stream.mongo.dlq;
 
 import io.flowwarden.stream.spi.DlqPolicy;
 import io.flowwarden.stream.spi.DlqStore;
@@ -50,7 +50,27 @@ import java.util.concurrent.ConcurrentMap;
  * {@link MongoDlqProperties}. Registering a stream also creates the TTL
  * index on {@code expiresAt} for that collection.</p>
  *
- * <p>This class is internal and not part of the public API.</p>
+ * <p>The collections live in the database of the {@link MongoTemplate} this
+ * store is built on. {@link ReactiveMongoDlqStore} writes the same documents.</p>
+ *
+ * <p>Public API. The auto-configuration builds this store on the application's
+ * default {@code MongoTemplate}; to keep the FlowWarden state in another database,
+ * declare the bean yourself on the template of that database — the
+ * auto-configured one backs off:</p>
+ *
+ * <pre>{@code
+ * @Bean
+ * DlqStore dlqStore(@Qualifier("stateMongoTemplate") MongoTemplate template,
+ *                   MongoDlqProperties properties) {
+ *     return new MongoDlqStore(template, properties);
+ * }
+ * }</pre>
+ *
+ * <p>The three state beans ({@code CheckpointStore}, {@code DlqStore},
+ * {@code LockService}) are independent: redeclare all three to move the whole
+ * state, and check the {@code FlowWarden state: …} line logged at startup.
+ * {@code @ChangeStream(mongoTemplateRef = …)} selects the template a stream
+ * <em>watches</em>; it does not move the state.</p>
  */
 public class MongoDlqStore implements DlqStore {
 
@@ -61,9 +81,26 @@ public class MongoDlqStore implements DlqStore {
     private final ConcurrentMap<String, String> streamToCollection = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Boolean> indexesCreated = new ConcurrentHashMap<>();
 
+    /**
+     * @param mongoTemplate the template whose database receives the DLQ collections
+     * @param properties    backend defaults ({@code flowwarden.dlq.mongo.*}) — the
+     *                      auto-configured bean can be injected as is
+     */
     public MongoDlqStore(MongoTemplate mongoTemplate, MongoDlqProperties properties) {
         this.mongoTemplate = mongoTemplate;
         this.defaultCollection = properties.getCollection();
+    }
+
+    /**
+     * {@code mongo[<database>]}: the database of the template this store was built on.
+     */
+    @Override
+    public String backendDescription() {
+        try {
+            return "mongo[" + mongoTemplate.getDb().getName() + "]";
+        } catch (RuntimeException e) {
+            return "mongo[?]";
+        }
     }
 
     @Override

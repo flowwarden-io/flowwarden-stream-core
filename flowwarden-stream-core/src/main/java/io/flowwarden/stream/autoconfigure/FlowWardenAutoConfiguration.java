@@ -19,6 +19,11 @@ import io.flowwarden.stream.config.FlowWardenProperties;
 import io.flowwarden.stream.internal.discovery.ChangeStreamBeanPostProcessor;
 import io.flowwarden.stream.internal.discovery.StreamContributorProcessor;
 import io.flowwarden.stream.internal.discovery.StreamRegistry;
+import io.flowwarden.stream.internal.StateBackendReporter;
+import io.flowwarden.stream.spi.CheckpointStore;
+import io.flowwarden.stream.spi.DlqStore;
+import io.flowwarden.stream.spi.LockService;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.ApplicationContext;
@@ -52,5 +57,17 @@ public class FlowWardenAutoConfiguration {
             ApplicationContext applicationContext,
             StreamRegistry registry) {
         return new StreamContributorProcessor(applicationContext, registry);
+    }
+
+    /**
+     * Logs once, whatever the execution mode and the backends, where the checkpoints,
+     * the dead-letter entries and the locks live.
+     */
+    @Bean
+    public StateBackendReporter flowWardenStateBackendReporter(
+            ObjectProvider<CheckpointStore> checkpointStore,
+            ObjectProvider<DlqStore> dlqStore,
+            ObjectProvider<LockService> lockService) {
+        return new StateBackendReporter(checkpointStore, dlqStore, lockService);
     }
 }

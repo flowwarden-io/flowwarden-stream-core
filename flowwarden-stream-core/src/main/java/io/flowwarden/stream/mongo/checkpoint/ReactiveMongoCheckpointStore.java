@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.checkpoint;
+package io.flowwarden.stream.mongo.checkpoint;
 
 import io.flowwarden.stream.spi.Checkpoint;
 import io.flowwarden.stream.spi.CheckpointStore;
@@ -31,21 +31,58 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * {@link ReactiveMongoTemplate}-backed implementation of {@link CheckpointStore}.
+ * MongoDB-backed {@link CheckpointStore} on the reactive streams driver — the
+ * default in REACTIVE mode.
  *
  * <p>Uses blocking {@code .block()} calls because the {@link CheckpointStore} SPI
  * is synchronous. This is acceptable since checkpoint saves are lightweight
- * single-document upserts.</p>
+ * single-document upserts. Nothing here touches the synchronous driver.</p>
  *
  * <p>Stores checkpoints in the {@value MongoCheckpointStore#COLLECTION} collection
- * (same collection and format as the imperative variant).</p>
+ * of the database of the {@link ReactiveMongoTemplate} it is built on (same
+ * collection and format as {@link MongoCheckpointStore}).</p>
+ *
+ * <p>Public API. The auto-configuration builds this store on the application's
+ * default {@code ReactiveMongoTemplate}; to keep the FlowWarden state in another database,
+ * declare the bean yourself on the template of that database — the
+ * auto-configured one backs off:</p>
+ *
+ * <pre>{@code
+ * @Bean
+ * CheckpointStore checkpointStore(@Qualifier("stateMongoTemplate") ReactiveMongoTemplate template) {
+ *     return new ReactiveMongoCheckpointStore(template);
+ * }
+ * }</pre>
+ *
+ * <p>The three state beans ({@code CheckpointStore}, {@code DlqStore},
+ * {@code LockService}) are independent: redeclare all three to move the whole
+ * state, and check the {@code FlowWarden state: …} line logged at startup.
+ * {@code @ChangeStream(mongoTemplateRef = …)} selects the template a stream
+ * <em>watches</em>; it does not move the state.</p>
  */
 public class ReactiveMongoCheckpointStore implements CheckpointStore {
 
     private final ReactiveMongoTemplate reactiveMongoTemplate;
 
+    /**
+     * @param reactiveMongoTemplate the template whose database receives {@code _fw_checkpoints}
+     */
     public ReactiveMongoCheckpointStore(ReactiveMongoTemplate reactiveMongoTemplate) {
         this.reactiveMongoTemplate = reactiveMongoTemplate;
+    }
+
+    /**
+     * {@code mongo[<database>]}: the database of the template this store was built on.
+     */
+    @Override
+    public String backendDescription() {
+        try {
+            return "mongo[" + reactiveMongoTemplate.getMongoDatabase()
+                    .map(com.mongodb.reactivestreams.client.MongoDatabase::getName)
+                    .block(java.time.Duration.ofSeconds(5)) + "]";
+        } catch (RuntimeException e) {
+            return "mongo[?]";
+        }
     }
 
     @Override

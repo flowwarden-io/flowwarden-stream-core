@@ -20,7 +20,7 @@ import io.flowwarden.stream.annotation.ChangeStream;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.EnableFlowWarden;
 import io.flowwarden.stream.annotation.OnInsert;
-import io.flowwarden.stream.internal.checkpoint.MongoCheckpointStore;
+import io.flowwarden.stream.mongo.checkpoint.MongoCheckpointStore;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.BsonDocument;

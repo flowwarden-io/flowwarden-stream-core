@@ -115,6 +115,29 @@ public interface LockService {
     }
 
     /**
+     * Short, human-readable description of where this service keeps the leader leases: the backend and,
+     * when it has one, the place inside it — {@code mongo[orders]}, {@code redis[fw:]}.
+     *
+     * <p>Read once at startup for the {@code FlowWarden state: …} log line, which
+     * shows side by side where the checkpoints, the dead-letter entries and the
+     * locks live, so that a state split across two backends or two databases by
+     * an incomplete redeclaration is visible. Purely informational: nothing in the
+     * runtime branches on the value.</p>
+     *
+     * <p>Implementations should return a short single-line value, never
+     * {@code null}, without credentials (a database or keyspace name, not a
+     * connection string), and should not throw. The default is the simple class
+     * name of the implementation; a decorator or a composite may want to name
+     * its delegates.</p>
+     *
+     * @return the backend description, never {@code null}
+     */
+    default String backendDescription() {
+        String simpleName = getClass().getSimpleName();
+        return simpleName.isEmpty() ? getClass().getName() : simpleName;
+    }
+
+    /**
      * Returns the shared no-op implementation that always grants the lock to the caller.
      *
      * <p>Suitable for tests and for {@code DeploymentMode.ALL_INSTANCES} setups where no

@@ -20,7 +20,7 @@ import io.flowwarden.stream.annotation.ChangeStream;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.EnableFlowWarden;
 import io.flowwarden.stream.annotation.OnInsert;
-import io.flowwarden.stream.internal.dlq.MongoDlqStore;
+import io.flowwarden.stream.mongo.dlq.MongoDlqStore;
 import io.flowwarden.stream.spi.DlqStore;
 import io.flowwarden.stream.spi.FailedEvent;
 import io.flowwarden.stream.test.SharedMongoContainer;

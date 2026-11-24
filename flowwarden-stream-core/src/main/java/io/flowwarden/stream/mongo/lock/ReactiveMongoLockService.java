@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.lock;
+package io.flowwarden.stream.mongo.lock;
 
 import com.mongodb.MongoWriteException;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
@@ -44,9 +44,28 @@ import java.util.Optional;
  * {@code spring-boot-starter-data-mongodb-reactive}: nothing here touches the
  * synchronous driver.</p>
  *
- * <p>Shares its document layout and lease protocol ({@link MongoLockDocuments}) with
- * {@link MongoLockService}: an imperative instance and a reactive instance can contend
- * for the same lease on the same {@code _fw_locks} collection, and exactly one wins.</p>
+ * <p>Shares its document layout and lease protocol with {@link MongoLockService}: an
+ * imperative instance and a reactive instance can contend for the same lease on the same
+ * {@code _fw_locks} collection, and exactly one wins. Every instance of an application must
+ * therefore build its lock service on the same database.</p>
+ *
+ * <p>Public API. The auto-configuration builds this service on the application's
+ * default {@code ReactiveMongoTemplate}; to keep the FlowWarden state in another database,
+ * declare the bean yourself on the template of that database — the
+ * auto-configured one backs off:</p>
+ *
+ * <pre>{@code
+ * @Bean
+ * LockService lockService(@Qualifier("stateMongoTemplate") ReactiveMongoTemplate template) {
+ *     return new ReactiveMongoLockService(template);
+ * }
+ * }</pre>
+ *
+ * <p>The three state beans ({@code CheckpointStore}, {@code DlqStore},
+ * {@code LockService}) are independent: redeclare all three to move the whole
+ * state, and check the {@code FlowWarden state: …} line logged at startup.
+ * {@code @ChangeStream(mongoTemplateRef = …)} selects the template a stream
+ * <em>watches</em>; it does not move the state.</p>
  */
 public class ReactiveMongoLockService implements LockService {
 
@@ -56,8 +75,25 @@ public class ReactiveMongoLockService implements LockService {
 
     private final ReactiveMongoTemplate reactiveMongoTemplate;
 
+    /**
+     * @param reactiveMongoTemplate the template whose database receives {@code _fw_locks}
+     */
     public ReactiveMongoLockService(ReactiveMongoTemplate reactiveMongoTemplate) {
         this.reactiveMongoTemplate = reactiveMongoTemplate;
+    }
+
+    /**
+     * {@code mongo[<database>]}: the database of the template this service was built on.
+     */
+    @Override
+    public String backendDescription() {
+        try {
+            return "mongo[" + reactiveMongoTemplate.getMongoDatabase()
+                    .map(com.mongodb.reactivestreams.client.MongoDatabase::getName)
+                    .block(java.time.Duration.ofSeconds(5)) + "]";
+        } catch (RuntimeException e) {
+            return "mongo[?]";
+        }
     }
 
     @Override

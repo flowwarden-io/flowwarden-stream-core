@@ -22,7 +22,7 @@ import io.flowwarden.stream.annotation.EnableFlowWarden;
 import io.flowwarden.stream.annotation.Filter;
 import io.flowwarden.stream.annotation.OnInsert;
 import io.flowwarden.stream.annotation.RetryPolicy;
-import io.flowwarden.stream.internal.checkpoint.MongoCheckpointStore;
+import io.flowwarden.stream.mongo.checkpoint.MongoCheckpointStore;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.BsonDocument;
 import org.bson.Document;

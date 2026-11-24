@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.flowwarden.stream.internal.checkpoint;
+package io.flowwarden.stream.mongo.checkpoint;
 
 import io.flowwarden.stream.spi.Checkpoint;
 import io.flowwarden.stream.spi.CheckpointStore;
@@ -31,8 +31,35 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * MongoDB-backed implementation of {@link CheckpointStore}.
- * Stores checkpoints in the {@code _fw_checkpoints} collection.
+ * MongoDB-backed {@link CheckpointStore} on the synchronous driver — the
+ * default in IMPERATIVE mode.
+ *
+ * <p>Stores one document per stream, keyed by the stream name, in the
+ * {@code _fw_checkpoints} collection of the database of the
+ * {@link MongoTemplate} it is built on. Every targeted write is a single
+ * atomic update. {@link ReactiveMongoCheckpointStore} reads and writes the
+ * same collection in the same format.</p>
+ *
+ * <p>Public API. The auto-configuration builds this store on the application's
+ * default {@code MongoTemplate}; to keep the FlowWarden state in another database,
+ * declare the bean yourself on the template of that database — the
+ * auto-configured one backs off:</p>
+ *
+ * <pre>{@code
+ * @Bean
+ * CheckpointStore checkpointStore(@Qualifier("stateMongoTemplate") MongoTemplate template) {
+ *     return new MongoCheckpointStore(template);
+ * }
+ * }</pre>
+ *
+ * <p>The three state beans ({@code CheckpointStore}, {@code DlqStore},
+ * {@code LockService}) are independent: redeclare all three to move the whole
+ * state, and check the {@code FlowWarden state: …} line logged at startup.
+ * {@code @ChangeStream(mongoTemplateRef = …)} selects the template a stream
+ * <em>watches</em>; it does not move the state.</p>
+ *
+ * <p>When the checkpoints and a handler's writes go through different database
+ * factories, they do not share a transaction.</p>
  */
 public class MongoCheckpointStore implements CheckpointStore {
 
@@ -40,8 +67,23 @@ public class MongoCheckpointStore implements CheckpointStore {
 
     private final MongoTemplate mongoTemplate;
 
+    /**
+     * @param mongoTemplate the template whose database receives {@code _fw_checkpoints}
+     */
     public MongoCheckpointStore(MongoTemplate mongoTemplate) {
         this.mongoTemplate = mongoTemplate;
+    }
+
+    /**
+     * {@code mongo[<database>]}: the database of the template this store was built on.
+     */
+    @Override
+    public String backendDescription() {
+        try {
+            return "mongo[" + mongoTemplate.getDb().getName() + "]";
+        } catch (RuntimeException e) {
+            return "mongo[?]";
+        }
     }
 
     @Override

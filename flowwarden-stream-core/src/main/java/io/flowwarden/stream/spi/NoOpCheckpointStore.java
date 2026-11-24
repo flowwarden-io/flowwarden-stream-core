@@ -65,4 +65,9 @@ final class NoOpCheckpointStore implements CheckpointStore {
     @Override
     public void delete(String streamName) {
     }
+
+    @Override
+    public String backendDescription() {
+        return "none (no-op)";
+    }
 }

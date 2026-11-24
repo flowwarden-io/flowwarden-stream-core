@@ -75,6 +75,22 @@ public abstract class LockServiceContractTest {
         lockService = createLockService();
     }
 
+    /**
+     * The description feeds the {@code FlowWarden state: …} line logged at startup:
+     * it must be usable as one token of a log line, whatever the backend — the
+     * class-name default or an override naming the database, keyspace or exchange.
+     */
+    @Test
+    void backendDescription_isAStableSingleLine() {
+        String description = lockService.backendDescription();
+
+        assertThat(description).isNotBlank();
+        assertThat(description).doesNotContain("\n", "\r");
+        assertThat(lockService.backendDescription())
+                .as("describing the service twice gives the same answer")
+                .isEqualTo(description);
+    }
+
     @Test
     void renew_failsIfLeaseExpired() {
         assertThat(lockService.tryAcquire("my-stream", INSTANCE_A, TTL)).isTrue();

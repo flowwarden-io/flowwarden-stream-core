@@ -15,13 +15,13 @@
  */
 package io.flowwarden.stream.autoconfigure;
 
-import io.flowwarden.stream.internal.checkpoint.ReactiveMongoCheckpointStore;
+import io.flowwarden.stream.mongo.checkpoint.ReactiveMongoCheckpointStore;
 import io.flowwarden.stream.internal.discovery.StreamRegistry;
-import io.flowwarden.stream.internal.dlq.MongoDlqProperties;
-import io.flowwarden.stream.internal.dlq.ReactiveMongoDlqStore;
+import io.flowwarden.stream.mongo.dlq.MongoDlqProperties;
+import io.flowwarden.stream.mongo.dlq.ReactiveMongoDlqStore;
 import io.flowwarden.stream.internal.MongoTemplateRegistry;
 import io.flowwarden.stream.internal.lock.LeaderElectionCoordinator;
-import io.flowwarden.stream.internal.lock.ReactiveMongoLockService;
+import io.flowwarden.stream.mongo.lock.ReactiveMongoLockService;
 import io.flowwarden.stream.internal.reactive.ReactiveStreamManager;
 import io.flowwarden.stream.spi.CheckpointStore;
 import io.flowwarden.stream.spi.DlqStore;
@@ -40,6 +40,44 @@ import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
  *
  * <p>Activated when {@code flowwarden.default-mode=REACTIVE}. Every default bean is
  * built on {@link ReactiveMongoTemplate}: the synchronous Mongo driver is not required.</p>
+ *
+ * <p>The three state beans — {@link CheckpointStore}, {@link DlqStore} and
+ * {@link LockService} — are built on the application's default
+ * {@code ReactiveMongoTemplate}: the FlowWarden state ({@code _fw_checkpoints},
+ * {@code _fw_dlq}, {@code _fw_locks}) lives in that database.
+ * {@code @ChangeStream(mongoTemplateRef = …)} selects the template a stream
+ * <em>watches</em> and does not move the state. Each bean is
+ * {@code @ConditionalOnMissingBean}: an application whose state belongs in another
+ * database declares the three beans in its own {@code @Configuration}, on the
+ * template of that database:</p>
+ *
+ * <pre>{@code
+ * @Bean
+ * CheckpointStore checkpointStore(@Qualifier("stateMongoTemplate") ReactiveMongoTemplate template) {
+ *     return new ReactiveMongoCheckpointStore(template);
+ * }
+ *
+ * @Bean
+ * DlqStore dlqStore(@Qualifier("stateMongoTemplate") ReactiveMongoTemplate template,
+ *                   MongoDlqProperties properties) {
+ *     return new ReactiveMongoDlqStore(template, properties);
+ * }
+ *
+ * @Bean
+ * LockService lockService(@Qualifier("stateMongoTemplate") ReactiveMongoTemplate template) {
+ *     return new ReactiveMongoLockService(template);
+ * }
+ * }</pre>
+ *
+ * <p>Spring Boot's own {@code ReactiveMongoTemplate} backs off as soon as the application
+ * declares one, so an application with two databases declares both templates and
+ * marks the one FlowWarden watches by default {@code @Primary}.</p>
+ *
+ * <p>The beans are independent: redeclaring only one of them splits the state
+ * across two databases. The {@code FlowWarden state: checkpoints=… dlq=… locks=…}
+ * line logged at startup shows where each one lives. When the state and a
+ * handler's writes go through different database factories, they do not share a
+ * transaction.</p>
  */
 @AutoConfiguration(after = FlowWardenAutoConfiguration.class)
 @ConditionalOnProperty(name = "flowwarden.default-mode", havingValue = "REACTIVE")
