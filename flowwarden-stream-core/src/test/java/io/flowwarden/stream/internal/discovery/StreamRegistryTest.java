@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -62,6 +63,32 @@ class StreamRegistryTest {
 
         Optional<ChangeStreamDefinition> found = registry.findByName("unknown");
         assertTrue(found.isEmpty());
+    }
+
+    @Test
+    void getStreamNamesFollowsRegistrationOrder() {
+        registry.register(createDefinition("zeta"));
+        registry.register(createDefinition("alpha"));
+        registry.register(createDefinition("mid"));
+
+        assertEquals(List.of("zeta", "alpha", "mid"), List.copyOf(registry.getStreamNames()));
+    }
+
+    @Test
+    void getStreamNamesIsEmptyBeforeAnyRegistration() {
+        assertTrue(registry.getStreamNames().isEmpty());
+    }
+
+    @Test
+    void getStreamNamesIsAnUnmodifiableSnapshot() {
+        registry.register(createDefinition("first"));
+        Set<String> names = registry.getStreamNames();
+
+        registry.register(createDefinition("second"));
+
+        assertEquals(Set.of("first"), names, "a snapshot must not follow later registrations");
+        assertThrows(UnsupportedOperationException.class, () -> names.add("intruder"));
+        assertEquals(List.of("first", "second"), List.copyOf(registry.getStreamNames()));
     }
 
     private ChangeStreamDefinition createDefinition(String name) {
