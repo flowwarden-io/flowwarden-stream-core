@@ -93,7 +93,7 @@ class PipelineInspectorTest {
     void reportsATopLevelFieldThatIsNotAnEventField() {
         var findings = PipelineInspector.analyze(List.of(matchStage(new Document("status", "OPEN"))));
 
-        assertThat(findings.unknownFields()).containsExactly("status");
+        assertThat(findings.unsatisfiableFields()).containsExactly("status");
     }
 
     @Test
@@ -103,8 +103,7 @@ class PipelineInspectorTest {
 
         var findings = PipelineInspector.analyze(List.of(matchStage(query)));
 
-        assertThat(findings.unknownFields()).isEmpty();
-        assertThat(findings.referencesFullDocument()).isTrue();
+        assertThat(findings.unsatisfiableFields()).isEmpty();
         assertThat(findings.matchesOnEventId()).isTrue();
     }
 
@@ -118,7 +117,8 @@ class PipelineInspectorTest {
 
         var findings = PipelineInspector.analyze(List.of(matchStage(query), matchStage(new Document("status", 2))));
 
-        assertThat(findings.unknownFields()).containsExactly("status", "archived");
+        // 'archived: true' is always false, which under $nor selects every event: not reported.
+        assertThat(findings.unsatisfiableFields()).containsExactly("status");
     }
 
     @Test
@@ -127,7 +127,7 @@ class PipelineInspectorTest {
                 .append("$comment", "status")
                 .append("$jsonSchema", new Document("required", List.of("status")));
 
-        assertThat(PipelineInspector.analyze(List.of(matchStage(query))).unknownFields()).isEmpty();
+        assertThat(PipelineInspector.analyze(List.of(matchStage(query))).unsatisfiableFields()).isEmpty();
     }
 
     @Test
@@ -136,7 +136,7 @@ class PipelineInspectorTest {
                 new Document("$elemMatch", new Document("sku", "A")))
                 .append("documentKey", new Document("_id", 1).append("tenant", "t"));
 
-        assertThat(PipelineInspector.analyze(List.of(matchStage(query))).unknownFields()).isEmpty();
+        assertThat(PipelineInspector.analyze(List.of(matchStage(query))).unsatisfiableFields()).isEmpty();
     }
 
     @Test
@@ -147,7 +147,7 @@ class PipelineInspectorTest {
                     new Document(stage, new Document("status", "$fullDocument.status")),
                     matchStage(new Document("status", "OPEN"))));
 
-            assertThat(findings.unknownFields()).as(stage).isEmpty();
+            assertThat(findings.unsatisfiableFields()).as(stage).isEmpty();
         }
     }
 
@@ -157,7 +157,7 @@ class PipelineInspectorTest {
                 new Document("$someFutureStage", new Document()),
                 matchStage(new Document("status", "OPEN"))));
 
-        assertThat(findings.unknownFields()).isEmpty();
+        assertThat(findings.unsatisfiableFields()).isEmpty();
     }
 
     @Test
@@ -167,7 +167,7 @@ class PipelineInspectorTest {
                 new Document("$changeStreamSplitLargeEvent", new Document()),
                 matchStage(new Document("status", "OPEN"))));
 
-        assertThat(findings.unknownFields()).containsExactly("status");
+        assertThat(findings.unsatisfiableFields()).containsExactly("status");
     }
 
     @Test
@@ -179,7 +179,155 @@ class PipelineInspectorTest {
                         com.mongodb.client.model.Filters.eq("operationType", "delete")))))
                 .resolve(new Object());
 
-        assertThat(PipelineInspector.analyze(resolved).unknownFields()).containsExactly("status");
+        assertThat(PipelineInspector.analyze(resolved).unsatisfiableFields()).containsExactly("status");
+    }
+
+    // --- operators and logical context ---
+
+    @Test
+    void aConditionThatAMissingFieldSatisfiesIsNotReported() {
+        List<Document> satisfied = List.of(
+                new Document("status", new Document("$exists", false)),
+                new Document("status", null),
+                new Document("status", new Document("$eq", null)),
+                new Document("status", new Document("$ne", "OPEN")),
+                new Document("status", new Document("$nin", List.of("OPEN", "PAID"))),
+                new Document("status", new Document("$in", java.util.Arrays.asList("OPEN", null))),
+                new Document("status", new Document("$not", new Document("$gt", 3))),
+                new Document("status", new Document("$not", java.util.regex.Pattern.compile("^O"))));
+
+        for (Document query : satisfied) {
+            var findings = PipelineInspector.analyze(List.of(matchStage(query)));
+
+            assertThat(findings.unsatisfiableFields()).as(query.toJson()).isEmpty();
+            assertThat(findings.matchesNothing()).as(query.toJson()).isFalse();
+        }
+    }
+
+    @Test
+    void aConditionThatAMissingFieldCannotSatisfyIsReported() {
+        List<Document> unsatisfiable = List.of(
+                new Document("status", "OPEN"),
+                new Document("status", new Document("$exists", true)),
+                new Document("status", new Document("$ne", null)),
+                new Document("status", new Document("$in", List.of("OPEN", "PAID"))),
+                new Document("status", new Document("$nin", java.util.Arrays.asList("OPEN", null))),
+                new Document("status", new Document("$gt", 3)),
+                new Document("status", new Document("$regex", "^O").append("$options", "i")),
+                new Document("status", java.util.regex.Pattern.compile("^O")),
+                new Document("status", new Document("$ne", "X").append("$exists", true)),
+                new Document("status", new Document("$not", new Document("$exists", false))));
+
+        for (Document query : unsatisfiable) {
+            var findings = PipelineInspector.analyze(List.of(matchStage(query)));
+
+            assertThat(findings.unsatisfiableFields()).as(query.toJson()).containsExactly("status");
+            assertThat(findings.matchesNothing()).as(query.toJson()).isTrue();
+        }
+    }
+
+    @Test
+    void anOperatorTheCheckDoesNotKnowIsNotReported() {
+        var findings = PipelineInspector.analyze(List.of(
+                matchStage(new Document("status", new Document("$someFutureOperator", 1))),
+                matchStage(new Document("status", new Document("$exists", "yes")))));
+
+        assertThat(findings.unsatisfiableFields()).isEmpty();
+        assertThat(findings.matchesNothing()).isFalse();
+    }
+
+    @Test
+    void norInvertsWhatIsUnsatisfiable() {
+        var harmless = PipelineInspector.analyze(List.of(matchStage(
+                new Document("$nor", List.of(new Document("status", "OPEN"))))));
+        var blocking = PipelineInspector.analyze(List.of(matchStage(
+                new Document("$nor", List.of(new Document("status", new Document("$exists", false)))))));
+        var doubleNegation = PipelineInspector.analyze(List.of(matchStage(
+                new Document("$nor", List.of(new Document("$nor", List.of(new Document("status", "OPEN"))))))));
+
+        assertThat(harmless.unsatisfiableFields()).isEmpty();
+        assertThat(harmless.matchesNothing()).isFalse();
+        assertThat(blocking.unsatisfiableFields()).containsExactly("status");
+        assertThat(blocking.matchesNothing()).isTrue();
+        assertThat(doubleNegation.unsatisfiableFields()).containsExactly("status");
+        assertThat(doubleNegation.matchesNothing()).isTrue();
+    }
+
+    @Test
+    void aDeadBranchOfAnOrIsReportedWithoutClaimingTheStreamIsSilent() {
+        Document stage = matchStage(new Document("$or", List.of(
+                new Document("operationType", "delete"), new Document("status", "OPEN"))));
+        ChangeStreamDefinition def = definition(rawPipeline(stage), FullDocumentMode.DEFAULT, false);
+
+        var findings = PipelineInspector.analyze(List.of(stage));
+        PipelineInspector.inspect(def, List.of(stage));
+
+        assertThat(findings.unsatisfiableFields()).containsExactly("status");
+        assertThat(findings.matchesNothing()).isFalse();
+        assertThat(warnings()).singleElement().asString()
+                .contains("[status]")
+                .contains("The part of the filter that relies on it selects no event")
+                .doesNotContain("will receive none");
+    }
+
+    @Test
+    void aFilterThatSelectsNothingSaysSo() {
+        Document stage = matchStage(new Document("operationType", "insert").append("status", "OPEN"));
+        ChangeStreamDefinition def = definition(rawPipeline(stage), FullDocumentMode.DEFAULT, false);
+
+        PipelineInspector.inspect(def, List.of(stage));
+
+        assertThat(warnings()).singleElement().asString().contains("the stream will receive none");
+    }
+
+    @Test
+    void selectingTheEventsWithoutFullDocumentIsNotReportedAsDroppingThem() {
+        List<Document> valid = List.of(
+                new Document("fullDocument", new Document("$exists", false)),
+                new Document("fullDocument", null),
+                new Document("fullDocument.status", new Document("$ne", "ARCHIVED")),
+                new Document("$nor", List.of(new Document("fullDocument.status", "ARCHIVED"))),
+                // updates pass through the other branch
+                new Document("$or", List.of(
+                        new Document("operationType", "update"), new Document("fullDocument.status", "OPEN"))),
+                new Document("$or", List.of(
+                        new Document("operationType", new Document("$in", List.of("update", "delete"))),
+                        new Document("fullDocument.status", "OPEN"))),
+                // updates are excluded on purpose, with or without a fullDocument
+                new Document("operationType", "insert").append("fullDocument.status", "OPEN"),
+                // not decidable
+                new Document("$or", List.of(
+                        new Document("updateDescription.updatedFields.status", "OPEN"),
+                        new Document("fullDocument.status", "OPEN"))));
+
+        for (Document query : valid) {
+            Document stage = matchStage(query);
+            PipelineInspector.inspect(definition(rawPipeline(stage), FullDocumentMode.DEFAULT, true),
+                    List.of(stage));
+
+            assertThat(warnings()).as(query.toJson()).isEmpty();
+        }
+    }
+
+    @Test
+    void aFullDocumentConditionThatRejectsEveryUpdateIsReported() {
+        List<Document> dropping = List.of(
+                new Document("fullDocument.status", "OPEN"),
+                new Document("fullDocument", new Document("$exists", true)),
+                new Document("operationType", new Document("$in", List.of("insert", "update")))
+                        .append("fullDocument.status", "OPEN"),
+                new Document("$or", List.of(
+                        new Document("operationType", "delete"), new Document("fullDocument.status", "OPEN"))),
+                new Document("$nor", List.of(new Document("fullDocument", new Document("$exists", false)))));
+
+        for (Document query : dropping) {
+            appender.list.clear();
+            Document stage = matchStage(query);
+            PipelineInspector.inspect(definition(rawPipeline(stage), FullDocumentMode.DEFAULT, true),
+                    List.of(stage));
+
+            assertThat(warnings()).as(query.toJson()).singleElement().asString().contains("UPDATE_LOOKUP");
+        }
     }
 
     // --- inspect (logging) ---
