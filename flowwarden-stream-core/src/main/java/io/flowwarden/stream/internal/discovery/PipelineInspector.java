@@ -116,9 +116,9 @@ public final class PipelineInspector {
      *                                        satisfied where it stands, in order
      * @param matchesNothing                  whether a {@code $match} stage is certainly false for every
      *                                        event, so the stream receives none
-     * @param dropsUpdatesWithoutFullDocument whether a {@code $match} stage certainly rejects an update
-     *                                        event for the sole reason that it carries no
-     *                                        {@code fullDocument}
+     * @param dropsUpdatesWithoutFullDocument whether the {@code $match} stages, taken together, certainly
+     *                                        reject an update event for the sole reason that it carries
+     *                                        no {@code fullDocument}
      * @param matchesOnEventId                whether a condition is on the event's {@code _id}
      */
     record Findings(Set<String> unsatisfiableFields, boolean matchesNothing,
@@ -175,9 +175,11 @@ public final class PipelineInspector {
 
     static Findings analyze(List<Document> pipeline) {
         Set<String> unsatisfiable = new LinkedHashSet<>();
-        boolean matchesNothing = false;
-        boolean dropsUpdates = false;
         boolean[] eventId = new boolean[1];
+        // Successive $match stages are a conjunction: each shape is evaluated over all of them.
+        List<Truth> anyEvent = new ArrayList<>();
+        List<Truth> updateWithoutFullDocument = new ArrayList<>();
+        List<Truth> updateWithFullDocument = new ArrayList<>();
         for (Document stage : pipeline) {
             if (stage == null || stage.size() != 1) {
                 break;
@@ -188,13 +190,17 @@ public final class PipelineInspector {
             }
             if ("$match".equals(operator) && stage.get(operator) instanceof Map<?, ?> query) {
                 collect(query, false, unsatisfiable, eventId);
-                matchesNothing |= evaluate(query, EventShape.ANY) == Truth.FALSE;
-                // Attributed to the missing fullDocument only if the same update event would not
-                // certainly be rejected with one: {operationType: "insert"} drops updates either way.
-                dropsUpdates |= evaluate(query, EventShape.UPDATE_WITHOUT_FULL_DOCUMENT) == Truth.FALSE
-                        && evaluate(query, EventShape.UPDATE_WITH_FULL_DOCUMENT) != Truth.FALSE;
+                anyEvent.add(evaluate(query, EventShape.ANY));
+                updateWithoutFullDocument.add(evaluate(query, EventShape.UPDATE_WITHOUT_FULL_DOCUMENT));
+                updateWithFullDocument.add(evaluate(query, EventShape.UPDATE_WITH_FULL_DOCUMENT));
             }
         }
+        boolean matchesNothing = Truth.allOf(anyEvent) == Truth.FALSE;
+        // Attributed to the missing fullDocument only if the same update event would not certainly
+        // be rejected with one: {operationType: "insert"}, in this stage or another, drops updates
+        // either way.
+        boolean dropsUpdates = Truth.allOf(updateWithoutFullDocument) == Truth.FALSE
+                && Truth.allOf(updateWithFullDocument) != Truth.FALSE;
         return new Findings(Collections.unmodifiableSet(unsatisfiable), matchesNothing, dropsUpdates, eventId[0]);
     }
 

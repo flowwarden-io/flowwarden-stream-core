@@ -330,6 +330,46 @@ class PipelineInspectorTest {
         }
     }
 
+    @Test
+    void successiveMatchStagesAreEvaluatedAsOneConjunction() {
+        Document insertsOnly = matchStage(new Document("operationType", "insert"));
+        Document openOnly = matchStage(new Document("fullDocument.status", "OPEN"));
+        Document merged = matchStage(new Document("operationType", "insert").append("fullDocument.status", "OPEN"));
+
+        // Updates are excluded on purpose by the other stage, whatever the order of the stages.
+        for (List<Document> pipeline : List.of(
+                List.of(insertsOnly, openOnly), List.of(openOnly, insertsOnly), List.of(merged))) {
+            PipelineInspector.inspect(definition(rawPipeline(pipeline.toArray(Document[]::new)),
+                    FullDocumentMode.DEFAULT, true), pipeline);
+
+            assertThat(PipelineInspector.analyze(pipeline).dropsUpdatesWithoutFullDocument())
+                    .as(pipeline.toString()).isFalse();
+            assertThat(warnings()).as(pipeline.toString()).isEmpty();
+        }
+    }
+
+    @Test
+    void aSecondStageThatKeepsUpdatesDoesNotHideTheMissingFullDocument() {
+        List<Document> pipeline = List.of(
+                matchStage(new Document("operationType", new Document("$in", List.of("insert", "update")))),
+                matchStage(new Document("fullDocument.status", "OPEN")));
+
+        PipelineInspector.inspect(definition(rawPipeline(pipeline.toArray(Document[]::new)),
+                FullDocumentMode.DEFAULT, true), pipeline);
+
+        assertThat(warnings()).singleElement().asString().contains("UPDATE_LOOKUP");
+    }
+
+    @Test
+    void stagesAfterAReshapingStageDoNotEnterTheConjunction() {
+        List<Document> pipeline = List.of(
+                matchStage(new Document("fullDocument.status", "OPEN")),
+                new Document("$project", new Document("operationType", 1)),
+                matchStage(new Document("operationType", "insert")));
+
+        assertThat(PipelineInspector.analyze(pipeline).dropsUpdatesWithoutFullDocument()).isTrue();
+    }
+
     // --- inspect (logging) ---
 
     @Test
