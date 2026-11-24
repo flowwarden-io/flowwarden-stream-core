@@ -794,6 +794,11 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     }
 
     @Override
+    public Set<String> getStreamNames() {
+        return registry.getStreamNames();
+    }
+
+    @Override
     public Instant getLastEventTime(String streamName) {
         return lastActivityTimes.get(streamName);
     }

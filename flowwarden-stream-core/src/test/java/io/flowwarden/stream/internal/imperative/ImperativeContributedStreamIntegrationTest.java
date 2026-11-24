@@ -26,12 +26,15 @@ import io.flowwarden.stream.HistoryLostContext;
 import io.flowwarden.stream.ErrorAction;
 import io.flowwarden.stream.OperationType;
 import io.flowwarden.stream.annotation.EnableFlowWarden;
+import io.flowwarden.stream.core.FlowWardenStreamManager;
 import io.flowwarden.stream.registration.StreamDefinitionContributor;
 import io.flowwarden.stream.test.SharedMongoContainer;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.event.ApplicationStartedEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
@@ -45,6 +48,7 @@ import org.springframework.test.context.DynamicPropertySource;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -79,6 +83,24 @@ class ImperativeContributedStreamIntegrationTest {
 
     @Autowired
     CheckpointStore checkpointStore;
+
+    @Autowired
+    StartupStreamNames startupStreamNames;
+
+    @Test
+    void contributedStreamNamesAreListedBeforeTheStreamsStart() {
+        // Captured on ApplicationStartedEvent — published before the
+        // ApplicationReadyEvent on which the streams open: the complete list
+        // is available to code that validates configured names at startup.
+        assertThat(startupStreamNames.names).containsExactlyInAnyOrder(
+                "contributed-order-watcher",
+                "contributed-pipeline-filter-watcher",
+                "contributed-reconcile-watcher",
+                "contributed-onerror-watcher");
+        assertThat(startupStreamNames.anyRunning).isFalse();
+        // Still the same once started, whatever each stream's state.
+        assertThat(streamManager.getStreamNames()).isEqualTo(startupStreamNames.names);
+    }
 
     @Test
     void contributedReconcileHook_runsBeforeTheStreamResumesAfterAHistoryLoss() {
@@ -213,6 +235,11 @@ class ImperativeContributedStreamIntegrationTest {
     static class TestApp {
 
         @Bean
+        StartupStreamNames startupStreamNames(FlowWardenStreamManager manager) {
+            return new StartupStreamNames(manager);
+        }
+
+        @Bean
         StreamDefinitionContributor orderStreamContributor(ContributedOrderHandler handler) {
             return registration -> registration.stream("contributed-order-watcher", Document.class)
                     .collection("contributed_orders")
@@ -256,6 +283,23 @@ class ImperativeContributedStreamIntegrationTest {
                         handler.caughtErrors.add(ex);
                         return ErrorAction.SKIP;
                     }, IllegalStateException.class);
+        }
+    }
+
+    /** Reads the public API at the point an integration layer would: before the streams open. */
+    static class StartupStreamNames {
+        private final FlowWardenStreamManager manager;
+        volatile Set<String> names;
+        volatile boolean anyRunning;
+
+        StartupStreamNames(FlowWardenStreamManager manager) {
+            this.manager = manager;
+        }
+
+        @EventListener(ApplicationStartedEvent.class)
+        void capture() {
+            names = manager.getStreamNames();
+            anyRunning = names.stream().anyMatch(manager::isRunning);
         }
     }
 

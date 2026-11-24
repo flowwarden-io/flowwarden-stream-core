@@ -15,8 +15,11 @@
  */
 package io.flowwarden.stream.internal.discovery;
 
+import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Registry of {@link ChangeStreamDefinition} instances.
@@ -48,6 +51,18 @@ public interface StreamRegistry {
      * @return the definition, or empty if not found
      */
     Optional<ChangeStreamDefinition> findByName(String streamName);
+
+    /**
+     * Returns the names of the registered streams as an unmodifiable snapshot,
+     * in registration order.
+     */
+    default Set<String> getStreamNames() {
+        Set<String> names = new LinkedHashSet<>();
+        for (ChangeStreamDefinition definition : getDefinitions()) {
+            names.add(definition.streamName());
+        }
+        return Collections.unmodifiableSet(names);
+    }
 
     /**
      * Whether registered streams may start automatically on
