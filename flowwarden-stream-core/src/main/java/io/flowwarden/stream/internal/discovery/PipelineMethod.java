@@ -15,12 +15,11 @@
  */
 package io.flowwarden.stream.internal.discovery;
 
+import io.flowwarden.stream.PipelineScope;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.springframework.data.mongodb.core.aggregation.Aggregation;
 import org.springframework.data.mongodb.core.aggregation.AggregationOperation;
-import org.springframework.data.mongodb.core.aggregation.AggregationOperationContext;
-import org.springframework.data.mongodb.core.aggregation.TypeBasedAggregationOperationContext;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -53,23 +52,46 @@ public final class PipelineMethod {
 
     private final Method method;
     private final ReturnStyle returnStyle;
-    private final Supplier<List<Bson>> pipelineSupplier;
+    private final Supplier<?> pipelineSupplier;
+    private final PipelineScope scope;
 
+    /** A {@code @Pipeline} method whose stages are sent as written ({@link PipelineScope#EVENT}). */
     public PipelineMethod(Method method, ReturnStyle returnStyle) {
+        this(method, returnStyle, PipelineScope.EVENT);
+    }
+
+    public PipelineMethod(Method method, ReturnStyle returnStyle, PipelineScope scope) {
         this.method = Objects.requireNonNull(method, "method must not be null");
         this.returnStyle = Objects.requireNonNull(returnStyle, "returnStyle must not be null");
         this.pipelineSupplier = null;
+        this.scope = Objects.requireNonNull(scope, "scope must not be null");
     }
 
-    private PipelineMethod(Supplier<List<Bson>> pipelineSupplier) {
+    private PipelineMethod(Supplier<?> pipelineSupplier, ReturnStyle returnStyle, PipelineScope scope) {
         this.method = null;
-        this.returnStyle = null;
+        this.returnStyle = returnStyle;
         this.pipelineSupplier = Objects.requireNonNull(pipelineSupplier, "pipelineSupplier must not be null");
+        this.scope = Objects.requireNonNull(scope, "scope must not be null");
     }
 
-    /** Creates a {@link PipelineMethod} backed by a functional supplier (no reflection). */
+    /** Creates a {@link PipelineMethod} backed by a functional supplier of raw BSON stages (no reflection). */
     public static PipelineMethod fromSupplier(Supplier<List<Bson>> pipelineSupplier) {
-        return new PipelineMethod(pipelineSupplier);
+        return new PipelineMethod(pipelineSupplier, ReturnStyle.BSON_LIST, PipelineScope.EVENT);
+    }
+
+    /**
+     * Creates a {@link PipelineMethod} backed by a functional supplier of raw BSON stages with
+     * an explicit scope. {@link PipelineScope#DOCUMENT} is rejected by the definition validator
+     * for this style — the factory itself accepts it so the validator can name the stream.
+     */
+    public static PipelineMethod fromSupplier(Supplier<List<Bson>> pipelineSupplier, PipelineScope scope) {
+        return new PipelineMethod(pipelineSupplier, ReturnStyle.BSON_LIST, scope);
+    }
+
+    /** Creates a {@link PipelineMethod} backed by a functional supplier of a Spring Data aggregation. */
+    public static PipelineMethod fromAggregationSupplier(Supplier<Aggregation> aggregationSupplier,
+                                                         PipelineScope scope) {
+        return new PipelineMethod(aggregationSupplier, ReturnStyle.AGGREGATION, scope);
     }
 
     public Method method() {
@@ -80,19 +102,41 @@ public final class PipelineMethod {
         return returnStyle;
     }
 
+    /** What the field names of the pipeline are written against. Never null. */
+    public PipelineScope scope() {
+        return scope;
+    }
+
     /**
-     * Invokes the pipeline method (or functional supplier) and returns the pipeline
-     * as a {@code List<Document>} suitable for Spring Data MongoDB's
-     * {@code ChangeStreamRequest.filter()} and {@code ChangeStreamOptions.filter()}.
+     * Invokes the pipeline method (or functional supplier) and returns the stages
+     * exactly as they are sent to MongoDB, for the main cursor and for the heartbeat
+     * probe alike.
+     *
+     * <p>The stages apply to the <strong>change event</strong>. FlowWarden hands them
+     * to Spring Data as plain documents, which Spring Data forwards untouched: the
+     * {@code fullDocument.} prefixing that Spring Data's change stream API applies to
+     * an {@code Aggregation} filter does <em>not</em> happen there. With
+     * {@link PipelineScope#DOCUMENT} the equivalent rewrite is done here, once, by
+     * {@link DocumentScopePipeline}; with {@link PipelineScope#EVENT} the stages are
+     * returned as written.</p>
      *
      * @param bean the target bean instance (ignored for a functional supplier)
      * @return the aggregation pipeline as a list of BSON documents, never null
      * @throws IllegalStateException if the pipeline method/supplier fails or returns null
      */
-    @SuppressWarnings("unchecked")
     public List<Document> resolve(Object bean) {
+        List<Document> stages = toDocuments(invoke(bean));
+        // A raw BSON pipeline is never rewritten, whatever the scope says: the
+        // validator rejects that combination before a stream can start.
+        if (scope == PipelineScope.DOCUMENT && returnStyle != ReturnStyle.BSON_LIST) {
+            return DocumentScopePipeline.toEventScope(stages);
+        }
+        return stages;
+    }
+
+    private Object invoke(Object bean) {
         if (pipelineSupplier != null) {
-            List<Bson> result;
+            Object result;
             try {
                 result = pipelineSupplier.get();
             } catch (RuntimeException e) {
@@ -101,7 +145,7 @@ public final class PipelineMethod {
             if (result == null) {
                 throw new IllegalStateException("Pipeline supplier returned null");
             }
-            return toBsonDocumentList(result);
+            return result;
         }
         try {
             Object result = method.invoke(bean);
@@ -110,12 +154,7 @@ public final class PipelineMethod {
                         "@Pipeline method " + method.getDeclaringClass().getSimpleName()
                                 + "#" + method.getName() + " returned null");
             }
-
-            return switch (returnStyle) {
-                case BSON_LIST -> toBsonDocumentList((List<Bson>) result);
-                case AGGREGATION_OPERATION_LIST -> toDocumentListFromOperations((List<AggregationOperation>) result);
-                case AGGREGATION -> toDocumentListFromAggregation((Aggregation) result);
-            };
+            return result;
         } catch (InvocationTargetException e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw new IllegalStateException(
@@ -126,6 +165,15 @@ public final class PipelineMethod {
                     "Cannot invoke @Pipeline method " + method.getDeclaringClass().getSimpleName()
                             + "#" + method.getName(), e);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Document> toDocuments(Object result) {
+        return switch (returnStyle) {
+            case BSON_LIST -> toBsonDocumentList((List<Bson>) result);
+            case AGGREGATION_OPERATION_LIST -> toDocumentListFromOperations((List<AggregationOperation>) result);
+            case AGGREGATION -> toDocumentListFromAggregation((Aggregation) result);
+        };
     }
 
     private static List<Document> toBsonDocumentList(List<Bson> bsonList) {
@@ -146,16 +194,15 @@ public final class PipelineMethod {
     }
 
     private static List<Document> toDocumentListFromAggregation(Aggregation aggregation) {
-        AggregationOperationContext context = Aggregation.DEFAULT_CONTEXT;
-        return aggregation.toPipeline(context);
+        return aggregation.toPipeline(Aggregation.DEFAULT_CONTEXT);
     }
 
     @Override
     public String toString() {
         if (pipelineSupplier != null) {
-            return "functional(pipeline)";
+            return scope == PipelineScope.EVENT ? "functional(pipeline)" : "functional(pipeline, scope=" + scope + ")";
         }
         return method.getDeclaringClass().getSimpleName() + "#" + method.getName()
-                + "(" + returnStyle + ")";
+                + "(" + returnStyle + (scope == PipelineScope.EVENT ? "" : ", scope=" + scope) + ")";
     }
 }

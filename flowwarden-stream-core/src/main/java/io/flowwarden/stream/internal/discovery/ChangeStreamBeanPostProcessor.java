@@ -19,6 +19,7 @@ import io.flowwarden.stream.ChangeStreamContext;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.FullDocumentMode;
 import io.flowwarden.stream.OperationType;
+import io.flowwarden.stream.PipelineScope;
 import io.flowwarden.stream.annotation.ChangeStream;
 import io.flowwarden.stream.annotation.Checkpoint;
 import io.flowwarden.stream.annotation.DeadLetterQueue;
@@ -440,7 +441,11 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         }
 
         PipelineMethod.ReturnStyle returnStyle = resolvePipelineReturnStyle(method, targetClass, beanName);
-        return new PipelineMethod(method, returnStyle);
+        PipelineScope scope = AnnotationUtils.findAnnotation(method, Pipeline.class).scope();
+        StreamDefinitionValidator.validatePipelineScope(beanName,
+                "@Pipeline method " + targetClass.getName() + "#" + method.getName(), scope,
+                returnStyle == PipelineMethod.ReturnStyle.BSON_LIST);
+        return new PipelineMethod(method, returnStyle, scope);
     }
 
     private PipelineMethod.ReturnStyle resolvePipelineReturnStyle(Method method, Class<?> targetClass,

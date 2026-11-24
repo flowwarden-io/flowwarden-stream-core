@@ -22,6 +22,9 @@ import io.flowwarden.stream.annotation.MongoDlqOptions;
 import io.flowwarden.stream.annotation.RestartPolicy;
 import io.flowwarden.stream.annotation.RetryPolicy;
 
+import org.bson.Document;
+
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -92,6 +95,25 @@ public record ChangeStreamDefinition(
                 pipelineMethod, filterMethod, null, checkpointAnnotation, retryPolicyAnnotation,
                 restartPolicyAnnotation, deadLetterQueueAnnotation, mongoDlqOptionsAnnotation,
                 errorHandlerResolver, metadata);
+    }
+
+    /**
+     * Resolves the server-side pipeline of this stream — the stages exactly as
+     * they are sent to MongoDB — and runs the startup inspection that reports
+     * {@code $match} conditions unable to select a change event. Called once
+     * per start by both managers, so the main cursor and the heartbeat probe
+     * share one resolution.
+     *
+     * @return the resolved stages, empty when the stream declares no pipeline
+     * @throws IllegalStateException if the pipeline method or supplier fails
+     */
+    public List<Document> resolvePipeline() {
+        if (pipelineMethod == null) {
+            return List.of();
+        }
+        List<Document> resolved = pipelineMethod.resolve(bean);
+        PipelineInspector.inspect(this, resolved);
+        return resolved;
     }
 
     /**

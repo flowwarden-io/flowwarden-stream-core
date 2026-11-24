@@ -17,6 +17,7 @@ package io.flowwarden.stream.internal.discovery;
 
 import io.flowwarden.stream.OnHistoryLost;
 import io.flowwarden.stream.OperationType;
+import io.flowwarden.stream.PipelineScope;
 import io.flowwarden.stream.StartPosition;
 import io.flowwarden.stream.internal.retry.RetryPolicyConfig;
 import org.slf4j.Logger;
@@ -265,6 +266,23 @@ final class StreamDefinitionValidator {
                                 + "Use a server-side pipeline to filter these events, "
                                 + "or move the filtering logic into the handler.");
             }
+        }
+    }
+
+    /**
+     * {@link PipelineScope#DOCUMENT} rewrites field names, which is only defined for a
+     * pipeline FlowWarden renders itself (an {@code Aggregation} or a list of
+     * {@code AggregationOperation}). A raw BSON pipeline is sent as written, always.
+     */
+    static void validatePipelineScope(String beanName, String subject, PipelineScope scope,
+                                      boolean rawBsonPipeline) {
+        if (scope == PipelineScope.DOCUMENT && rawBsonPipeline) {
+            throw new BeanCreationException(beanName,
+                    "The pipeline of " + subject + " declares scope = PipelineScope.DOCUMENT but is a raw "
+                            + "List<Bson>: raw BSON stages are sent to MongoDB as written and are never "
+                            + "rewritten. Return an Aggregation (or a List<AggregationOperation>) to use the "
+                            + "DOCUMENT scope, or keep scope = EVENT and write the field names against the "
+                            + "change event ('fullDocument.<field>').");
         }
     }
 

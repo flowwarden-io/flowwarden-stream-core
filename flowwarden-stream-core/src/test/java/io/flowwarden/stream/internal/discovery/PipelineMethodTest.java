@@ -15,9 +15,15 @@
  */
 package io.flowwarden.stream.internal.discovery;
 
+import io.flowwarden.stream.PipelineScope;
 import org.bson.Document;
+import org.bson.conversions.Bson;
 import org.junit.jupiter.api.Test;
 
+import org.springframework.data.mongodb.core.aggregation.Aggregation;
+import org.springframework.data.mongodb.core.aggregation.AggregationOperation;
+
+import java.lang.reflect.Method;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -58,5 +64,83 @@ class PipelineMethodTest {
         IllegalStateException thrown = assertThrows(IllegalStateException.class, () -> pm.resolve(new Object()));
         assertSame(cause, thrown.getCause());
         assertInstanceOf(String.class, thrown.getMessage());
+    }
+
+    // --- scope ---
+
+    static class Pipelines {
+        Aggregation aggregation() {
+            return Aggregation.newAggregation(Aggregation.match(
+                    org.springframework.data.mongodb.core.query.Criteria.where("status").is("OPEN")));
+        }
+
+        List<AggregationOperation> operations() {
+            return List.of(Aggregation.match(
+                    org.springframework.data.mongodb.core.query.Criteria.where("status").is("OPEN")));
+        }
+
+        List<Bson> bson() {
+            return List.of(new Document("$match", new Document("status", "OPEN")));
+        }
+    }
+
+    private static List<Document> resolve(String methodName, PipelineMethod.ReturnStyle style, PipelineScope scope)
+            throws Exception {
+        Method method = Pipelines.class.getDeclaredMethod(methodName);
+        return new PipelineMethod(method, style, scope).resolve(new Pipelines());
+    }
+
+    private static final Document AS_WRITTEN = new Document("$match", new Document("status", "OPEN"));
+    private static final Document PREFIXED = new Document("$match", new Document("fullDocument.status", "OPEN"));
+
+    @Test
+    void eventScopeIsTheDefaultAndSendsAnAggregationAsWritten() throws Exception {
+        Method method = Pipelines.class.getDeclaredMethod("aggregation");
+        PipelineMethod pm = new PipelineMethod(method, PipelineMethod.ReturnStyle.AGGREGATION);
+
+        assertEquals(PipelineScope.EVENT, pm.scope());
+        assertEquals(List.of(AS_WRITTEN), pm.resolve(new Pipelines()));
+        assertEquals(List.of(AS_WRITTEN),
+                resolve("operations", PipelineMethod.ReturnStyle.AGGREGATION_OPERATION_LIST, PipelineScope.EVENT));
+    }
+
+    @Test
+    void documentScopePrefixesAnAggregation() throws Exception {
+        assertEquals(List.of(PREFIXED),
+                resolve("aggregation", PipelineMethod.ReturnStyle.AGGREGATION, PipelineScope.DOCUMENT));
+    }
+
+    @Test
+    void documentScopePrefixesAListOfAggregationOperations() throws Exception {
+        assertEquals(List.of(PREFIXED),
+                resolve("operations", PipelineMethod.ReturnStyle.AGGREGATION_OPERATION_LIST, PipelineScope.DOCUMENT));
+    }
+
+    @Test
+    void rawBsonIsNeverRewrittenWhateverTheScope() throws Exception {
+        // The validator rejects this combination at startup; the resolution itself must still not touch raw BSON.
+        assertEquals(List.of(AS_WRITTEN),
+                resolve("bson", PipelineMethod.ReturnStyle.BSON_LIST, PipelineScope.DOCUMENT));
+        assertEquals(List.of(AS_WRITTEN),
+                PipelineMethod.fromSupplier(() -> List.of(AS_WRITTEN), PipelineScope.DOCUMENT).resolve(new Object()));
+    }
+
+    @Test
+    void aggregationSupplierHonoursTheScope() {
+        Pipelines pipelines = new Pipelines();
+
+        assertEquals(List.of(PREFIXED),
+                PipelineMethod.fromAggregationSupplier(pipelines::aggregation, PipelineScope.DOCUMENT)
+                        .resolve(new Object()));
+        assertEquals(List.of(AS_WRITTEN),
+                PipelineMethod.fromAggregationSupplier(pipelines::aggregation, PipelineScope.EVENT)
+                        .resolve(new Object()));
+    }
+
+    @Test
+    void aggregationSupplierReturningNullFailsLikeTheBsonOne() {
+        PipelineMethod pm = PipelineMethod.fromAggregationSupplier(() -> null, PipelineScope.DOCUMENT);
+
+        assertThrows(IllegalStateException.class, () -> pm.resolve(new Object()));
     }
 }

@@ -252,6 +252,51 @@ class StreamSpecConverterTest {
     }
 
     @Test
+    void convertsAnAggregationPipelineSentAsWrittenByDefault() {
+        StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
+                .collection("orders")
+                .aggregationPipeline(() -> org.springframework.data.mongodb.core.aggregation.Aggregation
+                        .newAggregation(org.springframework.data.mongodb.core.aggregation.Aggregation.match(
+                                org.springframework.data.mongodb.core.query.Criteria.where("status").is("OPEN"))))
+                .onChange(ctx -> { })
+                .build();
+
+        ChangeStreamDefinition definition = StreamSpecConverter.convert(spec, new Object(), "testBean");
+
+        assertEquals(io.flowwarden.stream.PipelineScope.EVENT, definition.pipelineMethod().scope());
+        assertEquals(List.of(new Document("$match", new Document("status", "OPEN"))),
+                definition.pipelineMethod().resolve(definition.bean()));
+    }
+
+    @Test
+    void convertsAnAggregationPipelineWithDocumentScope() {
+        StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
+                .collection("orders")
+                .aggregationPipeline(() -> org.springframework.data.mongodb.core.aggregation.Aggregation
+                        .newAggregation(org.springframework.data.mongodb.core.aggregation.Aggregation.match(
+                                org.springframework.data.mongodb.core.query.Criteria.where("status").is("OPEN"))))
+                .pipelineScope(io.flowwarden.stream.PipelineScope.DOCUMENT)
+                .onChange(ctx -> { })
+                .build();
+
+        ChangeStreamDefinition definition = StreamSpecConverter.convert(spec, new Object(), "testBean");
+
+        assertEquals(io.flowwarden.stream.PipelineScope.DOCUMENT, definition.pipelineMethod().scope());
+        assertEquals(List.of(new Document("$match", new Document("fullDocument.status", "OPEN"))),
+                definition.pipelineMethod().resolve(definition.bean()));
+    }
+
+    @Test
+    void aStreamAcceptsOnlyOnePipelineWhicheverFormItTakes() {
+        var builder = StreamSpec.builder("order-stream", Order.class)
+                .collection("orders")
+                .pipeline(() -> List.of(new Document("$match", new Document("operationType", "insert"))));
+
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> builder.aggregationPipeline(() -> null));
+    }
+
+    @Test
     void convertsFilterAndEvaluatesItThroughFilterMethod() {
         StreamSpec<Order> spec = StreamSpec.builder("order-stream", Order.class)
                 .collection("orders")

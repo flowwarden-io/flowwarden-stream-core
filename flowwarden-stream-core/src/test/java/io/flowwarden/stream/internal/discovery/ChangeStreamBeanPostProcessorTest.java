@@ -537,6 +537,33 @@ class ChangeStreamBeanPostProcessorTest {
     }
 
     @Test
+    void pipelineScopeDefaultsToEvent() {
+        processor.postProcessAfterInitialization(new PipelineAggregationBean(), "pipelineAgg");
+
+        assertEquals(io.flowwarden.stream.PipelineScope.EVENT,
+                processor.getDefinitions().get(0).pipelineMethod().scope());
+    }
+
+    @Test
+    void carriesTheDocumentScopeOfAnAggregationPipeline() {
+        processor.postProcessAfterInitialization(new PipelineDocumentScopeBean(), "pipelineDocScope");
+
+        PipelineMethod pipeline = processor.getDefinitions().get(0).pipelineMethod();
+        assertEquals(io.flowwarden.stream.PipelineScope.DOCUMENT, pipeline.scope());
+        assertEquals(List.of(new Document("$match", new Document("fullDocument.status", "OPEN"))),
+                pipeline.resolve(processor.getDefinitions().get(0).bean()));
+    }
+
+    @Test
+    void rejectsDocumentScopeOnARawBsonPipeline() {
+        BeanCreationException ex = assertThrows(BeanCreationException.class,
+                () -> processor.postProcessAfterInitialization(new PipelineDocumentScopeBsonBean(), "badScope"));
+
+        assertTrue(ex.getMessage().contains("PipelineScope.DOCUMENT"));
+        assertTrue(ex.getMessage().contains("PipelineDocumentScopeBsonBean#pipeline"));
+    }
+
+    @Test
     void discoversPipelineMethodWithAggregationOperationList() {
         PipelineAggOpListBean bean = new PipelineAggOpListBean();
         processor.postProcessAfterInitialization(bean, "pipelineAggOp");
@@ -614,6 +641,30 @@ class ChangeStreamBeanPostProcessorTest {
                     Aggregation.match(org.springframework.data.mongodb.core.query.Criteria
                             .where("operationType").in("insert", "update"))
             );
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    static class PipelineDocumentScopeBean {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {}
+
+        @Pipeline(scope = io.flowwarden.stream.PipelineScope.DOCUMENT)
+        Aggregation pipeline() {
+            return Aggregation.newAggregation(
+                    Aggregation.match(org.springframework.data.mongodb.core.query.Criteria
+                            .where("status").is("OPEN")));
+        }
+    }
+
+    @ChangeStream(collection = "orders")
+    static class PipelineDocumentScopeBsonBean {
+        @OnChange
+        void handle(ChangeStreamContext<?> ctx) {}
+
+        @Pipeline(scope = io.flowwarden.stream.PipelineScope.DOCUMENT)
+        List<Bson> pipeline() {
+            return List.of(new Document("$match", new Document("status", "OPEN")));
         }
     }
 

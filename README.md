@@ -131,7 +131,11 @@ public class OrderStreamHandler {
 
     private static final Logger log = LoggerFactory.getLogger(OrderStreamHandler.class);
 
-    /** Server-side: only matching events reach the application. */
+    /**
+     * Server-side: only matching events reach the application. The stages apply to the
+     * change event, hence "fullDocument.status" — or return an Aggregation with
+     * @Pipeline(scope = PipelineScope.DOCUMENT) to write the filter against the document.
+     */
     @Pipeline
     List<Bson> pipeline() {
         return List.of(
