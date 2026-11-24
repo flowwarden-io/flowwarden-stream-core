@@ -20,6 +20,7 @@ import io.flowwarden.stream.DeploymentMode;
 import io.flowwarden.stream.FullDocumentBeforeChangeMode;
 import io.flowwarden.stream.FullDocumentMode;
 import io.flowwarden.stream.OperationType;
+import io.flowwarden.stream.PipelineScope;
 import io.flowwarden.stream.core.ContextHandler;
 import io.flowwarden.stream.core.DocumentHandler;
 import io.flowwarden.stream.core.ErrorHandler;
@@ -28,6 +29,7 @@ import io.flowwarden.stream.core.ReactiveDocumentHandler;
 import io.flowwarden.stream.core.ReactiveReconcileHandler;
 import io.flowwarden.stream.core.ReconcileHandler;
 import org.bson.conversions.Bson;
+import org.springframework.data.mongodb.core.aggregation.Aggregation;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -93,6 +95,8 @@ public final class StreamSpec<T> {
     private final Map<OperationType, TypedHandler<T>> typedHandlers;
     private final TypedHandler<T> onChangeHandler;
     private final Supplier<List<Bson>> pipeline;
+    private final Supplier<Aggregation> aggregationPipeline;
+    private final PipelineScope pipelineScope;
     private final Predicate<ChangeStreamContext<T>> filter;
     private final ReconcileHandler reconcile;
     private final ReactiveReconcileHandler reconcileReactive;
@@ -119,6 +123,8 @@ public final class StreamSpec<T> {
         this.typedHandlers = new EnumMap<>(builder.typedHandlers);
         this.onChangeHandler = builder.onChangeHandler;
         this.pipeline = builder.pipeline;
+        this.aggregationPipeline = builder.aggregationPipeline;
+        this.pipelineScope = builder.pipelineScope;
         this.filter = builder.filter;
         this.reconcile = builder.reconcile;
         this.reconcileReactive = builder.reconcileReactive;
@@ -207,9 +213,25 @@ public final class StreamSpec<T> {
         return Optional.ofNullable(onChangeHandler);
     }
 
-    /** Server-side aggregation pipeline supplier, if any — equivalent of {@code @Pipeline}. */
+    /**
+     * Server-side pipeline declared as raw BSON stages, if any — equivalent of a
+     * {@code @Pipeline} method returning {@code List<Bson>}.
+     */
     public Optional<Supplier<List<Bson>>> pipeline() {
         return Optional.ofNullable(pipeline);
+    }
+
+    /**
+     * Server-side pipeline declared as a Spring Data {@code Aggregation}, if any —
+     * equivalent of a {@code @Pipeline} method returning {@code Aggregation}.
+     */
+    public Optional<Supplier<Aggregation>> aggregationPipeline() {
+        return Optional.ofNullable(aggregationPipeline);
+    }
+
+    /** What the pipeline's field names are written against — equivalent of {@code @Pipeline.scope}. */
+    public PipelineScope pipelineScope() {
+        return pipelineScope;
     }
 
     /** Client-side event predicate, if any — equivalent of {@code @Filter}. */
@@ -271,6 +293,8 @@ public final class StreamSpec<T> {
         private final Map<OperationType, TypedHandler<T>> typedHandlers = new EnumMap<>(OperationType.class);
         private TypedHandler<T> onChangeHandler;
         private Supplier<List<Bson>> pipeline;
+        private Supplier<Aggregation> aggregationPipeline;
+        private PipelineScope pipelineScope = PipelineScope.EVENT;
         private Predicate<ChangeStreamContext<T>> filter;
         private ReconcileHandler reconcile;
         private ReactiveReconcileHandler reconcileReactive;
@@ -438,15 +462,52 @@ public final class StreamSpec<T> {
         }
 
         /**
-         * Server-side aggregation pipeline, evaluated once at stream start — equivalent of
-         * {@code @Pipeline}. Only one is allowed per stream.
+         * Server-side aggregation pipeline as raw BSON stages, evaluated once at stream start —
+         * equivalent of a {@code @Pipeline} method returning {@code List<Bson>}. Only one
+         * pipeline is allowed per stream.
+         *
+         * <p>The stages apply to the <strong>change event</strong> and are sent as written:
+         * a condition on a field of the document is written {@code fullDocument.<field>}.
+         * Raw BSON is never rewritten, so {@link #pipelineScope(PipelineScope)
+         * pipelineScope(DOCUMENT)} is rejected with this form — use
+         * {@link #aggregationPipeline(Supplier)}.</p>
          */
         public Builder<T> pipeline(Supplier<List<Bson>> pipeline) {
-            if (this.pipeline != null) {
-                throw new IllegalStateException("A pipeline is already registered on stream '" + name + "'");
-            }
+            requirePipelineUnset();
             this.pipeline = Objects.requireNonNull(pipeline, "pipeline must not be null");
             return this;
+        }
+
+        /**
+         * Server-side aggregation pipeline as a Spring Data {@code Aggregation}, evaluated once
+         * at stream start — equivalent of a {@code @Pipeline} method returning
+         * {@code Aggregation}. Only one pipeline is allowed per stream.
+         *
+         * <p>The stages apply to the change event and are sent as written, unless
+         * {@link #pipelineScope(PipelineScope) pipelineScope(DOCUMENT)} is set.</p>
+         */
+        public Builder<T> aggregationPipeline(Supplier<Aggregation> pipeline) {
+            requirePipelineUnset();
+            this.aggregationPipeline = Objects.requireNonNull(pipeline, "pipeline must not be null");
+            return this;
+        }
+
+        /**
+         * What the pipeline's field names are written against — equivalent of
+         * {@code @Pipeline(scope = ...)}. Default {@link PipelineScope#EVENT}: the stages are
+         * sent as written. With {@link PipelineScope#DOCUMENT} the field names of the
+         * {@code $match} stages are prefixed with {@code fullDocument.}; only valid with
+         * {@link #aggregationPipeline(Supplier)}.
+         */
+        public Builder<T> pipelineScope(PipelineScope pipelineScope) {
+            this.pipelineScope = Objects.requireNonNull(pipelineScope, "pipelineScope must not be null");
+            return this;
+        }
+
+        private void requirePipelineUnset() {
+            if (this.pipeline != null || this.aggregationPipeline != null) {
+                throw new IllegalStateException("A pipeline is already registered on stream '" + name + "'");
+            }
         }
 
         /**

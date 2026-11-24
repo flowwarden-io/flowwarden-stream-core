@@ -76,7 +76,11 @@ final class StreamSpecConverter {
         MongoDlqOptions mongoDlqOptions = spec.mongoDlqOptions()
                 .map(StreamSpecConverter::synthesizeMongoDlqOptions).orElse(null);
 
-        PipelineMethod pipelineMethod = spec.pipeline().map(PipelineMethod::fromSupplier).orElse(null);
+        PipelineMethod pipelineMethod = spec.pipeline()
+                .map(supplier -> PipelineMethod.fromSupplier(supplier, spec.pipelineScope()))
+                .or(() -> spec.aggregationPipeline()
+                        .map(supplier -> PipelineMethod.fromAggregationSupplier(supplier, spec.pipelineScope())))
+                .orElse(null);
         FilterMethod filterMethod = toFilterMethod(spec);
         ReconcileMethod reconcileMethod = spec.reconcile()
                 .map(ReconcileMethod::fromHandler)

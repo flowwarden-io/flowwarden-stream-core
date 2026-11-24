@@ -384,9 +384,7 @@ public class ImperativeStreamManager implements FlowWardenStreamManager {
 
         // Resolve the @Pipeline stages once: the main stream and the heartbeat
         // probe MUST observe the exact same pipeline documents.
-        List<Document> resolvedPipeline = def.pipelineMethod() != null
-                ? def.pipelineMethod().resolve(def.bean())
-                : List.of();
+        List<Document> resolvedPipeline = def.resolvePipeline();
         HeartbeatProbe probe = createHeartbeatProbe(streamTemplate, def, resolvedPipeline);
         StreamState state = new StreamState(container, new AtomicReference<>(), def,
                 new AtomicBoolean(false), probe,

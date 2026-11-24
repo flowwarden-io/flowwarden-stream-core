@@ -117,6 +117,9 @@ public class StreamContributorProcessor implements SmartInitializingSingleton {
         StreamDefinitionValidator.validateAtLeastOneHandler(beanName, subject,
                 spec.onChangeHandler().isPresent(), !spec.typedHandlers().isEmpty());
 
+        StreamDefinitionValidator.validatePipelineScope(beanName, subject, spec.pipelineScope(),
+                spec.pipeline().isPresent());
+
         boolean updateExpectsDocument = spec.handler(OperationType.UPDATE)
                 .map(StreamContributorProcessor::expectsDocument)
                 .orElse(false);

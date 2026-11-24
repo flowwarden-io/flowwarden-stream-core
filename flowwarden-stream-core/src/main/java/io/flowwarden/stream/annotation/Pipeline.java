@@ -15,6 +15,8 @@
  */
 package io.flowwarden.stream.annotation;
 
+import io.flowwarden.stream.PipelineScope;
+
 import java.lang.annotation.Documented;
 import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
@@ -36,6 +38,32 @@ import java.lang.annotation.Target;
  * </ul>
  *
  * <p>At most one {@code @Pipeline} method is allowed per {@link ChangeStream} class.</p>
+ *
+ * <p><strong>The stages apply to the change event.</strong> MongoDB runs the pipeline on the <em>change event</em>, not on the document.
+ * The document sits under {@code fullDocument}; the top level of an event only
+ * holds {@code operationType}, {@code fullDocument}, {@code documentKey},
+ * {@code updateDescription}, {@code ns}, {@code clusterTime} and a few others. A
+ * condition on a field of the document is therefore written with the
+ * {@code fullDocument.} prefix:</p>
+ *
+ * <pre>{@code
+ * @Pipeline
+ * Aggregation pipeline() {
+ *     return newAggregation(match(where("fullDocument.status").is("OPEN")));
+ * }
+ * }</pre>
+ *
+ * <p>{@code match(where("status").is("OPEN"))} would be sent as written and select
+ * nothing: a change event has no top-level {@code status}. FlowWarden reports such
+ * a condition with a WARN when the stream starts, but the stream still runs.</p>
+ *
+ * <p><strong>Coming from Spring Data's change stream API.</strong>
+ * {@code ReactiveMongoTemplate.changeStream(...)} and a
+ * {@code MessageListenerContainer} with a {@code ChangeStreamRequest} prefix the
+ * fields of an {@code Aggregation} filter with {@code fullDocument.} themselves.
+ * FlowWarden does not, by default: a filter moved as is keeps compiling and stops
+ * matching. Either add the prefix, or declare {@link #scope() scope =
+ * PipelineScope.DOCUMENT} to keep writing the filter against the document.</p>
  *
  * <p>When a {@code @Pipeline} filters out most events, the stream may settle
  * nothing for long stretches: the idle heartbeat then certifies a fresh
@@ -61,4 +89,54 @@ import java.lang.annotation.Target;
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 public @interface Pipeline {
+
+    /**
+     * What the field names of the pipeline are written against.
+     *
+     * <p>{@link PipelineScope#EVENT} (default): the stages are sent to MongoDB
+     * exactly as written.</p>
+     *
+     * <p>{@link PipelineScope#DOCUMENT}: the field names of the {@code $match}
+     * stages are prefixed with {@code fullDocument.} before the pipeline is sent,
+     * so the filter is written against the document:</p>
+     *
+     * <pre>{@code
+     * @Pipeline(scope = PipelineScope.DOCUMENT)
+     * Aggregation pipeline() {
+     *     return newAggregation(match(where("status").is("OPEN")));
+     *     // sent as { "$match": { "fullDocument.status": "OPEN" } }
+     * }
+     * }</pre>
+     *
+     * <p>What the rewrite does, and does not:</p>
+     * <ul>
+     *   <li>The top-level fields of a change event are never prefixed
+     *       ({@code operationType}, {@code documentKey}, {@code updateDescription},
+     *       {@code ns}, {@code clusterTime}, …), nor is a name already written
+     *       {@code fullDocument.…}: event conditions and document conditions can be
+     *       mixed in one {@code $match}.</li>
+     *   <li>{@code _id} is a field of the event — its resume token — and stays
+     *       one. The document's id is written {@code documentKey._id} (present on
+     *       deletes too) or {@code fullDocument._id}. Spring Data's API prefixes
+     *       {@code _id}; a filter on it must be adapted, and a WARN at start says
+     *       so.</li>
+     *   <li>The rewrite descends into {@code $and} / {@code $or} / {@code $nor}.
+     *       {@code $expr} is left alone: a {@code "$status"} expression inside it
+     *       must be written {@code "$fullDocument.status"}.</li>
+     *   <li>Only {@code $match} stages are rewritten, and only up to the first
+     *       stage that reshapes the event ({@code $project}, {@code $addFields},
+     *       {@code $set}, {@code $unset}, {@code $replaceRoot},
+     *       {@code $replaceWith}): those stages, and whatever follows them, are
+     *       sent as written.</li>
+     *   <li>A document-scoped condition can only select events that carry a
+     *       {@code fullDocument}: deletes never do, and updates only with
+     *       {@code fullDocument = UPDATE_LOOKUP} (or {@code WHEN_AVAILABLE} /
+     *       {@code REQUIRED}).</li>
+     * </ul>
+     *
+     * <p>Only for a method returning {@code Aggregation} or
+     * {@code List<AggregationOperation>}. A {@code List<Bson>} is raw BSON and is
+     * never rewritten: {@code DOCUMENT} on such a method is rejected at startup.</p>
+     */
+    PipelineScope scope() default PipelineScope.EVENT;
 }

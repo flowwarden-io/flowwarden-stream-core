@@ -161,6 +161,31 @@ class StreamContributorProcessorTest {
     }
 
     @Test
+    void failsOnDocumentScopeWithARawBsonPipelineSameAsAnnotationPath() {
+        contextRunner
+                .withUserConfiguration(DocumentScopeOnRawPipelineContributorConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasMessageContaining("PipelineScope.DOCUMENT")
+                            .hasMessageContaining("raw-document-scope-stream");
+                });
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class DocumentScopeOnRawPipelineContributorConfig {
+        @Bean
+        StreamDefinitionContributor documentScopeOnRawPipelineContributor() {
+            return registration -> registration.stream("raw-document-scope-stream", Order.class)
+                    .collection("orders")
+                    .pipeline(() -> java.util.List.of(
+                            new org.bson.Document("$match", new org.bson.Document("status", "OPEN"))))
+                    .pipelineScope(io.flowwarden.stream.PipelineScope.DOCUMENT)
+                    .onChange(ctx -> { });
+        }
+    }
+
+    @Test
     void failsOnBlankHandlerName() {
         contextRunner
                 .withUserConfiguration(BlankHandlerNameContributorConfig.class)
