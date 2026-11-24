@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `FlowWardenStreamManager.getStreamNames()`: the names of the registered streams, so that code outside FlowWarden can enumerate them — validate configured stream names at startup, serve the stream statuses under its own contract — without depending on `io.flowwarden.stream.internal.discovery.StreamRegistry`. The manager already took a name everywhere (`startStream`, `stopStream`, `isRunning`, `getLastEventTime`) but returned none. The result is an unmodifiable snapshot in registration order, independent of each stream's state: a stopped, crashed or never-started stream is listed, including under `@EnableFlowWarden(enabled = false)`. It follows registration, not startup: the list is complete from the end of the context refresh on (`ContextRefreshedEvent`, `ApplicationStartedEvent`, `SmartLifecycle`, `ApplicationRunner`), before the `ApplicationReadyEvent` on which the streams open; earlier (a constructor, `@PostConstruct`) it may be partial, since `@ChangeStream` classes register as their beans are initialized and contributed streams once all singletons are instantiated. A `default` method returning an empty set, so an application's own `FlowWardenStreamManager` implementation keeps compiling; both managers shipped by FlowWarden override it. (#152)
+
 ### Changed
 - `flowwarden-bom` pins the satellites released on this core line: `flowwarden-javers`, `flowwarden-redis` and `flowwarden-amqp` `1.0.0-rc.4` (all built against stream-core `1.0.0-rc.8`), replacing the rc.3 pins that were built against rc.7.
 

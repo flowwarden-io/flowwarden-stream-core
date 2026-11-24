@@ -70,6 +70,8 @@ class ImperativeEnableFlowWardenDisabledIntegrationTest {
     void streamsAreRegisteredButNotStarted_untilStartedExplicitly() {
         assertThat(registry.isAutoStartEnabled()).isFalse();
         assertThat(registry.findByName(STREAM)).isPresent();
+        // Listed by the public API although nothing started.
+        assertThat(streamManager.getStreamNames()).containsExactly(STREAM);
         assertThat(streamManager.isRunning(STREAM)).isFalse();
         assertThat(streamManager.isRestartPending(STREAM)).isFalse();
 
