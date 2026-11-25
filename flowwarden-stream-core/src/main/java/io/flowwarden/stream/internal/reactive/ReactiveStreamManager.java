@@ -105,6 +105,12 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
 
     private static final Logger log = LoggerFactory.getLogger(ReactiveStreamManager.class);
 
+    /**
+     * How long a graceful stop waits for a processed-anchor save already in
+     * flight before tearing the stream down.
+     */
+    private static final Duration STOP_IN_FLIGHT_SAVE_TIMEOUT = Duration.ofSeconds(5);
+
     private final MongoTemplateRegistry templateRegistry;
     private final ReactiveMongoTemplate defaultReactiveTemplate;
     private final StreamRegistry registry;
@@ -462,6 +468,13 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
                         return Mono.empty();
                     }
                     noteGenerationProven(state);
+                    // A stop in progress may be waiting for a checkpoint
+                    // save before disposing: an event admitted now would be
+                    // handled with no anchor to follow. Dropped unsettled —
+                    // the next start delivers it.
+                    if (state.gracefulStop().get()) {
+                        return Mono.empty();
+                    }
                     // Dispatch gate for the stuck-stream verdict, claimed
                     // HERE — on receipt, before the boundedElastic hop — so
                     // an event waiting for a worker already counts as in
@@ -737,9 +750,29 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         if (heartbeat != null) {
             heartbeat.cancel();
         }
-        ProcessedAnchorPolicy stoppedPolicy = processedPolicies.remove(streamName);
+        // Admission closes FIRST: from here on the generation takes no new
+        // event (see the concatMap gate), so the wait below cannot let the
+        // cursor deliver events whose anchor would never be written.
+        ReactiveStreamState stopping = streams.get(streamName);
+        if (stopping != null) {
+            stopping.gracefulStop().set(true);
+        }
+        // The processed policy is invalidated only once a write already in
+        // flight has finished: the dispose() below interrupts the worker
+        // blocked in the store, and the anchor of an event whose handler
+        // completed would be lost — the event delivered again after a clean
+        // stop. Bounded, so a hung store cannot hold the stop. The policy
+        // stays registered until it is invalidated: the one dispatch
+        // admitted before the gate closed still reaches it if it settles
+        // during the wait.
+        ProcessedAnchorPolicy stoppedPolicy = processedPolicies.get(streamName);
         if (stoppedPolicy != null) {
-            stoppedPolicy.cancel();
+            if (!stoppedPolicy.cancelAfterInFlightWrite(STOP_IN_FLIGHT_SAVE_TIMEOUT)) {
+                log.warn("Stopping stream '{}' with a checkpoint save still in flight after {} ms: "
+                                + "the save is abandoned, its event may be delivered again on the next start",
+                        streamName, STOP_IN_FLIGHT_SAVE_TIMEOUT.toMillis());
+            }
+            processedPolicies.remove(streamName, stoppedPolicy);
         }
         ScheduledFuture<?> task = intervalTasks.remove(streamName);
         if (task != null) {

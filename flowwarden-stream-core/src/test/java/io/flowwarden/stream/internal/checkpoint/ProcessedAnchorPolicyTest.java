@@ -24,6 +24,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -201,6 +202,119 @@ class ProcessedAnchorPolicyTest {
         policy.onSettled(T1, NOW);
         policy.flushIfDirty();
         assertThat(policy.saveNow(T1, NOW)).isFalse();
+
+        assertThat(store.writes).isEmpty();
+    }
+
+    // --- graceful stop: an in-flight write is waited out, then nothing more is written ---
+
+    @Test
+    void cancelAfterInFlightWrite_waitsForTheWrite_thenNeverWritesAgain() throws Exception {
+        ProcessedAnchorPolicy policy = new ProcessedAnchorPolicy(STREAM, store, 1);
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        store.blockOn = T1;
+        store.writeEntered = writeEntered;
+        store.releaseWrite = releaseWrite;
+
+        Thread delivery = new Thread(() -> policy.onSettled(T1, NOW), "delivery");
+        delivery.start();
+        assertThat(writeEntered.await(5, TimeUnit.SECONDS)).isTrue();
+
+        CountDownLatch stopReturned = new CountDownLatch(1);
+        boolean[] quiesced = new boolean[1];
+        Thread stop = new Thread(() -> {
+            quiesced[0] = policy.cancelAfterInFlightWrite(Duration.ofSeconds(10));
+            stopReturned.countDown();
+        }, "stop");
+        stop.start();
+
+        // The stop is held for as long as the write is in the store.
+        assertThat(stopReturned.await(300, TimeUnit.MILLISECONDS)).isFalse();
+
+        releaseWrite.countDown();
+        assertThat(stopReturned.await(5, TimeUnit.SECONDS)).isTrue();
+        delivery.join(5_000);
+
+        assertThat(quiesced[0]).isTrue();
+        assertThat(store.writes).containsExactly("t1");
+
+        policy.onSettled(T2, NOW);
+        policy.flushIfDirty();
+        assertThat(policy.saveNow(T2, NOW)).isFalse();
+        assertThat(store.writes).containsExactly("t1");
+    }
+
+    @Test
+    void cancelAfterInFlightWrite_letsAWriterQueuedBehindTheWriteGoFirst() throws Exception {
+        // A flush is in the store; the stop starts waiting; a settlement
+        // then completes and queues behind the flush. Its anchor must be
+        // written before the policy is invalidated.
+        ProcessedAnchorPolicy policy = new ProcessedAnchorPolicy(STREAM, store, 1);
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        store.throwOnWrite = true;
+        policy.onSettled(T1, NOW); // failed write: T1 stays dirty
+        store.throwOnWrite = false;
+        store.blockOn = T1;
+        store.writeEntered = writeEntered;
+        store.releaseWrite = releaseWrite;
+
+        Thread flush = new Thread(policy::flushIfDirty, "flush");
+        flush.start();
+        assertThat(writeEntered.await(5, TimeUnit.SECONDS)).isTrue();
+
+        boolean[] quiesced = new boolean[1];
+        Thread stop = new Thread(
+                () -> quiesced[0] = policy.cancelAfterInFlightWrite(Duration.ofSeconds(10)), "stop");
+        stop.start();
+        Thread.sleep(200); // the stop is queued on the policy lock
+
+        Thread delivery = new Thread(() -> policy.onSettled(T2, NOW), "delivery");
+        delivery.start();
+        Thread.sleep(200); // the settlement is queued behind the stop
+
+        releaseWrite.countDown();
+        flush.join(5_000);
+        delivery.join(5_000);
+        stop.join(5_000);
+
+        assertThat(quiesced[0]).isTrue();
+        assertThat(store.writes).containsExactly("t1", "t2");
+
+        policy.onSettled(T3, NOW);
+        assertThat(store.writes).containsExactly("t1", "t2");
+    }
+
+    @Test
+    void cancelAfterInFlightWrite_givesUpAfterTheBound_andStillInvalidates() throws Exception {
+        ProcessedAnchorPolicy policy = new ProcessedAnchorPolicy(STREAM, store, 1);
+        CountDownLatch writeEntered = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        store.blockOn = T1;
+        store.writeEntered = writeEntered;
+        store.releaseWrite = releaseWrite;
+
+        Thread delivery = new Thread(() -> policy.onSettled(T1, NOW), "delivery");
+        delivery.start();
+        assertThat(writeEntered.await(5, TimeUnit.SECONDS)).isTrue();
+
+        assertThat(policy.cancelAfterInFlightWrite(Duration.ofMillis(100))).isFalse();
+
+        releaseWrite.countDown();
+        delivery.join(5_000);
+
+        policy.onSettled(T2, NOW);
+        assertThat(policy.saveNow(T2, NOW)).isFalse();
+        assertThat(store.writes).containsExactly("t1");
+    }
+
+    @Test
+    void cancelAfterInFlightWrite_doesNotFlushADirtyAnchor() {
+        ProcessedAnchorPolicy policy = new ProcessedAnchorPolicy(STREAM, store, 10);
+        policy.onSettled(T1, NOW);
+
+        assertThat(policy.cancelAfterInFlightWrite(Duration.ofSeconds(1))).isTrue();
 
         assertThat(store.writes).isEmpty();
     }
