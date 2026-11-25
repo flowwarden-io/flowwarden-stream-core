@@ -36,6 +36,43 @@ import java.lang.annotation.Target;
  * is controlled by the FlowWarden runtime. This annotation is
  * meta-annotated with {@link Component @Component}, so there is no need
  * to add {@code @Component} separately.</p>
+ *
+ * <p><strong>Inheritance.</strong> The method-level annotations ({@link Pipeline},
+ * {@link Filter}, {@link OnChange}, {@link OnInsert}, {@link OnUpdate}, {@link OnDelete},
+ * {@link OnReplace}, {@link Reconcile}, {@link OnError}) are looked up through the whole
+ * type hierarchy of the class: its superclasses and the interfaces it implements, default
+ * methods included, whatever the visibility of the method. Streams that only differ by
+ * their document type can therefore share their pipeline and handlers in a generic
+ * superclass:</p>
+ *
+ * <pre>{@code
+ * abstract class BaseStream<T> {
+ *
+ *     @Pipeline
+ *     Aggregation pipeline() {
+ *         return newAggregation(match(where("fullDocument.status").is("OPEN")));
+ *     }
+ *
+ *     @OnInsert
+ *     void onInsert(T document) { ... }
+ * }
+ *
+ * @ChangeStream(name = "orders-stream", documentType = Order.class)
+ * class OrdersStream extends BaseStream<Order> {
+ * }
+ * }</pre>
+ *
+ * <ul>
+ *   <li>A method overridden in a subclass counts once, and the override is the one that
+ *       runs. It keeps the role of the method it overrides without repeating the
+ *       annotation, so an inherited handler is replaced, or neutralised with an empty
+ *       body, by overriding it.</li>
+ *   <li>The "at most one" rules apply to the hierarchy as a whole: an {@code @OnInsert}
+ *       method in the superclass and another one, with a different name, in the subclass
+ *       are two handlers and fail the startup like two in the same class.</li>
+ *   <li>A parameter declared as a type variable ({@code T document}) is checked against
+ *       {@link #documentType()} with the type the subclass binds it to.</li>
+ * </ul>
  */
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)
