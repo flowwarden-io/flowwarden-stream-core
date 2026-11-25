@@ -77,6 +77,9 @@ import java.util.function.Predicate;
  * handler methods ({@link OnChange}, {@link OnInsert}, {@link OnUpdate},
  * {@link OnDelete}, {@link OnReplace}).
  *
+ * <p>Annotated methods are looked up through the whole type hierarchy of the bean class
+ * (superclasses and interfaces), see {@link AnnotatedMethods}.</p>
+ *
  * <p>This class is internal and not part of the public API.</p>
  */
 public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, ApplicationContextAware, StreamRegistry, Ordered {
@@ -303,12 +306,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
     // --- Handler discovery ---
 
     private HandlerMethod findOnChangeHandler(Class<?> targetClass, String beanName, ChangeStream csAnnotation) {
-        List<Method> onChangeMethods = new ArrayList<>();
-        for (Method method : targetClass.getDeclaredMethods()) {
-            if (AnnotationUtils.findAnnotation(method, OnChange.class) != null) {
-                onChangeMethods.add(method);
-            }
-        }
+        List<Method> onChangeMethods = AnnotatedMethods.find(targetClass, OnChange.class);
 
         if (onChangeMethods.isEmpty()) {
             return null; // typed handlers may suffice
@@ -316,7 +314,8 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         if (onChangeMethods.size() > 1) {
             throw new BeanCreationException(beanName,
                     "@ChangeStream class " + targetClass.getName()
-                            + " must have exactly one @OnChange method, found " + onChangeMethods.size());
+                            + " must have exactly one @OnChange method, found " + onChangeMethods.size()
+                            + ": " + AnnotatedMethods.describe(onChangeMethods));
         }
 
         Method method = onChangeMethods.get(0);
@@ -333,12 +332,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
             Class<? extends Annotation> annotationType = entry.getKey();
             OperationType opType = entry.getValue();
 
-            List<Method> methods = new ArrayList<>();
-            for (Method method : targetClass.getDeclaredMethods()) {
-                if (AnnotationUtils.findAnnotation(method, annotationType) != null) {
-                    methods.add(method);
-                }
-            }
+            List<Method> methods = AnnotatedMethods.find(targetClass, annotationType);
 
             if (methods.isEmpty()) {
                 continue;
@@ -347,7 +341,8 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                 throw new BeanCreationException(beanName,
                         "@ChangeStream class " + targetClass.getName()
                                 + " must have at most one @" + annotationType.getSimpleName()
-                                + " method, found " + methods.size());
+                                + " method, found " + methods.size()
+                            + ": " + AnnotatedMethods.describe(methods));
             }
 
             Method method = methods.get(0);
@@ -416,12 +411,8 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
     // --- Pipeline discovery ---
 
     private PipelineMethod findPipelineMethod(Class<?> targetClass, String beanName) {
-        List<Method> pipelineMethods = new ArrayList<>();
-        for (Method method : targetClass.getDeclaredMethods()) {
-            if (AnnotationUtils.findAnnotation(method, Pipeline.class) != null) {
-                pipelineMethods.add(method);
-            }
-        }
+        Map<Method, Pipeline> annotatedPipelines = AnnotatedMethods.findWithAnnotation(targetClass, Pipeline.class);
+        List<Method> pipelineMethods = new ArrayList<>(annotatedPipelines.keySet());
 
         if (pipelineMethods.isEmpty()) {
             return null;
@@ -429,7 +420,8 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         if (pipelineMethods.size() > 1) {
             throw new BeanCreationException(beanName,
                     "@ChangeStream class " + targetClass.getName()
-                            + " must have at most one @Pipeline method, found " + pipelineMethods.size());
+                            + " must have at most one @Pipeline method, found " + pipelineMethods.size()
+                            + ": " + AnnotatedMethods.describe(pipelineMethods));
         }
 
         Method method = pipelineMethods.get(0);
@@ -441,7 +433,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         }
 
         PipelineMethod.ReturnStyle returnStyle = resolvePipelineReturnStyle(method, targetClass, beanName);
-        PipelineScope scope = AnnotationUtils.findAnnotation(method, Pipeline.class).scope();
+        PipelineScope scope = annotatedPipelines.get(method).scope();
         StreamDefinitionValidator.validatePipelineScope(beanName,
                 "@Pipeline method " + targetClass.getName() + "#" + method.getName(), scope,
                 returnStyle == PipelineMethod.ReturnStyle.BSON_LIST);
@@ -489,12 +481,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
     // --- Filter discovery ---
 
     private FilterMethod findFilterMethod(Class<?> targetClass, String beanName) {
-        List<Method> filterMethods = new ArrayList<>();
-        for (Method method : targetClass.getDeclaredMethods()) {
-            if (AnnotationUtils.findAnnotation(method, Filter.class) != null) {
-                filterMethods.add(method);
-            }
-        }
+        List<Method> filterMethods = AnnotatedMethods.find(targetClass, Filter.class);
 
         if (filterMethods.isEmpty()) {
             return null;
@@ -502,7 +489,8 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         if (filterMethods.size() > 1) {
             throw new BeanCreationException(beanName,
                     "@ChangeStream class " + targetClass.getName()
-                            + " must have at most one @Filter method, found " + filterMethods.size());
+                            + " must have at most one @Filter method, found " + filterMethods.size()
+                            + ": " + AnnotatedMethods.describe(filterMethods));
         }
 
         Method method = filterMethods.get(0);
@@ -513,12 +501,7 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
     // --- Reconcile discovery ---
 
     private ReconcileMethod findReconcileMethod(Class<?> targetClass, String beanName) {
-        List<Method> reconcileMethods = new ArrayList<>();
-        for (Method method : targetClass.getDeclaredMethods()) {
-            if (AnnotationUtils.findAnnotation(method, Reconcile.class) != null) {
-                reconcileMethods.add(method);
-            }
-        }
+        List<Method> reconcileMethods = AnnotatedMethods.find(targetClass, Reconcile.class);
 
         if (reconcileMethods.isEmpty()) {
             return null;
@@ -526,7 +509,8 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         if (reconcileMethods.size() > 1) {
             throw new BeanCreationException(beanName,
                     "@ChangeStream class " + targetClass.getName()
-                            + " must have at most one @Reconcile method, found " + reconcileMethods.size());
+                            + " must have at most one @Reconcile method, found " + reconcileMethods.size()
+                            + ": " + AnnotatedMethods.describe(reconcileMethods));
         }
 
         Method method = reconcileMethods.get(0);
@@ -577,11 +561,9 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
         List<ErrorHandlerMethod> handlers = new ArrayList<>();
         List<Set<Class<? extends Throwable>>> declaredExceptionTypeSets = new ArrayList<>();
 
-        for (Method method : targetClass.getDeclaredMethods()) {
-            OnError onError = AnnotationUtils.findAnnotation(method, OnError.class);
-            if (onError == null) {
-                continue;
-            }
+        for (var annotated : AnnotatedMethods.findWithAnnotation(targetClass, OnError.class).entrySet()) {
+            Method method = annotated.getKey();
+            OnError onError = annotated.getValue();
 
             // Validate signature: ErrorAction method(Throwable, ChangeStreamContext)
             validateOnErrorSignature(method, targetClass, beanName);
@@ -642,7 +624,8 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
             }
             // Document-typed signature: validate against @ChangeStream.documentType() (fixes #86 —
             // this used to be accepted unconditionally and only fail at runtime on the first event).
-            validateTypedParameterType(method, targetClass, beanName, annotationType, params[0], documentType);
+            validateTypedParameterType(method, targetClass, beanName, annotationType,
+                    AnnotatedMethods.parameterType(method, 0, targetClass), documentType);
             return HandlerMethod.SignatureStyle.DOCUMENT_ONLY;
         }
         if (params.length == 2) {
@@ -651,7 +634,8 @@ public class ChangeStreamBeanPostProcessor implements BeanPostProcessor, Applica
                         annName + " method " + targetClass.getName() + "#" + method.getName()
                                 + " has invalid signature. Expected: void method(T doc, ChangeStreamContext ctx)");
             }
-            validateTypedParameterType(method, targetClass, beanName, annotationType, params[0], documentType);
+            validateTypedParameterType(method, targetClass, beanName, annotationType,
+                    AnnotatedMethods.parameterType(method, 0, targetClass), documentType);
             return HandlerMethod.SignatureStyle.DOCUMENT_AND_CONTEXT;
         }
 

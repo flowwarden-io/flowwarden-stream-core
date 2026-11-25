@@ -39,6 +39,9 @@ import java.lang.annotation.Target;
  *
  * <p>At most one {@code @Pipeline} method is allowed per {@link ChangeStream} class.</p>
  *
+ * <p>The method may be declared in a superclass or an interface of the
+ * {@link ChangeStream} class; the rule above applies to the hierarchy as a whole.</p>
+ *
  * <p><strong>The stages apply to the change event.</strong> MongoDB runs the pipeline on the <em>change event</em>, not on the document.
  * The document sits under {@code fullDocument}; the top level of an event only
  * holds {@code operationType}, {@code fullDocument}, {@code documentKey},

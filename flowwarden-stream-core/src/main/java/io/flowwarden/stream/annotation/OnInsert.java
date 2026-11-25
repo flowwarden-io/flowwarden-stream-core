@@ -32,6 +32,9 @@ import java.lang.annotation.Target;
  * </ul>
  *
  * <p>Only one {@code @OnInsert} method is allowed per {@link ChangeStream} class.</p>
+ *
+ * <p>The method may be declared in a superclass or an interface of the
+ * {@link ChangeStream} class; the rule above applies to the hierarchy as a whole.</p>
  */
 @Target(ElementType.METHOD)
 @Retention(RetentionPolicy.RUNTIME)
