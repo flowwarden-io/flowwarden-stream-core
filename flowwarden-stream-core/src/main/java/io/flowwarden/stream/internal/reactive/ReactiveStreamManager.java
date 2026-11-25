@@ -111,6 +111,13 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
      */
     private static final Duration STOP_IN_FLIGHT_SAVE_TIMEOUT = Duration.ofSeconds(5);
 
+    /**
+     * How long {@link #shutdown()} waits after disposing the cursors: the
+     * server's default {@code awaitData} window (1 s) plus a margin for the
+     * reply and the deferred close.
+     */
+    private static final Duration SHUTDOWN_CURSOR_DRAIN = Duration.ofMillis(1_200);
+
     private final MongoTemplateRegistry templateRegistry;
     private final ReactiveMongoTemplate defaultReactiveTemplate;
     private final StreamRegistry registry;
@@ -125,6 +132,13 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
     private final Map<String, ProcessedAnchorPolicy> processedPolicies = new ConcurrentHashMap<>();
     private final Map<String, AtomicReference<TokenSnapshot>> latestTokens = new ConcurrentHashMap<>();
     private final Map<String, Instant> lastActivityTimes = new ConcurrentHashMap<>();
+    /**
+     * {@link System#nanoTime()} of the last disposal of a live cursor, or
+     * {@code null} if none was disposed. Read by {@link #shutdown()}, which
+     * must outlast that cursor's {@code getMore} whatever disposed it — a
+     * {@code stopStream} shortly before the context closes included.
+     */
+    private final AtomicReference<Long> lastCursorDisposalNanos = new AtomicReference<>();
     private final Map<String, ScheduledFuture<?>> intervalTasks = new ConcurrentHashMap<>();
     private final Map<String, ScheduledFuture<?>> idleProbeTasks = new ConcurrentHashMap<>();
     private final Map<String, CheckpointHeartbeat> heartbeats = new ConcurrentHashMap<>();
@@ -724,6 +738,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         Disposable disposable = state.disposableHolder().get();
         if (disposable != null) {
             disposable.dispose();
+            lastCursorDisposalNanos.set(System.nanoTime());
         }
     }
 
@@ -802,6 +817,7 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
             Disposable disposable = state.disposableHolder().get();
             if (disposable != null) {
                 disposable.dispose();
+                lastCursorDisposalNanos.set(System.nanoTime());
             }
         } catch (Exception e) {
             log.warn("Error stopping stream '{}'", streamName, e);
@@ -1030,6 +1046,49 @@ public class ReactiveStreamManager implements FlowWardenStreamManager {
         intervalScheduler.shutdownNow();
         probeScheduler.shutdownNow();
         statsScheduler.shutdownNow();
+        awaitCursorDrain();
+    }
+
+    /**
+     * Gives the cursors disposed recently — by {@link #shutdown()} itself or
+     * by a {@code stopStream} just before it — the time to finish their
+     * {@code getMore} in flight before the context closes the MongoDB
+     * client. Waits for what is left of the drain window since the last
+     * disposal: nothing if no cursor was disposed, or long enough ago.
+     *
+     * <p>Disposing a change stream subscription does not abort the
+     * {@code getMore} already sent: the driver defers the cursor's close
+     * until the server answers, which an idle {@code awaitData} cursor does
+     * after one second at most (the server default — no {@code maxAwaitTime}
+     * is set on the main cursor). If the client is closed first, that
+     * {@code getMore} fails on its closed connection, the driver takes the
+     * failure for a resumable one and tries to reopen the cursor on a closed
+     * cluster: {@code IllegalStateException: state should be: open}, logged
+     * at ERROR with a stack trace by the driver on every clean shutdown.
+     * Seen with the 5.x driver (5.5.2); the 4.11 line does not log it.</p>
+     *
+     * <p>A mitigation, not a guarantee: the driver gives no signal for the
+     * end of a cancelled cursor, so the wait is a fixed window sized on the
+     * server's {@code awaitData} delay. A reply slower than the margin
+     * (network, loaded server) can still land after the client is closed.
+     * Bounded on purpose — a shutdown must not hang on a cursor. Only at
+     * shutdown: as long as the context stays up, the client stays open and
+     * the {@code getMore} returns normally.</p>
+     */
+    private void awaitCursorDrain() {
+        Long disposedAt = lastCursorDisposalNanos.get();
+        if (disposedAt == null) {
+            return;
+        }
+        long remainingNanos = SHUTDOWN_CURSOR_DRAIN.toNanos() - (System.nanoTime() - disposedAt);
+        if (remainingNanos <= 0) {
+            return;
+        }
+        try {
+            TimeUnit.NANOSECONDS.sleep(remainingNanos);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private Mono<Void> handleEventReactive(ChangeStreamDocument<Document> raw,
