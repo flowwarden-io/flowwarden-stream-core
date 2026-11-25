@@ -21,7 +21,9 @@ import org.bson.BsonDocument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.time.Instant;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -61,8 +63,12 @@ public final class ProcessedAnchorPolicy {
 
     private volatile boolean cancelled;
 
-    /** Serializes every processed write across its three writers. */
-    private final ReentrantLock lock = new ReentrantLock();
+    /**
+     * Serializes every processed write across its three writers. Fair, so
+     * that a graceful stop can let the writers already waiting go first
+     * (see {@link #cancelAfterInFlightWrite}).
+     */
+    private final ReentrantLock lock = new ReentrantLock(true);
 
     /** Latest settled token and its anchor timestamp. Guarded by {@link #lock}. */
     private BsonDocument latestToken;
@@ -88,6 +94,58 @@ public final class ProcessedAnchorPolicy {
      */
     public void cancel() {
         cancelled = true;
+    }
+
+    /**
+     * Graceful-stop variant of {@link #cancel()}: waits for a write already
+     * in flight to finish — and for the writers queued behind it — then
+     * invalidates the policy. The caller is about
+     * to tear the stream down, and that teardown may interrupt the thread
+     * blocked in the store — the write of an event whose handler completed
+     * would be lost, and the event delivered again after a stop that was
+     * meant to be clean. Nothing new is written: a dirty anchor stays dirty.
+     *
+     * <p>The wait is bounded so that a hung store cannot hold the stop; on
+     * expiry (or if the caller is interrupted) the policy is invalidated
+     * anyway. Safe to call from the thread that holds the write — the lock
+     * is reentrant.</p>
+     *
+     * @param maxWait upper bound of the wait for the in-flight write
+     * @return {@code true} if no write was left in flight when the policy
+     *         was invalidated, {@code false} if the wait expired
+     */
+    public boolean cancelAfterInFlightWrite(Duration maxWait) {
+        long deadline = System.nanoTime() + maxWait.toNanos();
+        try {
+            while (true) {
+                long remaining = Math.max(0L, deadline - System.nanoTime());
+                if (!lock.tryLock(remaining, TimeUnit.NANOSECONDS)) {
+                    cancelled = true;
+                    return false;
+                }
+                try {
+                    // A writer that queued behind the write in flight (a
+                    // settlement completing during the wait) goes first:
+                    // invalidating now would drop its anchor silently. The
+                    // lock is fair, so releasing it hands it to that writer
+                    // before this thread gets it back.
+                    // Called from inside a write (hold count above one):
+                    // the queue cannot drain while this thread holds the
+                    // lock, so there is nothing to wait for.
+                    if (lock.getHoldCount() > 1 || !lock.hasQueuedThreads()
+                            || deadline - System.nanoTime() <= 0) {
+                        cancelled = true;
+                        return true;
+                    }
+                } finally {
+                    lock.unlock();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            cancelled = true;
+            return false;
+        }
     }
 
     /**
