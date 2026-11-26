@@ -179,9 +179,12 @@ class ImperativeCheckpointFailureIntegrationTest {
                     assertThat(cp.get().lastProcessedToken())
                             .as("the flush must retry the token the manual save failed to persist")
                             .isNotNull();
+                    // Awaited with the token: the store counts a write after
+                    // the driver returns, so the token is readable in MongoDB
+                    // slightly before the count moves.
+                    assertThat(failingStore.confirmedSaveProcessed("imp-cp-fail-manual"))
+                            .isGreaterThanOrEqualTo(1);
                 });
-        assertThat(failingStore.confirmedSaveProcessed("imp-cp-fail-manual"))
-                .isGreaterThanOrEqualTo(1);
     }
 
     @Test
