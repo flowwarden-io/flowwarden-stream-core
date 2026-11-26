@@ -13,7 +13,7 @@
 
     <groupId>io.flowwarden</groupId>
     <artifactId>flowwarden-stream-core-parent</artifactId>
-    <version>1.0.0-rc.9</version>
+    <version>1.0.0-rc.10-SNAPSHOT</version>
     <packaging>pom</packaging>
 
     <name>FlowWarden Stream Core (parent)</name>
@@ -91,7 +91,7 @@
         -->
         <japicmp.version>0.26.3</japicmp.version>
         <japicmp.groovy.version>4.0.33</japicmp.groovy.version>
-        <japicmp.baseline>1.0.0-rc.8</japicmp.baseline>
+        <japicmp.baseline>1.0.0-rc.9</japicmp.baseline>
     </properties>
 
     <dependencyManagement>
